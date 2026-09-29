@@ -132,6 +132,48 @@ class TestMCPServerToolDiscovery:
         for expected in expected_tools:
             assert expected in tool_names, f"Missing tool: {expected}"
 
+    @pytest.mark.unit
+    def test_fallback_and_live_schema_constraints_agree(self, openapi_spec):
+        """Any default/minimum/maximum present in both a tool's fallback-built
+        and OpenAPI-built schema must be equal, comparing the schemas as
+        advertised (after the people-search limit override on each path)."""
+        import importlib.util
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with patch.object(module.LifeOSMCPServer, "_load_openapi_spec", lambda self: None):
+            server = module.LifeOSMCPServer()
+        server.openapi_spec = openapi_spec
+
+        server.tools = []
+        server._build_tools_from_spec()
+        server._cap_people_search_limit()
+        live = {t["name"]: t["inputSchema"].get("properties", {}) for t in server.tools}
+
+        server.tools = []
+        server._build_tools_fallback()
+        raw_people_limit = dict(
+            next(t for t in server.tools if t["name"] == "lifeos_people_search")["inputSchema"]["properties"]["limit"]
+        )
+        server._cap_people_search_limit()
+        fallback = {t["name"]: t["inputSchema"].get("properties", {}) for t in server.tools}
+
+        # The fallback documents the advertised override itself.
+        assert (raw_people_limit["default"], raw_people_limit["maximum"]) == (10, 50)
+
+        mismatches = []
+        for name, props in fallback.items():
+            for prop, fb in props.items():
+                lv = live.get(name, {}).get(prop)
+                if not lv:
+                    continue
+                for key in ("default", "minimum", "maximum"):
+                    if key in fb and key in lv and fb[key] != lv[key]:
+                        mismatches.append((name, prop, key, fb[key], lv[key]))
+        assert not mismatches, f"fallback vs live schema drift: {mismatches}"
+
     def test_task_create_tags_advertised_as_array(self, openapi_spec):
         """`lifeos_task_create`'s `tags` field must be advertised as
         `"type": "array"`, not `"type": "string"` — a schema-following
