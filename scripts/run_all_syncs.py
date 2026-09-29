@@ -994,6 +994,7 @@ SYNC_ORDER = [
 
     # === Phase 4: Vector Store Indexing ===
     # Index content with fresh people data available for entity resolution
+    "vault_tag",                # Incremental Jev tagging of changed notes (no GPU, not an embedding source); before the reindex so chunk context carries fresh tag phrases
     "vault_reindex",            # Full reindex with LLM summaries (no timeout)
     # `strengths` runs AFTER vault_reindex, not with the other Phase 3
     # relationship work, because vault_reindex *creates people* from vault
@@ -1056,6 +1057,7 @@ SYNC_SCRIPTS = {
 
     # Phase 4: Vector Store Indexing
     "vault_reindex": ("scripts/sync_vault_reindex.py", ["--execute"]),
+    "vault_tag": ("scripts/sync_vault_tag.py", ["--execute"]),
     "crm_vectorstore": ("scripts/sync_crm_to_vectorstore.py", ["--execute"]),
 
     # Phase 5: Content Sync
@@ -1078,6 +1080,7 @@ SYNC_TIMEOUTS = {
     "vault_reindex": 14400,          # 4 hours - incremental is typically 10-30min, but a
                                      #            `--force` full reindex of a ~6K-file vault
                                      #            plus per-file summary calls fits in ~3-4h
+    "vault_tag": 3600,               # 1 hour - nightly delta is ~tens of notes; a full backfill is ~8 min
     "slack": 7200,                   # 2 hours - ~100 linked DMs + group DMs, rate-limited
     "google_docs": 300,              # 5 minutes - normally takes ~9s, hangs on expired OAuth
     "google_sheets": 300,            # 5 minutes - normally takes ~1s, hangs on expired OAuth

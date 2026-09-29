@@ -20,7 +20,7 @@ import sqlite3
 import logging
 import unicodedata
 from pathlib import Path
-from typing import Optional
+from typing import Collection, Optional
 
 from config.settings import settings
 
@@ -32,6 +32,14 @@ def get_bm25_db_path() -> str:
     db_dir = Path(settings.chroma_path).parent
     db_dir.mkdir(parents=True, exist_ok=True)
     return str(db_dir / "bm25_index.db")
+
+
+def file_path_of_doc_id(doc_id: str) -> str:
+    """File path of a chunk id: ``{path}_{chunk}`` or ``{path}::summary``."""
+    if doc_id.endswith("::summary"):
+        return doc_id[: -len("::summary")]
+    head, sep, tail = doc_id.rpartition("_")
+    return head if sep and tail.isdigit() else doc_id
 
 
 class BM25Index:
@@ -274,20 +282,52 @@ class BM25Index:
         quoted = [f'"{t}"' for t in terms]
         return (" OR " if use_or else " ").join(quoted)
 
-    def _match(self, conn: sqlite3.Connection, match_expr: str, limit: int, match_mode: str) -> list[dict]:
-        """Run one FTS5 MATCH expression and tag each row with its match mode."""
+    def _match(
+        self,
+        conn: sqlite3.Connection,
+        match_expr: str,
+        limit: int,
+        match_mode: str,
+        file_paths: Optional[Collection[str]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> list[dict]:
+        """Run one FTS5 MATCH expression and tag each row with its match mode.
+
+        ``file_paths`` and the ``date_from``/``date_to`` window (inclusive
+        ``YYYY-MM-DD``; undated chunks pass) restrict the rows before the
+        ``LIMIT`` applies, so a selective restriction still returns ``limit``
+        rows when that many exist.
+        """
+        restrict = ""
+        params: list = [match_expr]
+        if file_paths is not None:
+            allowed = file_paths if isinstance(file_paths, (set, frozenset)) else set(file_paths)
+            conn.create_function(
+                "in_allowed_files", 1,
+                lambda doc_id: 1 if file_path_of_doc_id(doc_id) in allowed else 0,
+                deterministic=True,
+            )
+            restrict = "AND in_allowed_files(chunks_fts.doc_id)"
+        if date_from:
+            restrict += " AND (COALESCE(doc_dates.modified_date, '') = '' OR substr(doc_dates.modified_date, 1, 10) >= ?)"
+            params.append(date_from)
+        if date_to:
+            restrict += " AND (COALESCE(doc_dates.modified_date, '') = '' OR substr(doc_dates.modified_date, 1, 10) <= ?)"
+            params.append(date_to)
+        params.append(limit)
         cursor = conn.execute(
-            """
+            f"""
             SELECT chunks_fts.doc_id, chunks_fts.content,
                    chunks_fts.file_name, chunks_fts.people,
                    bm25(chunks_fts) as score, doc_dates.modified_date
             FROM chunks_fts
             LEFT JOIN doc_dates ON doc_dates.doc_id = chunks_fts.doc_id
-            WHERE chunks_fts MATCH ?
+            WHERE chunks_fts MATCH ? {restrict}
             ORDER BY score
             LIMIT ?
             """,
-            (match_expr, limit)
+            params,
         )
         return [
             {
@@ -302,10 +342,51 @@ class BM25Index:
             for row in cursor.fetchall()
         ]
 
+    def paths_under(self, prefix: str) -> set[str]:
+        """Absolute file paths of indexed chunks whose path starts with ``prefix``."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT doc_id FROM chunks_fts WHERE substr(doc_id, 1, ?) = ?",
+                (len(prefix), prefix),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {file_path_of_doc_id(r[0]) for r in rows}
+
+    def paths_with_people(self, names: list[str]) -> set[str]:
+        """Candidate file paths whose people column contains any of ``names``' terms.
+
+        The column is a space-joined, stemmed FTS text, so this is a superset
+        of the exact matches; callers confirm whole person values against the
+        vector store's per-chunk ``people`` lists."""
+        phrases = []
+        for name in names:
+            terms = self._extract_terms(name)
+            if terms:
+                phrases.append('"' + " ".join(terms) + '"')
+        if not phrases:
+            return set()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT doc_id FROM chunks_fts WHERE chunks_fts MATCH ?",
+                ("people : (" + " OR ".join(phrases) + ")",),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning(f"BM25 people lookup error: {e}")
+            return set()
+        finally:
+            conn.close()
+        return {file_path_of_doc_id(r[0]) for r in rows}
+
     def search(
         self,
         query: str,
-        limit: int = 20
+        limit: int = 20,
+        file_paths: Optional[Collection[str]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> list[dict]:
         """
         Search the index using BM25.
@@ -319,6 +400,11 @@ class BM25Index:
         Args:
             query: Search query string
             limit: Maximum number of results
+            file_paths: When given, only chunks of these files (absolute
+                paths) are candidates; an empty collection matches nothing.
+            date_from: Inclusive lower bound (YYYY-MM-DD) on doc date, applied
+                before ``limit``; undated chunks pass.
+            date_to: Inclusive upper bound, same rules.
 
         Returns:
             List of matching documents with doc_id and BM25 score
@@ -326,10 +412,15 @@ class BM25Index:
         strict_query = self._sanitize_query(query)
         if not strict_query:
             return []
+        restrict = {
+            k: v for k, v in
+            (("file_paths", file_paths), ("date_from", date_from), ("date_to", date_to))
+            if v is not None
+        }
 
         conn = sqlite3.connect(self.db_path)
         try:
-            results = self._match(conn, strict_query, limit, "and")
+            results = self._match(conn, strict_query, limit, "and", **restrict)
             if len(results) >= limit:
                 return results
             lenient_query = self._sanitize_query(query, use_or=True)
@@ -337,7 +428,7 @@ class BM25Index:
                 return results
             seen = {r["doc_id"] for r in results}
             # Over-fetch by the strict count so its rows can't crowd out the fill.
-            for row in self._match(conn, lenient_query, limit + len(results), "or"):
+            for row in self._match(conn, lenient_query, limit + len(results), "or", **restrict):
                 if row["doc_id"] not in seen:
                     seen.add(row["doc_id"])
                     results.append(row)
