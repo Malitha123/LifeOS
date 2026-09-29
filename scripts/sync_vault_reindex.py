@@ -43,6 +43,20 @@ def clear_vector_store():
     logger.info("Vector store cleared")
 
 
+def backfill_search_keys(indexer) -> int:
+    """Backfill ``tag:`` and ``modified_day`` metadata keys on chunks missing them.
+
+    A full metadata-only scan every run: completion is never inferred, so a
+    replaced or partially migrated collection is repaired, and an already
+    complete one costs only the read.
+    """
+    try:
+        return indexer.vector_store.backfill_search_keys()
+    except Exception as e:
+        logger.warning(f"Search key backfill failed: {e}")
+        return 0
+
+
 def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries: bool = False) -> dict:
     """
     Reindex the Obsidian vault.
@@ -105,16 +119,20 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
     except Exception as e:
         logger.warning(f"Index page generation failed: {e}")
 
+    search_keys_backfilled = backfill_search_keys(indexer)
+
     elapsed = time.time() - start_time
 
     logger.info("\n=== Vault Reindex Results ===")
     logger.info(f"  Files indexed: {files_indexed}")
+    logger.info(f"  Search keys backfilled: {search_keys_backfilled}")
     logger.info(f"  Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
     return {
         "status": "success",
         "files_indexed": files_indexed,
         "index_pages": index_pages,
+        "search_keys_backfilled": search_keys_backfilled,
         "elapsed_seconds": round(elapsed, 1),
     }
 
@@ -154,4 +172,5 @@ if __name__ == '__main__':
     from api.services.sync_health import emit_sync_stats
     emit_sync_stats({
         "processed": int(result.get("files_indexed", 0) or 0),
+        "search_keys_backfilled": int(result.get("search_keys_backfilled", 0) or 0),
     })

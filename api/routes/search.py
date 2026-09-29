@@ -6,12 +6,12 @@ POST /api/search - Search the indexed vault for relevant content.
 import logging
 import time
 from typing import Optional
-from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from api.services.vectorstore import VectorStore
 from api.services.hybrid_search import HybridSearch
+from api.services.search_facets import SearchFacets
 from api.utils.date_parser import resolve_effective_dates
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,12 @@ class SearchFilters(BaseModel):
     people: Optional[list[str]] = None
     date_from: Optional[str] = None  # ISO date string
     date_to: Optional[str] = None
+    folder: Optional[str] = None  # vault-relative directory prefix
+    tags: Optional[list[str]] = None
+    doc_type: Optional[list[str]] = None
+    domain: Optional[list[str]] = None
+    topic: Optional[list[str]] = None
+    project: Optional[list[str]] = None
 
 
 class SearchRequest(BaseModel):
@@ -104,30 +110,32 @@ async def search(request: SearchRequest) -> SearchResponse:
     """
     start_time = time.time()
 
-    # Build ChromaDB filter from request filters
-    chroma_filter = None
+    # Structured filters are applied before ranking, inside both search arms.
+    facets = None
     if request.filters:
-        chroma_filter = {}
+        f = request.filters
+        facets = SearchFacets(
+            folder=f.folder, note_type=f.note_type, people=f.people, tags=f.tags,
+            doc_type=f.doc_type, domain=f.domain, topic=f.topic, project=f.project,
+        )
+        if facets.is_empty():
+            facets = None
 
-        # Note type filter (single value for ChromaDB)
-        if request.filters.note_type and len(request.filters.note_type) == 1:
-            chroma_filter["note_type"] = request.filters.note_type[0]
-
-        # ChromaDB doesn't support range queries directly on strings, so
-        # date-range filtering happens in post-processing below (see
-        # request.filters.date_from/to).
-
-    # Resolve the effective date window: explicit params win; otherwise try to
-    # infer one from a bounded relative-time phrase in the query ("last week")
-    # against the current date. Keeps recency working even when the caller
-    # didn't pass explicit bounds.
-    #
-    # NOTE: independent of the legacy ``request.filters.date_from/to`` post-filter
-    # below. Two separate knobs — the top-level params push the window down into
-    # hybrid_search (pre-ranking); ``filters`` filters already-ranked results
-    # here. Both let undated docs pass through, so they compose without conflict.
+    # Resolve the effective date window. The top-level params and the nested
+    # ``filters.date_from/to`` are both explicit bounds and are intersected; the
+    # window constrains candidates inside both search arms, before their limits.
+    # With no explicit bound, a bounded relative-time phrase in the query
+    # ("last week") is resolved against the current date. Undated docs pass.
+    explicit_from = max(
+        (d for d in (request.date_from, request.filters and request.filters.date_from) if d),
+        default=None,
+    )
+    explicit_to = min(
+        (d for d in (request.date_to, request.filters and request.filters.date_to) if d),
+        default=None,
+    )
     date_from, date_to = resolve_effective_dates(
-        request.query, request.date_from, request.date_to
+        request.query, explicit_from, explicit_to
     )
 
     # Search using hybrid search (vector + BM25 keyword)
@@ -138,6 +146,7 @@ async def search(request: SearchRequest) -> SearchResponse:
             top_k=request.top_k,
             date_from=date_from,
             date_to=date_to,
+            facets=facets,
         )
     except Exception as e:
         logger.error(f"Hybrid search error: {e}")
@@ -146,39 +155,6 @@ async def search(request: SearchRequest) -> SearchResponse:
     # Post-process results
     results = []
     for r in raw_results:
-        # Apply additional filters that ChromaDB can't handle natively
-        if request.filters:
-            # Filter by people (check if any requested person is in result)
-            if request.filters.people:
-                result_people = r.get("people", [])
-                if isinstance(result_people, str):
-                    result_people = [result_people]
-                if not any(p in result_people for p in request.filters.people):
-                    continue
-
-            # Filter by date range
-            if request.filters.date_from or request.filters.date_to:
-                result_date = r.get("modified_date", "")
-                if result_date:
-                    try:
-                        # Parse result date (ISO format)
-                        result_dt = datetime.fromisoformat(result_date.replace("Z", "+00:00"))
-                        result_date_str = result_dt.strftime("%Y-%m-%d")
-
-                        if request.filters.date_from:
-                            if result_date_str < request.filters.date_from:
-                                continue
-                        if request.filters.date_to:
-                            if result_date_str > request.filters.date_to:
-                                continue
-                    except (ValueError, TypeError):
-                        pass  # Skip date filtering for invalid dates
-
-            # Filter by note_type if multiple types requested
-            if request.filters.note_type and len(request.filters.note_type) > 1:
-                if r.get("note_type") not in request.filters.note_type:
-                    continue
-
         # Build result object
         people = r.get("people", [])
         if isinstance(people, str):
