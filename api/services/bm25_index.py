@@ -191,25 +191,42 @@ class BM25Index:
         'for', 'of', 'with', 'by',
     })
 
+    _JOINERS = frozenset("'\u2019-")
+
     @staticmethod
     def _extract_terms(query: str) -> list[str]:
-        """Split text into runs of letters, digits and combining marks (NFC-normalized)."""
+        """
+        Split text into terms (NFC-normalized).
+
+        A term is a run of letters, digits and combining marks that may contain
+        apostrophes (``'``, U+2019) and hyphens between them, so ``name's`` and
+        ``follow-up`` stay single terms. Leading and trailing joiners are
+        separators.
+        """
         terms: list[str] = []
         current: list[str] = []
+
+        def flush() -> None:
+            while current and current[-1] in BM25Index._JOINERS:
+                current.pop()
+            if current:
+                terms.append("".join(current))
+            current.clear()
+
         for ch in unicodedata.normalize("NFC", query) + " ":
             if ch.isalnum() or unicodedata.category(ch).startswith("M"):
                 current.append(ch)
-                continue
-            if any(c.isalnum() for c in current):
-                terms.append("".join(current))
-            current = []
+            elif ch in BM25Index._JOINERS and current:
+                current.append(ch)
+            else:
+                flush()
         return terms
 
     def _sanitize_query(self, query: str, use_or: bool = False) -> str:
         """
         Turn arbitrary text into a valid FTS5 MATCH expression.
 
-        Every run of letters, digits and combining marks (after NFC
+        Every term from ``_extract_terms`` (after NFC
         normalization) becomes a double-quoted term, so no
         character in the input (punctuation, symbols, emoji, a leading ``-``
         or ``^``, ``col:`` filters) and no uppercase ``AND``/``OR``/``NOT``/
@@ -267,9 +284,11 @@ class BM25Index:
         """
         Search the index using BM25.
 
-        Runs a strict query (every term must match) first; when that yields
-        no rows, re-runs it with any-term semantics. Each result carries
-        ``match_mode`` of ``"and"`` or ``"or"`` accordingly.
+        Runs a strict query (every term must match) first, then fills any
+        remaining slots up to ``limit`` with any-term matches (stop words
+        removed) not already returned. The any-term query is skipped when the
+        strict one already fills ``limit``. Each result carries ``match_mode``
+        of ``"and"`` or ``"or"``; strict rows come first.
 
         Args:
             query: Search query string
@@ -285,12 +304,20 @@ class BM25Index:
         conn = sqlite3.connect(self.db_path)
         try:
             results = self._match(conn, strict_query, limit, "and")
-            if results:
+            if len(results) >= limit:
                 return results
             lenient_query = self._sanitize_query(query, use_or=True)
             if lenient_query == strict_query:
-                return []
-            return self._match(conn, lenient_query, limit, "or")
+                return results
+            seen = {r["doc_id"] for r in results}
+            # Over-fetch by the strict count so its rows can't crowd out the fill.
+            for row in self._match(conn, lenient_query, limit + len(results), "or"):
+                if row["doc_id"] not in seen:
+                    seen.add(row["doc_id"])
+                    results.append(row)
+                    if len(results) >= limit:
+                        break
+            return results
         except sqlite3.OperationalError as e:
             logger.warning(f"BM25 search error for query '{query}': {e}")
             return []
