@@ -4,7 +4,7 @@ Tag vault notes (nightly, incremental).
 
 Walks every ``.md`` note under the vault, skips notes whose content hash and
 the taxonomy's vocabulary version match the stored tag row, tags the rest with
-``VaultTagger``, and prunes rows for notes that no longer exist. Not an
+``VaultTagger``, and prunes rows for notes absent from the vault. Not an
 embedding source: no GPU and no local-LLM pause.
 
 Runs only when ``LIFEOS_JEV_VAULT_TAGGING`` is ``shadow`` or ``on`` and a

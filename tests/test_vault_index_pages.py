@@ -251,6 +251,7 @@ def test_generated_page_is_indexed_without_any_summary_call(vault, tmp_path, mon
     indexer = IndexerService.__new__(IndexerService)
     indexer.vault_path = vault
     indexer._interaction_store = indexer._source_entity_store = indexer._entity_resolver = None
+    indexer._tag_store, indexer._tag_store_failed = None, True
     indexer.vector_store = MagicMock()
     indexer.bm25_index = BM25Index(db_path=str(tmp_path / "bm25.db"))
     indexer._sync_people_to_v2 = MagicMock(return_value=set())
