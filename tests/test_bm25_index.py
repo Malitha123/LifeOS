@@ -135,3 +135,195 @@ class TestDocDates:
         bm25.clear()
         bm25.add_document("d1", "budget", "a.md")
         assert bm25.search("budget")[0]["modified_date"] == ""
+
+
+@pytest.fixture
+def seeded(bm25):
+    bm25.bulk_add([
+        {"doc_id": "d1", "content": "we discussed hiring plans for the platform team", "file_name": "Hiring.md"},
+        {"doc_id": "d2", "content": "the roadmap owner is the platform lead", "file_name": "Roadmap.md"},
+        {"doc_id": "d3", "content": "cloud costs are rising while local inference is cheap", "file_name": "Infra.md"},
+        {"doc_id": "d4", "content": "alpha and beta rollout notes", "file_name": "Rollout.md"},
+        {"doc_id": "d5", "content": "project tag planning session", "file_name": "Tags.md"},
+        {"doc_id": "d6", "content": "gamma launch checklist", "file_name": "Gamma.md"},
+        {"doc_id": "d7", "content": "delta budget summary", "file_name": "Delta.md"},
+    ])
+    return bm25
+
+
+class TestQuerySanitizing:
+    @pytest.mark.parametrize("query,expected_doc", [
+        ("what did we decide about hiring, and who owns it?", "d1"),
+        ("alpha/beta rollout", "d4"),
+        ("platform = lead", "d2"),
+        ("cloud OR local costs", "d3"),
+        ("/roadmap", "d2"),
+        ("alpha & beta", "d4"),
+        ("#tag planning", "d5"),
+        ('\U0001F680 "gamma" launch', "d6"),
+        ("-budget ^delta", "d7"),
+        ("notes:rollout", "d4"),
+    ])
+    def test_query_shapes_return_results_without_error(self, seeded, caplog, query, expected_doc):
+        with caplog.at_level("WARNING"):
+            results = seeded.search(query)
+        assert "BM25 search error" not in caplog.text
+        assert expected_doc in [r["doc_id"] for r in results]
+
+    @pytest.mark.parametrize("char", list(",/=&|+#@<>'\"()[]{}*^~.:;?!"))
+    def test_every_syntax_character_is_safe(self, seeded, caplog, char):
+        with caplog.at_level("WARNING"):
+            results = seeded.search(f"platform {char} lead {char}")
+        assert "BM25 search error" not in caplog.text
+        assert "d2" in [r["doc_id"] for r in results]
+
+    def test_symbol_only_query_returns_empty(self, seeded):
+        assert seeded.search("&&& ,,, //") == []
+
+    def test_uppercase_operator_words_are_plain_terms(self, seeded):
+        # As an FTS5 operator, NOT would exclude d2 (contains "lead"); as a
+        # plain term the query has no co-occurring match and falls back to OR.
+        results = seeded.search("platform NOT lead")
+        assert "d2" in [r["doc_id"] for r in results]
+
+    def test_quoted_terms_are_stemmed(self, seeded):
+        results = seeded.search("discussing plan")
+        assert results[0]["doc_id"] == "d1"
+        assert results[0]["match_mode"] == "and"
+
+
+class TestStrictThenLenient:
+    def test_cooccurring_terms_rank_and_matches_first(self, seeded):
+        results = seeded.search("platform team hiring")
+        assert [(r["doc_id"], r["match_mode"]) for r in results] == [("d1", "and"), ("d2", "or")]
+
+    def test_non_cooccurring_terms_fall_back_to_or(self, seeded):
+        results = seeded.search("hiring roadmap")
+        assert {r["doc_id"] for r in results} == {"d1", "d2"}
+        assert all(r["match_mode"] == "or" for r in results)
+
+    def test_fallback_drops_stop_words(self, seeded):
+        # "the" appears in d1 and d2; as an OR term it would pull in d2.
+        results = seeded.search("the hiring gamma")
+        assert {r["doc_id"] for r in results} == {"d1", "d6"}
+
+    def test_stop_word_only_query_still_searches(self, seeded):
+        assert {r["doc_id"] for r in seeded.search("the")} == {"d1", "d2"}
+
+    def test_no_matching_terms_returns_empty(self, seeded):
+        assert seeded.search("zzzunknown qqqmissing") == []
+
+
+class TestUnicodeQueries:
+    def test_decomposed_query_matches_composed_content(self, bm25):
+        import unicodedata
+        composed = "résumé"
+        bm25.add_document("d1", f"updated {composed} draft", "Doc.md")
+        decomposed = unicodedata.normalize("NFD", composed)
+        assert decomposed != composed
+        results = bm25.search(decomposed)
+        assert [r["doc_id"] for r in results] == ["d1"]
+        assert results[0]["match_mode"] == "and"
+
+    def test_composed_query_matches_decomposed_content(self, bm25):
+        import unicodedata
+        composed = "résumé"
+        bm25.add_document("d1", unicodedata.normalize("NFD", composed), "Doc.md")
+        assert [r["doc_id"] for r in bm25.search(composed)] == ["d1"]
+
+    def test_combining_marks_survive_term_extraction(self, bm25):
+        # Devanagari vowel signs are combining marks with no precomposed form.
+        term = "किताब"
+        assert bm25._sanitize_query(term) == f'"{term}"'
+
+
+class TestLiteralOperatorWords:
+    @pytest.fixture
+    def operator_index(self, bm25):
+        bm25.bulk_add([
+            {"doc_id": "all3", "content": "alpha or beta comparison", "file_name": "A.md"},
+            {"doc_id": "without", "content": "alpha and beta comparison", "file_name": "B.md"},
+            {"doc_id": "choice", "content": "choose one or the other", "file_name": "C.md"},
+        ])
+        return bm25
+
+    def test_uppercase_or_is_a_required_term_in_strict_mode(self, operator_index):
+        results = operator_index.search("alpha OR beta")
+        assert results[0]["doc_id"] == "all3"
+        assert results[0]["match_mode"] == "and"
+
+    def test_or_alone_is_a_plain_term(self, operator_index, caplog):
+        with caplog.at_level("WARNING"):
+            results = operator_index.search("OR")
+        assert "BM25 search error" not in caplog.text
+        assert {r["doc_id"] for r in results} == {"all3", "choice"}
+
+
+class TestFillWithOr:
+    @pytest.fixture
+    def filled(self, bm25):
+        bm25.bulk_add(
+            [{"doc_id": f"both{i}", "content": "kiwi mango", "file_name": f"B{i}.md"} for i in range(2)]
+            + [{"doc_id": f"kiwi{i}", "content": "kiwi only", "file_name": f"K{i}.md"} for i in range(4)]
+            + [{"doc_id": f"mango{i}", "content": "mango only", "file_name": f"M{i}.md"} for i in range(4)]
+        )
+        return bm25
+
+    @staticmethod
+    def _modes(results):
+        return [r["match_mode"] for r in results]
+
+    def test_and_rows_first_then_or_fill_without_duplicates(self, filled):
+        results = filled.search("kiwi mango", limit=6)
+        ids = [r["doc_id"] for r in results]
+        assert len(results) == 6
+        assert len(set(ids)) == 6
+        assert self._modes(results) == ["and"] * 2 + ["or"] * 4
+        assert set(ids[:2]) == {"both0", "both1"}
+
+    def test_or_query_is_skipped_when_and_fills_limit(self, filled, monkeypatch):
+        modes_run = []
+        original = filled._match
+
+        def spy(conn, match_expr, limit, match_mode):
+            modes_run.append(match_mode)
+            return original(conn, match_expr, limit, match_mode)
+
+        monkeypatch.setattr(filled, "_match", spy)
+        results = filled.search("kiwi mango", limit=2)
+        assert self._modes(results) == ["and", "and"]
+        assert modes_run == ["and"]
+
+    def test_zero_and_matches_equals_or_only(self, filled):
+        results = filled.search("kiwi mango zzzunknown", limit=5)
+        assert len(results) == 5
+        assert set(self._modes(results)) == {"or"}
+
+
+class TestIntraWordJoiners:
+    @pytest.fixture
+    def joined(self, bm25):
+        bm25.bulk_add([
+            {"doc_id": "poss", "content": "Name's launch plan", "file_name": "P.md"},
+            {"doc_id": "lone_s", "content": "s", "file_name": "S.md"},
+            {"doc_id": "hyph", "content": "weekly follow-up notes", "file_name": "H.md"},
+            {"doc_id": "spaced", "content": "a follow up call", "file_name": "F.md"},
+            {"doc_id": "only_follow", "content": "follow the leader", "file_name": "O.md"},
+        ])
+        return bm25
+
+    @pytest.mark.parametrize("apostrophe", ["'", "\u2019"])
+    def test_possessive_is_one_term_and_ignores_lone_s(self, joined, apostrophe):
+        query = f"name{apostrophe}s"
+        assert joined._extract_terms(query) == [query]
+        assert [r["doc_id"] for r in joined.search(query)] == ["poss"]
+
+    def test_hyphenated_term_matches_phrase_not_partial(self, joined):
+        assert joined._extract_terms("follow-up") == ["follow-up"]
+        ids = {r["doc_id"] for r in joined.search("follow-up")}
+        assert ids == {"hyph", "spaced"}
+
+    @pytest.mark.parametrize("query", ["-alpha", "'alpha'", "\u2019alpha\u2019", "alpha-"])
+    def test_leading_and_trailing_joiners_are_separators(self, bm25, query):
+        assert bm25._extract_terms(query) == ["alpha"]
+        assert bm25._sanitize_query(query) == '"alpha"'

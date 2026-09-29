@@ -277,6 +277,19 @@ Example:
 
 ---
 
+## Retrieval Eval
+
+`scripts/retrieval_eval/` measures whether search ranks the right vault files near the top. The labeled set lives in `data/retrieval_eval/pairs.jsonl` (git-ignored; it holds real queries and file names).
+
+| Script | Purpose |
+|--------|---------|
+| `mine_pairs.py` | Reads `data/conversations.db` (`--db` to override) and writes `{query, relevant_files, source}` pairs: `mined` for turns whose routing lists `search_vault` and whose persisted `sources` record a `read_vault_file` call, `cited` for vault files the answer cited. `--manual FILE` appends operator-written pairs from YAML or JSONL (`--manual-only` skips mining). Records with the same source, query and relevant files collapse into one carrying `count` (the number of turns that produced it); the summary line reports `deduped=<records removed>`. Prints counts only. |
+| `score.py` | `--arm hybrid\|bm25\|vector --k 10` prints recall@k, recall@40 and MRR over the pairs; `--exclude-source mined\|cited\|manual` (repeatable) drops a signal; `--weighted` weights each record by its `count` (default: each record counts once); `--verbose` lists the missed queries. `hybrid` calls `/api/search` on `LIFEOS_SERVER_URL`; `bm25` runs `BM25Index.search` on `--bm25-db` (point it at a copy, the index creates tables on open); `vector` runs `VectorStore.search` in-process and loads the embedding model, so set `HIP_VISIBLE_DEVICES=""`. |
+
+The display `sources` column stores each call as `tool(json-args)` cut to 80 characters; the miner resolves a cut-off path or file name by unique prefix match against the `.md` files under `--vault` (default `settings.vault_path`) and skips zero or ambiguous matches. Cited pairs are biased toward whatever the live retriever returned, so exclude them when comparing retrieval arms.
+
+---
+
 ## Utility Scripts
 
 | Script | Purpose |
@@ -297,6 +310,8 @@ Example:
 | `create-lifeos-app.sh` | Create the `LifeOS.app` Full Disk Access wrapper bundle in `/Applications` (macOS only), the FDA container cron/launchd route through for protected databases. |
 | `lifeos-agent-hook.sh` | Claude Code / Codex session-lifecycle hook — posts session_start/user_prompt_submit/stop/session_end to `POST /api/agents/cli-sessions/events` from any machine, so `/agents` shows sessions from every machine, not just this one. Installed by `install-agent-hooks.sh`; see [agents-go-to.md § 4](agents-go-to.md#4-cross-machine-session-registration). |
 | `install-agent-hooks.sh` | Idempotently installs `lifeos-agent-hook.sh` into `~/.claude/settings.json` and `~/.codex/hooks.json`. Run once per machine; safe to re-run. |
+| `taxonomy_bootstrap.py` | Proposes vault taxonomy topics: samples `--sample N` notes (default 200) stratified by top-level folder, collects their frontmatter tags and folder names, and asks the specialist LLM backend (Anthropic, else local, else remote) for `parent/child` topics in the shape of `config/vault_taxonomy.yaml`. Writes `data/taxonomy_proposal.yaml` only, never `config/`; the operator edits it into `config/vault_taxonomy.local.yaml`. Note titles, tags, and short excerpts go to the configured backend. `--dry-run` prints sample sizes and a prompt token estimate without calling the LLM. |
+| `search_attribution_report.py` | Read-only report over the perf-trace database (`--since <date>`, optional `--db`): how many vault searches ran, the mean/median share of final results the keyword arm reaches, the share of searches with zero keyword or zero vector candidates, the keyword match-mode mix, and the `top_k` distribution. Query text is printed only with `--show-queries`. See [observability.md](../specs/technical/observability.md#search-attribution). |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
 | `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync (macOS) |

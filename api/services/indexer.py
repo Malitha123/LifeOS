@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
-from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks
+from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags
 from api.services.vectorstore import VectorStore
 from api.services.bm25_index import BM25Index
 from api.services.people import extract_people_from_text
@@ -425,7 +425,7 @@ class IndexerService:
             "modified_date": self._extract_note_date(path, frontmatter, body),
             "note_type": self._infer_note_type(path),
             "people": all_people,
-            "tags": frontmatter.get("tags", []),
+            "tags": normalize_tags(frontmatter.get("tags")),
             "granola_id": frontmatter.get("granola_id"),  # For context generation
         }
 
@@ -635,23 +635,9 @@ class IndexerService:
         Returns:
             Note type string
         """
-        path_str = str(path).lower()
-        # Also check case-sensitive for ML
-        path_str_orig = str(path)
+        from api.services.vault_listing import infer_note_type
 
-        # ML folder = current job (high priority)
-        if "/ML/" in path_str_orig or "\\ML\\" in path_str_orig:
-            return "ML"
-        elif "granola" in path_str:
-            return "Granola"
-        elif "personal" in path_str:
-            return "Personal"
-        elif "work" in path_str:
-            return "Work"
-        elif "lifeos" in path_str:
-            return "LifeOS"
-        else:
-            return "Other"
+        return infer_note_type(path)
 
     def _sync_people_to_v2(
         self,

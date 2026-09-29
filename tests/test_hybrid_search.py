@@ -387,6 +387,51 @@ class TestHybridSearch:
         )
         assert [r.get("id") for r in results] == ["undated"]
 
+    def test_or_fallback_candidates_are_fused_and_keep_match_mode(self, temp_db):
+        """BM25 any-term candidates enter fusion and surface match_mode."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("only_bm25", "hiring plans", "Hiring.md")
+        bm25.add_document("shared", "roadmap owner", "Roadmap.md")
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "shared", "content": "roadmap owner", "metadata": {}},
+            {"id": "vec_only", "content": "unrelated", "metadata": {}},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        # "hiring" and "roadmap" never co-occur, so BM25 answers in OR mode.
+        results = hybrid.search("hiring roadmap", top_k=5)
+
+        by_id = {r["id"]: r for r in results}
+        assert by_id["only_bm25"]["match_mode"] == "or"
+        assert by_id["shared"]["match_mode"] == "or"
+        assert "match_mode" not in by_id["vec_only"]
+        assert by_id["only_bm25"]["rrf_score"] > 0
+
+    def test_bm25_exception_records_degradation(self):
+        """A raising BM25 index degrades to vector-only and records it."""
+        from api.services.hybrid_search import HybridSearch
+        from unittest.mock import MagicMock, patch
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "chunk1", "content": "Test content", "metadata": {}},
+        ]
+        broken_bm25 = MagicMock()
+        broken_bm25.search.side_effect = RuntimeError("index unreadable")
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=broken_bm25)
+        with patch("api.services.service_health.record_degradation") as record:
+            results = hybrid.search("test", top_k=5)
+
+        assert [r["id"] for r in results] == ["chunk1"]
+        record.assert_called_once()
+        assert record.call_args.args[:3] == ("bm25_index", "hybrid_search", "vector_only")
+
     def test_fallback_to_vector_only(self, temp_db):
         """Should fallback to vector search if BM25 returns no results."""
         from api.services.hybrid_search import HybridSearch
@@ -908,3 +953,182 @@ class TestQueryAwareReranking:
         assert 1 in protected
         assert 0 not in protected
         assert 2 not in protected
+
+
+class TestSearchAttribution:
+    """Each search records the tool query and per-arm attribution of the
+    returned results in a ``search_attribution`` span, and tags every result
+    with ``found_by``."""
+
+    @pytest.fixture
+    def temp_db(self):
+        with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
+            yield f.name
+        os.unlink(f.name)
+
+    @pytest.fixture
+    def trace(self):
+        from api.services import perf_trace
+        t = perf_trace.start_trace("conv", "synthetic question", "test")
+        yield t
+        perf_trace._current_trace.set(None)
+
+    @staticmethod
+    def _attribution_span(trace):
+        spans = [s for s in trace.spans if s.name == "search_attribution"]
+        assert len(spans) == 1
+        assert spans[0].parent == "tool_search_vault"
+        return spans[0].metadata
+
+    @staticmethod
+    def _vector_store(ids):
+        from unittest.mock import MagicMock
+        store = MagicMock()
+        store.search.return_value = [
+            {"id": i, "content": f"content {i}", "metadata": {}} for i in ids
+        ]
+        return store
+
+    def _bm25(self, temp_db):
+        from api.services.bm25_index import BM25Index
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("both_chunk", "zebra budget notes", "Both.md")
+        bm25.add_document("bm25_chunk", "zebra budget ledger", "Bm25.md")
+        return bm25
+
+    def test_found_by_and_span_metadata(self, temp_db, trace):
+        from api.services.hybrid_search import HybridSearch
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk", "vec_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        results = hybrid.search("zebra budget", top_k=10, use_reranker=False)
+
+        found_by = {r["id"]: r["found_by"] for r in results}
+        assert found_by == {"both_chunk": "both", "vec_chunk": "vector", "bm25_chunk": "bm25"}
+
+        meta = self._attribution_span(trace)
+        assert meta["query"] == "zebra budget"
+        assert meta["vector_candidates"] == 2
+        assert meta["bm25_candidates"] == 2
+        assert meta["bm25_match_mode"] == {"and": 2}
+        assert meta["attribution"] == {"vector_only": 1, "bm25_only": 1, "both": 1}
+        assert meta["top_k"] == 10
+
+    def test_or_fallback_mode_is_recorded(self, temp_db, trace):
+        from api.services.hybrid_search import HybridSearch
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["vec_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        hybrid.search("zebra nonexistentterm", top_k=10, use_reranker=False)
+        assert self._attribution_span(trace)["bm25_match_mode"] == {"or": 2}
+
+    def test_mixed_match_modes_are_counted(self, trace):
+        from unittest.mock import MagicMock
+        from api.services.hybrid_search import HybridSearch
+        bm25 = MagicMock()
+        bm25.search.return_value = [
+            {"doc_id": "a", "content": "a", "file_name": "A.md", "match_mode": "and"},
+            {"doc_id": "b", "content": "b", "file_name": "B.md", "match_mode": "or"},
+            {"doc_id": "c", "content": "c", "file_name": "C.md", "match_mode": "or"},
+        ]
+        hybrid = HybridSearch(vector_store=self._vector_store(["a"]), bm25_index=bm25)
+        hybrid.search("anything", top_k=10, use_reranker=False)
+        meta = self._attribution_span(trace)
+        assert meta["bm25_match_mode"] == {"and": 1, "or": 2}
+        assert meta["bm25_candidates"] == 3
+
+    def test_vector_only_early_return_records_attribution(self, temp_db, trace):
+        from api.services.hybrid_search import HybridSearch
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["v1", "v2", "v3"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        results = hybrid.search("qqqunmatched", top_k=2, use_reranker=False)
+
+        assert [r["found_by"] for r in results] == ["vector", "vector"]
+        meta = self._attribution_span(trace)
+        assert meta["bm25_candidates"] == 0
+        assert meta["vector_candidates"] == 3
+        assert meta["bm25_match_mode"] == "none"
+        assert meta["attribution"] == {"vector_only": 2, "bm25_only": 0, "both": 0}
+        assert meta["top_k"] == 2
+
+    def test_bm25_error_is_recorded(self, trace):
+        from unittest.mock import MagicMock
+        from api.services.hybrid_search import HybridSearch
+        bm25 = MagicMock()
+        bm25.search.side_effect = RuntimeError("boom")
+        hybrid = HybridSearch(vector_store=self._vector_store(["v1"]), bm25_index=bm25)
+        results = hybrid.search("anything", top_k=5, use_reranker=False)
+
+        assert results[0]["found_by"] == "vector"
+        meta = self._attribution_span(trace)
+        assert meta["bm25_match_mode"] == "error"
+        assert meta["attribution"]["vector_only"] == 1
+
+    def test_attribution_counts_only_returned_results(self, temp_db, trace):
+        """Attribution covers the list actually returned, after truncation."""
+        from api.services.hybrid_search import HybridSearch
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk", "vec_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        results = hybrid.search("zebra budget", top_k=1, use_reranker=False)
+
+        assert len(results) == 1
+        meta = self._attribution_span(trace)
+        assert sum(meta["attribution"].values()) == 1
+
+    def test_attribution_counts_after_rerank(self, temp_db, trace, monkeypatch):
+        """When the reranker truncates, attribution follows the reranked list."""
+        from unittest.mock import MagicMock
+        from api.services import reranker as reranker_mod
+        from api.services.hybrid_search import HybridSearch
+
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk", "vec_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        fake = MagicMock()
+        # Keep only the vector-only result, whatever the fused order was.
+        fake.rerank.side_effect = lambda query, results, top_k, **kw: [
+            r for r in results if r["found_by"] == "vector"
+        ][:top_k]
+        monkeypatch.setattr(reranker_mod, "get_reranker", lambda: fake)
+
+        results = hybrid.search("zebra budget", top_k=1, use_reranker=True)
+        assert [r["found_by"] for r in results] == ["vector"]
+        assert self._attribution_span(trace)["attribution"] == {
+            "vector_only": 1, "bm25_only": 0, "both": 0,
+        }
+
+    def test_metadata_round_trips_through_trace_store(self, temp_db, trace, tmp_path):
+        from api.services.hybrid_search import HybridSearch
+        from api.services.perf_trace import PerfTraceStore
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        hybrid.search("zebra budget", top_k=5, use_reranker=False)
+
+        store = PerfTraceStore(str(tmp_path / "traces.db"))
+        store.save_trace(trace)
+        saved = store.get_trace(trace.trace_id)
+        spans = [s for s in saved["spans"] if s["name"] == "search_attribution"]
+        assert spans[0]["metadata"]["attribution"] == {
+            "vector_only": 0, "bm25_only": 1, "both": 1,
+        }
+        assert spans[0]["metadata"]["query"] == "zebra budget"
+
+    def test_no_active_trace_leaves_behaviour_unchanged(self, temp_db):
+        from api.services import perf_trace
+        from api.services.hybrid_search import HybridSearch
+        perf_trace._current_trace.set(None)
+        hybrid = HybridSearch(
+            vector_store=self._vector_store(["both_chunk"]),
+            bm25_index=self._bm25(temp_db),
+        )
+        results = hybrid.search("zebra budget", top_k=5, use_reranker=False)
+        assert {r["found_by"] for r in results} == {"both", "bm25"}

@@ -187,6 +187,11 @@ CURATED_ENDPOINTS = {
         "description": "Write a text file into the Obsidian vault. Use for any task needing a `.md` deliverable. `path` is vault-relative; parents auto-created. `mode`: `create` (default), `overwrite`, `append`.",
         "method": "POST"
     },
+    "/api/vault/list": {
+        "name": "lifeos_vault_list",
+        "description": "List vault notes in a folder or glob, newest first, with date, note type, tags and total. Use to browse structure before searching. `path` is vault-relative; page with `limit`/`offset`.",
+        "method": "GET"
+    },
     "/api/conversations": {
         "name": "lifeos_conversations_list",
         "description": "List recent LifeOS conversations. Returns conversation IDs and titles for continuing previous chats.",
@@ -555,7 +560,7 @@ CURATED_ENDPOINTS = {
 
 # Contract count for the source catalog. The live fallback catalog is 71
 # curated tools plus 11 lifeos_agent_* tools = 82.
-CURATED_TOOL_COUNT = 71
+CURATED_TOOL_COUNT = 72
 
 
 class LifeOSMCPServer:
@@ -771,6 +776,9 @@ class LifeOSMCPServer:
                 }
                 if "items" in param_schema:
                     properties[name]["items"] = param_schema["items"]
+                for constraint in ("minimum", "maximum", "default"):
+                    if constraint in param_schema:
+                        properties[name][constraint] = param_schema[constraint]
                 if param.get("required"):
                     required.append(name)
 
@@ -861,11 +869,21 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "top_k": {"type": "integer", "description": "Number of results (1-100)", "default": 10},
+                    "top_k": {"type": "integer", "description": "Number of results (1-100, default 20)", "default": 20},
                     "date_from": {"type": "string", "description": "Only return notes on/after this date (YYYY-MM-DD). Resolve relative phrases like 'last week' against today's date before passing."},
                     "date_to": {"type": "string", "description": "Only return notes on/before this date (YYYY-MM-DD)."}
                 },
                 "required": ["query"]
+            },
+            "lifeos_vault_list": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Vault-relative folder; omit or '' for the vault root.", "default": ""},
+                    "glob": {"type": "string", "description": "Glob relative to path (default '**/*.md')."},
+                    "limit": {"type": "integer", "description": "Entries per page, 1-200 (default 50).", "minimum": 1, "maximum": 200, "default": 50},
+                    "offset": {"type": "integer", "description": "Entries to skip for the next page (default 0).", "minimum": 0, "default": 0}
+                },
+                "required": []
             },
             "lifeos_calendar_upcoming": {
                 "type": "object",
@@ -941,6 +959,7 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "q": {"type": "string", "description": "Name or email to search"},
+                    # 10/50 is the deliberate LLM-facing override applied by _cap_people_search_limit
                     "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10, "maximum": 50}
                 },
                 "required": ["q"]
@@ -1008,7 +1027,7 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "person_id": {"type": "string", "description": "The person's entity_id from lifeos_people_search"},
-                    "days_back": {"type": "integer", "description": "Days of history to include (default: 365)", "default": 365},
+                    "days_back": {"type": "integer", "description": "Days to look back (default 3650, max 3660)", "minimum": 1, "maximum": 3660, "default": 3650},
                     "source_type": {"type": "string", "description": "Filter by source type (e.g., 'imessage', 'gmail,slack')"},
                     "limit": {"type": "integer", "description": "Max results (default: 50)", "default": 50}
                 },
