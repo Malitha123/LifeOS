@@ -478,6 +478,8 @@ class HybridSearch:
                     bm25_results_by_id = {r["doc_id"]: r for r in bm25_results}
                 except Exception as e:
                     logger.warning(f"BM25 search failed: {e}")
+                    from api.services.service_health import record_degradation
+                    record_degradation("bm25_index", "hybrid_search", "vector_only", "BM25 search failed")
 
         # If no BM25 results, return vector results directly
         if not bm25_doc_ids:
@@ -545,6 +547,10 @@ class HybridSearch:
                 else:
                     # Unknown result, create minimal
                     result = {"id": doc_id, "content": "", "metadata": {}}
+
+                match_mode = bm25_results_by_id.get(doc_id, {}).get("match_mode")
+                if match_mode:
+                    result["match_mode"] = match_mode
 
                 # Drop results outside the requested date window.
                 if not in_date_range(result, date_from, date_to):
