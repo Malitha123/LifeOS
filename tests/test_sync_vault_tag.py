@@ -168,3 +168,45 @@ def test_dry_run_sends_nothing_and_writes_nothing(env, capsys):
     ask.assert_not_called()
     assert store.get("Notes/a.md") is None
     assert stats["would_tag"] == 3 and stats["tagged"] == 0
+
+
+def test_restricted_tag_setting_change_retags_code_only_note(env, monkeypatch):
+    vault, store = env
+    (vault / "Notes" / "f.md").write_text("---\ntags: [finance]\n---\nbudget\n")
+    (vault / "Notes" / "p.md").write_text("---\ntags: [private]\n---\nnotes\n")
+    _run()
+    for rel in ("Notes/f.md", "Notes/p.md"):
+        rec = store.get(rel)
+        assert rec.backend == "code" and rec.sensitivity == "restricted"
+
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", "private,confidential")
+    stats, ask = _run()
+    assert ask.call_count == 1 and stats["tagged"] == 1
+    rec = store.get("Notes/f.md")
+    assert rec.backend == "jev" and rec.sensitivity == "private"
+    assert store.get("Notes/p.md").backend == "code"
+
+    stats, ask = _run()
+    assert not ask.called and stats["tagged"] == 0
+
+
+def test_folded_restricted_tag_is_not_sent_by_nightly_retag(env, monkeypatch):
+    vault, store = env
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", "straße")
+    (vault / "Notes" / "f.md").write_text("---\ntags: [STRASSE]\n---\nx\n#straße/child\n")
+    _run()
+    stats, ask = _run()
+    assert ask.call_count == 0 and store.get("Notes/f.md").backend == "code"
+
+
+@pytest.mark.parametrize("tag", ["1-1", "_private", "équipe"])
+def test_retag_of_a_previously_sent_row_does_not_send_a_restricted_inline_tag(env, monkeypatch, tag):
+    vault, store = env
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", tag)
+    _run()
+    assert store.get("Notes/a.md").backend == "jev"
+    (vault / "Notes" / "a.md").write_text(f"# A\nchanged #{tag}\n")
+    stats, ask = _run()
+    assert stats["restricted"] == 1 and ask.call_count == 0
+    rec = store.get("Notes/a.md")
+    assert rec.backend == "code" and rec.sensitivity == "restricted"
