@@ -829,20 +829,36 @@ class TestStalenessAlerting:
         assert "fresh" in caplog.text.lower()
         assert "WARNING" not in caplog.text.split("fresh")[0]  # No warning before "fresh"
 
-    def test_stale_48h_warning(self, tmp_path, caplog):
+    def test_stale_30h_warning(self, tmp_path, caplog):
         from scripts.apple_data_import import check_manifest
 
         import_dir = tmp_path / "apple-imports"
-        stale = datetime.now(timezone.utc) - timedelta(hours=50)
+        stale = datetime.now(timezone.utc) - timedelta(hours=30)
         self._write_manifest(import_dir, stale.isoformat())
 
         with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
             with caplog.at_level(logging.WARNING):
                 check_manifest()
 
-        assert any("50h old" in r.message for r in caplog.records if r.levelno >= logging.WARNING)
+        assert any("30h old" in r.message for r in caplog.records if r.levelno >= logging.WARNING)
 
-    def test_stale_7d_critical(self, tmp_path, caplog):
+    def test_stale_36h_critical(self, tmp_path, caplog):
+        """Data just past the critical threshold fails, not just warns."""
+        from scripts.apple_data_import import check_manifest
+
+        import_dir = tmp_path / "apple-imports"
+        stale = datetime.now(timezone.utc) - timedelta(hours=40)
+        self._write_manifest(import_dir, stale.isoformat())
+
+        with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):
+            with caplog.at_level(logging.DEBUG):
+                result = check_manifest()
+
+        assert any(r.levelno >= logging.CRITICAL for r in caplog.records)
+        assert result is not None
+        assert "_staleness_critical_message" in result
+
+    def test_stale_very_old_critical(self, tmp_path, caplog):
         from scripts.apple_data_import import check_manifest
 
         import_dir = tmp_path / "apple-imports"
@@ -856,7 +872,7 @@ class TestStalenessAlerting:
         assert any(r.levelno >= logging.CRITICAL for r in caplog.records)
         assert any("10 days old" in r.message for r in caplog.records)
 
-    def test_stale_7d_critical_sets_structured_message(self, tmp_path, caplog):
+    def test_stale_very_old_critical_sets_structured_message(self, tmp_path, caplog):
         """The staleness signal must be readable
         from check_manifest()'s return value, not just the log stream. A
         CRITICAL log line lands in the sync log file fine, but it doesn't
@@ -891,12 +907,12 @@ class TestStalenessAlerting:
         assert result is not None
         assert "_staleness_critical_message" not in result
 
-    def test_stale_48h_no_structured_critical_message(self, tmp_path, caplog):
-        """The 48h WARNING tier must not set the critical-only flag."""
+    def test_stale_30h_no_structured_critical_message(self, tmp_path, caplog):
+        """The WARNING tier must not set the critical-only flag."""
         from scripts.apple_data_import import check_manifest
 
         import_dir = tmp_path / "apple-imports"
-        stale = datetime.now(timezone.utc) - timedelta(hours=50)
+        stale = datetime.now(timezone.utc) - timedelta(hours=30)
         self._write_manifest(import_dir, stale.isoformat())
 
         with patch("scripts.apple_data_import.IMPORT_DIR", import_dir):

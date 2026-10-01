@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 IMPORT_DIR = PROJECT_ROOT / "data" / "apple-imports"
 
 
-STALENESS_WARNING_HOURS = 48
-STALENESS_CRITICAL_HOURS = 168  # 7 days
+STALENESS_WARNING_HOURS = 26
+STALENESS_CRITICAL_HOURS = 36
 
 
 def _get_local_main_sha() -> str | None:
@@ -74,8 +74,9 @@ def check_manifest() -> dict | None:
     """Check the import manifest for freshness and per-source errors.
 
     Logs warnings/errors based on data age:
-    - >48h: WARNING (picked up by nightly health batch)
-    - >7d:  CRITICAL-level log, AND sets manifest["_staleness_critical_message"]
+    - >STALENESS_WARNING_HOURS:  WARNING (picked up by nightly health batch)
+    - >STALENESS_CRITICAL_HOURS: CRITICAL-level log, AND sets
+      manifest["_staleness_critical_message"]
 
     Also walks manifest["results"] and logs CRITICAL for any source the Mac
     Mini export marked with status == "error". The caller (main) uses the
