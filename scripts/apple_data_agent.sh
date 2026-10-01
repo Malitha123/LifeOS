@@ -52,13 +52,14 @@ retry_with_backoff() {
 
     local attempt=1
     while (( attempt <= max_attempts )); do
-        if "$@"; then
+        local rc=0
+        "$@" || rc=$?
+        if (( rc == 0 )); then
             if (( attempt > 1 )); then
                 log "${label}: succeeded on attempt ${attempt}/${max_attempts}"
             fi
             return 0
         fi
-        local rc=$?
         if (( attempt < max_attempts )); then
             local delay=${delays[$((attempt - 1))]}
             log "${label}: attempt ${attempt}/${max_attempts} failed (exit ${rc}); retrying in ${delay}s..."
