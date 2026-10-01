@@ -238,7 +238,12 @@ run_rsync() {
 if retry_with_backoff "Rsync" "${RETRY_DELAYS}" run_rsync; then
     log "Rsync: OK"
 else
-    log "Rsync: FAILED after retries (exports saved locally)"
+    rc=$?
+    log "Rsync: FAILED after retries (exports saved locally, exit ${rc})"
+    send_telegram "🚨 *LifeOS Apple Rsync Failed*
+Rsync to ${LINUX_SERVER} failed after retries (exit ${rc}).
+Exports saved locally at ${EXPORT_DIR} — will retry next run.
+See ${LOG_FILE} for details."
     exit 1
 fi
 

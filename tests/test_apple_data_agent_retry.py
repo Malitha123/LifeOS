@@ -35,12 +35,19 @@ def _run(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
     text = AGENT_SCRIPT.read_text(encoding="utf-8")
     log_file = tmp_path / "agent.log"
     counter = tmp_path / "attempts"
+    telegram_calls = tmp_path / "telegram_calls"
     script = "\n".join(
         [
             "set -euo pipefail",
             f'LOG_FILE="{log_file}"',
             f'COUNTER="{counter}"',
+            f'TELEGRAM_CALLS="{telegram_calls}"',
             'RETRY_DELAYS="0,0,0"',
+            'LINUX_SERVER="test-server.example"',
+            'EXPORT_DIR="/tmp/exports/"',
+            # Stub: records every call instead of hitting the network,
+            # one call per line in the counter so tests can count calls.
+            'send_telegram() { echo "$1" >> "${TELEGRAM_CALLS}"; echo "---" >> "${COUNTER}.telegram"; }',
             _function_source(text, "log"),
             _function_source(text, "retry_with_backoff"),
             # Fails with exit 7 on every call.
@@ -104,3 +111,34 @@ def test_rsync_gate_exits_nonzero_and_skips_import_when_every_attempt_fails(
     assert "Rsync: FAILED after retries" in result.stdout
     assert "Rsync: OK" not in result.stdout
     assert "Step 4" not in result.stdout
+
+
+@pytest.mark.unit
+def test_rsync_gate_alerts_telegram_on_failure_naming_host_and_exit_code(
+    tmp_path: Path,
+):
+    text = AGENT_SCRIPT.read_text(encoding="utf-8")
+    result = _run(
+        tmp_path,
+        "run_rsync() { always_fail; }\n" + _rsync_gate_source(text),
+    )
+
+    assert result.returncode == 1
+    call_count = (tmp_path / "attempts.telegram").read_text().count("---")
+    assert call_count == 1, call_count
+    telegram_calls = (tmp_path / "telegram_calls").read_text()
+    assert "test-server.example" in telegram_calls
+    assert "exit 7" in telegram_calls
+
+
+@pytest.mark.unit
+def test_rsync_gate_does_not_alert_telegram_on_success(tmp_path: Path):
+    text = AGENT_SCRIPT.read_text(encoding="utf-8")
+    result = _run(
+        tmp_path,
+        "run_rsync() { :; }\n" + _rsync_gate_source(text),
+    )
+
+    assert result.returncode == 0
+    assert "Rsync: OK" in result.stdout
+    assert not (tmp_path / "telegram_calls").exists()
