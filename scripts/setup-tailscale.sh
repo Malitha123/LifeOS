@@ -17,10 +17,10 @@ source "$ROOT/scripts/lib/tailscale-routes.sh"
 
 ROUTES_FILE="${LIFEOS_TAILSCALE_ROUTES_FILE:-$ROOT/config/tailscale-routes.local}"
 
-if ! ts_load_routes "$ROUTES_FILE"; then
-  echo "Invalid routes file; nothing applied." >&2
-  exit 1
-fi
+# A malformed line drops only that line: the valid routes (always including
+# LifeOS's own) are still applied, then the run fails.
+invalid=0
+ts_load_routes "$ROUTES_FILE" || invalid=1
 
 for route in "${ROUTES[@]}"; do
   ts_apply_route "$route"
@@ -34,6 +34,29 @@ for route in "${ROUTES[@]}"; do
     missing=1
   fi
 done
+
+# Exposure must match the declaration: a route is public only when declared
+# funnel=on (which the loader accepts only with the opt-in).
+for port in $(ts_declared_ports); do
+  if ts_wants_public "$port"; then
+    if ! ts_port_public "$port"; then
+      echo "MISSING funnel exposure on https=${port}" >&2
+      missing=1
+    fi
+  elif ts_port_public "$port"; then
+    echo "Port https=${port} is public but declared private; turning funnel off." >&2
+    tailscale funnel --https="$port" off || true
+    if ts_port_public "$port"; then
+      echo "STILL PUBLIC: https=${port}" >&2
+      missing=1
+    fi
+  fi
+done
+
+if [[ $invalid -eq 1 ]]; then
+  echo "Routes file has invalid lines (skipped); see messages above." >&2
+  missing=1
+fi
 
 echo "LifeOS tailnet URLs:"
 if [[ -n "${TAILNET_HTTPS_URL:-}" ]]; then

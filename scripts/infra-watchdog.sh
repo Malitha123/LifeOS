@@ -39,7 +39,7 @@ send_telegram() {
     bot_token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
     chat_id=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2-)
     [ -n "$bot_token" ] && [ -n "$chat_id" ] || return 1
-    "${LIFEOS_WATCHDOG_CURL:-/usr/bin/curl}" -s -f -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
+    "${LIFEOS_WATCHDOG_CURL:-/usr/bin/curl}" -s -f --connect-timeout 5 --max-time 15 -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
         --data-urlencode "text=${message}" > /dev/null 2>&1
 }
@@ -82,8 +82,7 @@ check_routes() {
     if ! ts_load_routes "$ROUTES_FILE" 2> "$errfile"; then
         err=$(cat "$errfile")
         log "routes: invalid routes file: ${err//$'\n'/ }"
-        alert routes-config "LifeOS host: tailnet routes file is invalid, so no declared routes are being checked. ${err}"
-        return 0
+        alert routes-config "LifeOS host: tailnet routes file has invalid lines that are being skipped. ${err}"
     fi
 
     local route port path target missing=() reapplied=() still=()
@@ -93,7 +92,6 @@ check_routes() {
     done
     if [ ${#missing[@]} -eq 0 ]; then
         log "routes: ${#ROUTES[@]} declared, all present"
-        return 0
     fi
 
     for route in "${missing[@]}"; do
@@ -110,6 +108,39 @@ check_routes() {
         log "routes: still missing after re-apply: ${still[*]}"
         alert routes "LifeOS host: tailnet route(s) missing and could not be re-applied: ${still[*]}"
     fi
+    check_exposure
+}
+
+# Public exposure (Funnel) must match the declaration. A port found public that
+# is declared private is switched off and alerted; a declared-public port found
+# private is re-applied. Nothing is ever made public without a funnel=on line,
+# and the loader accepts those only with LIFEOS_TAILSCALE_ALLOW_FUNNEL=true.
+check_exposure() {
+    local port route r_port funnel
+    for port in $(ts_declared_ports); do
+        if ts_wants_public "$port"; then
+            ts_port_public "$port" && continue
+            for route in "${ROUTES[@]}"; do
+                IFS='|' read -r r_port _ _ funnel <<< "$route"
+                [[ "$r_port" == "$port" && "$funnel" == "on" ]] && ts_apply_route "$route" > /dev/null 2>&1
+            done
+            if ts_port_public "$port"; then
+                log "exposure: https=${port} was private but declared public; re-applied"
+            else
+                log "exposure: https=${port} declared public but could not be restored"
+                alert "exposure-${port}" "LifeOS host: tailnet port ${port} is declared public (funnel=on) but is not, and could not be restored."
+            fi
+        elif ts_port_public "$port"; then
+            tailscale funnel --https="$port" off > /dev/null 2>&1
+            if ts_port_public "$port"; then
+                log "exposure: https=${port} is public, declared private; funnel off FAILED"
+                alert "exposure-${port}" "LifeOS host: tailnet port ${port} is publicly exposed (Funnel) but declared private, and it could not be turned off."
+            else
+                log "exposure: https=${port} was public, declared private; funnel turned off"
+                alert "exposure-${port}" "LifeOS host: tailnet port ${port} was publicly exposed (Funnel) but declared private. Funnel has been turned off."
+            fi
+        fi
+    done
 }
 
 check_pebble() {
@@ -117,7 +148,7 @@ check_pebble() {
     if [ -z "$url" ]; then
         return 0
     fi
-    if curl -sf -m 10 -o /dev/null "$url"; then
+    if curl -sf --connect-timeout 5 -m 10 -o /dev/null "$url"; then
         echo 0 > "$count_file"
         log "pebble: healthy"
         return 0

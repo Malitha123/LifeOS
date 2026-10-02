@@ -191,8 +191,16 @@ if [ -d "$USER_UNIT_SRC" ]; then
             | runuser -u "$REAL_USER" -- tee "$USER_UNIT_DST/$(basename "$unit")" > /dev/null
         echo "  Installed user unit $(basename "$unit")"
     done
+    # Without lingering the user manager (and its timers) stops at logout and
+    # does not start at boot with nobody logged in.
+    if ! "$SCRIPT_DIR/ensure-linger.sh" "$REAL_USER"; then
+        echo "  lifeos-infra-watchdog.timer: NOT enabled (lingering unavailable)" >&2
+        INFRA_TIMER_FAILED=1
+    fi
     USER_SYSTEMCTL=(runuser -u "$REAL_USER" -- env "XDG_RUNTIME_DIR=/run/user/$REAL_UID" systemctl --user)
-    if "${USER_SYSTEMCTL[@]}" daemon-reload 2>/dev/null; then
+    if [ "${INFRA_TIMER_FAILED:-0}" = "1" ]; then
+        :
+    elif "${USER_SYSTEMCTL[@]}" daemon-reload 2>/dev/null; then
         "${USER_SYSTEMCTL[@]}" enable --now lifeos-infra-watchdog.timer
         echo "  lifeos-infra-watchdog.timer (user): $("${USER_SYSTEMCTL[@]}" is-active lifeos-infra-watchdog.timer)"
     else
@@ -320,4 +328,9 @@ echo "=== Timer Status ==="
 systemctl list-timers lifeos-* --no-pager 2>/dev/null || true
 
 echo ""
+if [ "${INFRA_TIMER_FAILED:-0}" = "1" ]; then
+    echo "Setup finished with errors: the infra watchdog timer was not enabled (see the linger warning above)." >&2
+    exit 1
+fi
+
 echo "Setup complete. Check health with: curl http://localhost:8000/health/full | jq"

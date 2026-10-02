@@ -17,6 +17,7 @@ ts_load_routes() {
     local r_port r_path r_target r_funnel
     while IFS= read -r line || [[ -n "$line" ]]; do
         lineno=$((lineno + 1))
+        line="${line%$'\r'}"
         line="${line%%#*}"
         [[ -n "${line//[[:space:]]/}" ]] || continue
         r_port="" r_path="" r_target="" r_funnel="off" bad=0
@@ -89,4 +90,40 @@ ts_apply_route() {
     else
         tailscale serve --bg --https="$port" --set-path "$path" "$target"
     fi
+}
+
+# Succeeds when the tailnet port is publicly exposed (Funnel) on any host entry.
+ts_port_public() {
+    local port="$1"
+    tailscale serve status --json 2>/dev/null | python3 -c '
+import json, sys
+port = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+for hostport, on in (data.get("AllowFunnel") or {}).items():
+    if on and hostport.rsplit(":", 1)[-1] == port:
+        sys.exit(0)
+sys.exit(1)
+' "$port"
+}
+
+# Succeeds when any declared route on the port has funnel=on.
+ts_wants_public() {
+    local port="$1" route r_port funnel
+    for route in "${ROUTES[@]}"; do
+        IFS='|' read -r r_port _ _ funnel <<< "$route"
+        [[ "$r_port" == "$port" && "$funnel" == "on" ]] && return 0
+    done
+    return 1
+}
+
+# Declared ports, one per line, without duplicates.
+ts_declared_ports() {
+    local route r_port
+    for route in "${ROUTES[@]}"; do
+        IFS='|' read -r r_port _ <<< "$route"
+        echo "$r_port"
+    done | sort -un
 }

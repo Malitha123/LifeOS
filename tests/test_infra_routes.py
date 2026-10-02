@@ -19,6 +19,8 @@ pytestmark = pytest.mark.unit
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SETUP = REPO_ROOT / "scripts" / "setup-tailscale.sh"
 WATCHDOG = REPO_ROOT / "scripts" / "infra-watchdog.sh"
+LINGER = REPO_ROOT / "scripts" / "ensure-linger.sh"
+SERVICE = REPO_ROOT / "config" / "systemd" / "user" / "lifeos-infra-watchdog.service"
 
 HOST = "example-host.tailnet.ts.net"
 
@@ -35,21 +37,30 @@ except OSError:
 if args[:2] == ["serve", "reset"]:
     state = {}
 elif args[:2] == ["serve", "status"] and "--json" in args:
-    web = {}
+    web, funnel = {}, {}
     for key, target in state.items():
         port, path = key.split("|", 1)
+        if port == "funnel":
+            funnel[os.environ["FAKE_TS_HOST"] + ":" + path] = True
+            continue
         web.setdefault(os.environ["FAKE_TS_HOST"] + ":" + port, {"Handlers": {}})["Handlers"][path] = {"Proxy": target}
-    print(json.dumps({"Web": web}))
+    print(json.dumps({"Web": web, "AllowFunnel": funnel}))
     sys.exit(0)
 elif args[:2] == ["serve", "status"]:
     print("fake serve status")
     sys.exit(0)
+elif args[0] == "funnel" and args[-1] == "off":
+    port = next(a.split("=", 1)[1] for a in args if a.startswith("--https="))
+    if not os.environ.get("FAKE_FUNNEL_STUCK"):
+        state.pop("funnel|" + port, None)
 elif args[0] in ("serve", "funnel"):
     port = next(a.split("=", 1)[1] for a in args if a.startswith("--https="))
     path = args[args.index("--set-path") + 1]
     target = args[-1]
     if port != os.environ.get("FAKE_TS_DROP_PORT"):
         state[port + "|" + path] = target
+        if args[0] == "funnel":
+            state["funnel|" + port] = True
 json.dump(state, open(state_path, "w"))
 '''
 
@@ -64,6 +75,14 @@ esac
 PGREP_FAKE = '''#!/usr/bin/env bash
 echo "pgrep $*" >> "$FAKE_ACTIONS"
 [ "${FAKE_OBSIDIAN:-0}" = "1" ] && exit 0 || exit 1
+'''
+
+LOGINCTL_FAKE = '''#!/usr/bin/env bash
+echo "loginctl $*" >> "$FAKE_ACTIONS"
+if [ "$1" = "show-user" ]; then
+    [ "${FAKE_LINGER:-yes}" = "yes" ] && echo "Linger=yes" || echo "Linger=no"
+fi
+exit 0
 '''
 
 SYSTEMD_RUN_FAKE = '''#!/usr/bin/env bash
@@ -81,6 +100,7 @@ def box(tmp_path):
         ("curl", CURL_FAKE),
         ("pgrep", PGREP_FAKE),
         ("systemd-run", SYSTEMD_RUN_FAKE),
+        ("loginctl", LOGINCTL_FAKE),
     ):
         p = bin_dir / name
         p.write_text(body)
@@ -115,6 +135,12 @@ def box(tmp_path):
             ["bash", str(script)], env=env, capture_output=True, text=True, timeout=30
         )
 
+    def run_args(script, args, extra=None):
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "FAKE_ACTIONS": str(actions)}
+        env.update(extra or {})
+        return subprocess.run(["bash", str(script), *args], env=env, capture_output=True, text=True, timeout=30)
+
+    b.linger = lambda extra=None: run_args(LINGER, ["example-user"], extra)
     b.setup = lambda extra=None: run(SETUP, extra)
     b.watch = lambda extra=None: run(WATCHDOG, extra)
     b.log = lambda: actions.read_text().splitlines() if actions.exists() else []
@@ -174,7 +200,9 @@ def test_funnel_rejected_without_opt_in(box):
     r = box.setup()
     assert r.returncode != 0
     assert "LIFEOS_TAILSCALE_ALLOW_FUNNEL" in r.stderr
-    assert not any(a.startswith("tailscale funnel") or "serve --bg" in a for a in box.log())
+    assert not any(a.startswith("tailscale funnel") for a in box.log())
+    assert "8443|/webhooks/pebble" not in box.table()
+    assert box.table()["443|/"] == "http://127.0.0.1:8000"
 
 
 def test_funnel_allowed_with_opt_in(box):
@@ -184,11 +212,36 @@ def test_funnel_allowed_with_opt_in(box):
     assert any(a.startswith("tailscale funnel --bg --https=8443") for a in box.log())
 
 
-def test_invalid_route_line_applies_nothing(box):
-    box.routes.write_text("https=abc path=nope target=ftp://x\n")
+def test_invalid_route_line_fails_only_that_line(box):
+    box.routes.write_text("https=abc path=nope target=ftp://x\n" + PEBBLE_LINE)
     r = box.setup()
     assert r.returncode != 0
-    assert box.log() == []
+    assert box.table() == {
+        "443|/": "http://127.0.0.1:8000",
+        "8443|/webhooks/pebble": "http://127.0.0.1:9790/webhooks/pebble",
+    }
+
+
+def test_crlf_routes_file_is_parsed(box):
+    box.routes.write_text(PEBBLE_LINE.rstrip("\n") + "\r\n# note\r\n")
+    r = box.setup()
+    assert r.returncode == 0, r.stderr
+    assert "8443|/webhooks/pebble" in box.table()
+
+
+def test_watchdog_still_checks_valid_routes_when_a_line_is_malformed(box):
+    box.routes.write_text("garbage\n" + PEBBLE_LINE)
+    box.watch()
+    assert "8443|/webhooks/pebble" in box.table()
+    assert len(box.telegrams()) == 1
+
+
+def test_setup_turns_off_funnel_on_a_declared_private_port(box):
+    box.routes.write_text(PEBBLE_LINE)
+    box.ts_state.write_text(json.dumps({"funnel|8443": True}))
+    r = box.setup()
+    assert r.returncode == 0, r.stderr
+    assert "funnel|8443" not in box.table()
 
 
 # ---- infra-watchdog.sh ------------------------------------------------------
@@ -308,6 +361,80 @@ def test_watchdog_obsidian_launch_command_is_configurable(box):
         }
     )
     assert "systemd-run --user custom-launch" in box.log()
+
+
+def test_watchdog_turns_funnel_off_for_a_private_route_found_public(box):
+    box.routes.write_text(PEBBLE_LINE)
+    box.setup()
+    state = box.table()
+    state["funnel|8443"] = True
+    box.ts_state.write_text(json.dumps(state))
+    r = box.watch()
+    assert r.returncode == 0
+    assert "tailscale funnel --https=8443 off" in box.log()
+    assert "funnel|8443" not in box.table()
+    assert len(box.telegrams()) == 1
+
+
+def test_watchdog_alerts_when_funnel_cannot_be_turned_off(box):
+    box.routes.write_text(PEBBLE_LINE)
+    box.setup()
+    state = box.table()
+    state["funnel|8443"] = True
+    box.ts_state.write_text(json.dumps(state))
+    box.watch({"FAKE_FUNNEL_STUCK": "1"})
+    assert "FAILED" in (box.state_dir / "infra-watchdog.log").read_text()
+    assert len(box.telegrams()) == 1
+
+
+def test_watchdog_never_makes_a_private_port_public(box):
+    box.routes.write_text(PEBBLE_LINE)
+    box.watch()
+    assert not any(a.startswith("tailscale funnel") and not a.endswith(" off") for a in box.log())
+    assert not any(k.startswith("funnel|") for k in box.table())
+
+
+def test_watchdog_reapplies_a_declared_public_route_found_private(box):
+    opt_in = {"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "true"}
+    box.routes.write_text(PEBBLE_LINE.rstrip("\n") + " funnel=on\n")
+    assert box.setup(opt_in).returncode == 0
+    state = box.table()
+    del state["funnel|8443"]
+    box.ts_state.write_text(json.dumps(state))
+    box.watch(opt_in)
+    assert "funnel|8443" in box.table()
+
+
+def test_declared_public_route_without_opt_in_stays_private_in_the_watchdog(box):
+    box.routes.write_text(PEBBLE_LINE.rstrip("\n") + " funnel=on\n")
+    box.watch()
+    assert not any(k.startswith("funnel|") for k in box.table())
+    assert not any(a.startswith("tailscale funnel") for a in box.log())
+
+
+def test_telegram_send_has_connect_and_total_timeouts(box):
+    box.routes.write_text(PEBBLE_LINE)
+    box.watch({"FAKE_TS_DROP_PORT": "8443"})
+    (call,) = box.telegrams()
+    assert "--connect-timeout 5" in call
+    assert "--max-time 15" in call
+
+
+def test_service_unit_has_a_start_timeout():
+    assert "TimeoutStartSec=120" in SERVICE.read_text()
+
+
+def test_linger_enabled_and_verified(box):
+    r = box.linger()
+    assert r.returncode == 0, r.stderr
+    assert "loginctl enable-linger example-user" in box.log()
+    assert "loginctl show-user example-user -p Linger" in box.log()
+
+
+def test_linger_failure_is_loud_and_nonzero(box):
+    r = box.linger({"FAKE_LINGER": "no"})
+    assert r.returncode != 0
+    assert "WARNING" in r.stderr
 
 
 def test_watchdog_exits_zero_on_invalid_routes_file(box):

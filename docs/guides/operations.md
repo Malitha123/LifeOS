@@ -125,6 +125,10 @@ https=8443 path=/webhooks/example target=http://127.0.0.1:9000/webhooks/example
 
 Each alert kind has its own cooldown (`LIFEOS_INFRA_ALERT_COOLDOWN_MIN`, default 360); stamps and counters live under `logs/`. The watchdog is a user unit because re-applying routes and relaunching Obsidian need the login user's session manager; `setup-systemd.sh` installs it into `~/.config/systemd/user/` and enables it through that user's manager.
 
+**Lingering.** User timers only run at boot with nobody logged in if the user has lingering enabled. `setup-systemd.sh` runs `loginctl enable-linger <user>` and verifies `Linger=yes`; if it cannot, it prints a warning, leaves the timer disabled, and exits non-zero.
+
+**Exposure is verified too.** Besides the proxy target, the check compares Funnel exposure with the declaration. A port found public that is declared private has Funnel turned off (`tailscale funnel --https=<port> off`) and an alert is sent; a declared-public port found private is re-applied. A malformed route line is skipped and reported while LifeOS's own route and the valid lines are still applied.
+
 **Add a route.** Add a line to `config/tailscale-routes.local`, then run `./scripts/setup-tailscale.sh` (or wait up to 5 minutes for the watchdog to apply it). Settings are in [Configuration — Host Routes and Dependencies](configuration.md#host-routes-and-dependencies).
 
 ## Alerting Severities
