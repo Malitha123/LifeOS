@@ -1,7 +1,7 @@
 # Pebble Capture Filing
 
 **Status:** Complete
-**Last Updated:** 2026-09-17
+**Last Updated:** 2026-10-02
 **Audience:** Operators
 
 Pebble owns `LifeOS/Log/Pebble`, where each recording day is two files:
@@ -110,9 +110,10 @@ uses the local llama-server, which must be a loopback URL.
 
 With `LIFEOS_PEBBLE_CLASSIFIER=jev` and `TYPESAFE_API_KEY` set,
 `JevPebbleClassifier` segments the transcript in code and asks TypeSafe's
-Jev API which disposition, item, work fragment, and executor apply, in one
-call; its proposed actions pass through the same `validate_plan` authority
-gate as the LLM classifier. This sends the capture's transcript to
+Jev API which disposition, item, work fragment, executor, and assignee
+apply, plus which title each fragment carries, in one call; its proposed
+actions pass through the same `validate_plan` authority gate as the LLM
+classifier. This sends the capture's transcript to
 TypeSafe instead of the configured remote provider -- an operator choice,
 made by setting `LIFEOS_PEBBLE_CLASSIFIER=jev` explicitly. A missing key
 falls back to `PebbleJournalClassifier` with a logged warning, never a
@@ -125,6 +126,29 @@ filing one anyway would silently collapse it into a single one-time reminder
 at whatever hour happened to parse. `PebbleJournalClassifier` has no such
 limit -- the model emits a `cron` schedule directly, so it still files
 recurring reminders as schedules.
+
+Who a Jev-filed task is assigned to is Jev's judgment, not a phrasing
+match: Jev chooses among nobody, the speaker, and each AI agent. At 0.7
+confidence or above the judgment decides -- the speaker files the task
+tagged `me`, and the plan records `assignee_source="jev"` with Jev's
+confidence as the assignment's evidence. An AI agent additionally needs its
+name (any alias in `EXECUTOR_ALIASES`) in a positive clause of the
+transcript -- not negated, hypothetical, conditional, quoted, or reported
+speech -- which `validate_plan` re-checks before the tag survives; without
+it the task files unassigned. Below the floor, or on a missing or malformed
+answer, the explicit "assign it to me" wording and the `executor` answer
+decide instead. Agent schedules keep the literal scheduled-delegation
+evidence gate.
+
+A Jev-filed title is Jev's choice among literal cuts of the chosen fragment:
+every span starting within its first 12 words and ending at most 8 words
+before its end, so a leading filing request ("make a task assigned to me
+to") and a trailing assignee remark ("that one's mine") can each be cut
+away. Titles therefore stay exact transcript spans. Below 0.5 confidence the
+fragment with its filing request stripped is the title.
+`scripts/jev_eval/e7_pebble_filing.py` scores both judgments against a
+committed, synthetic-only labeled set of varied phrasings
+(`scripts/jev_eval/data/pebble_filing_cases.jsonl`) with real Jev.
 
 When the Jev classifier files a task, it also asks Jev whether the task is
 software work; at 0.7 confidence or above the task carries the `software`
@@ -142,6 +166,7 @@ concrete project rather than the vault or home, `fields.project` names it.
 | Plain-task filing is the classifier's judgment, re-checked by eval | `scripts/eval_pebble_filing.py`; index-based classifier/validated-action pairing regression; a log-only capture still completes |
 | Relative time, timezone, elapsed trigger safety | `validate_plan`; local-time, DST gap/overlap, offset mismatch, and saved-plan elapsed cases |
 | Explicit assignment and schedule action gate | source-scoped evidence validation; positive paraphrase, negated, quoted, reported, conditional, mentioned, unknown, and Markdown-rebuild pickup cases |
+| Jev-judged assignee and title | mocked-Jev self-assignment, unnamed/negated/reported agent, Jev-sourced `validate_plan` evidence, literal-title property, and fallback cases; `scripts/jev_eval/e7_pebble_filing.py` against real Jev |
 | Crash, restart, duplicate event, and revision conflict recovery | ledger consumer crash/replay and ambiguous-deletion cases; thread and process operation-key tests |
 | Human queue lifecycle | stable-key filing through `human_queue.add_card`, replay deduplication, and existing resolve-by-key transition |
 | Golden producer conformance | copied `tests/fixtures/pebble-result-*-v1.json` plus fixture-frame tests |

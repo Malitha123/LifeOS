@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from api.services.agent_board import AGENT_EXECUTOR_TAGS, ASSIGNEE_TAGS
 from api.services.jev_client import JevError
 from api.services.jev_task_routing import JevAnswer, TaskJudgment
 from api.services.pebble_capture import (
@@ -23,6 +24,7 @@ from api.services.pebble_capture import (
     PebbleJournalClassifier,
     PlannedAction,
     _segment_transcript,
+    _title_candidates,
     _validated_classifier_actions,
     parse_framed_blocks,
     ready_result,
@@ -2711,3 +2713,273 @@ def test_validated_classifier_actions_accepts_and_links_a_parent_index_plan():
     [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
     assert parent.parent_index is None
     assert child.parent_index == 0
+
+
+# --------------------------------------------------------------------------
+# JevPebbleClassifier: Jev judges the assignee and picks the title among
+# literal cuts of the item fragment; an agent assignee additionally needs
+# its name in a positive clause of the transcript.
+
+_RECORDED = "2030-01-01T10:00:00Z"
+_EVAL_CASES = Path(__file__).resolve().parents[1] / "scripts/jev_eval/data/pebble_filing_cases.jsonl"
+
+
+class _QuestionAwareJev:
+    """`aask` double that sees the questions: answers the fixed choices from
+    `answers`, and each `title_s<i>` question by picking the option whose
+    text equals `titles[i]` (`title_pick` may instead pick by option key)."""
+
+    def __init__(self, answers, *, titles=None, title_pick=None):
+        self.answers = answers
+        self.titles = titles or {}
+        self.title_pick = title_pick
+        self.questions = None
+
+    async def aask(self, state, questions):
+        self.questions = questions
+        answers = dict(self.answers)
+        for name, question in questions.items():
+            if not name.startswith("title_s"):
+                continue
+            options = question["criteria"]
+            if self.title_pick is not None:
+                choice = self.title_pick(name, options)
+            else:
+                wanted = self.titles.get(name[len("title_"):])
+                choice = next((key for key, text in options.items() if text == wanted), None)
+            if choice is not None:
+                answers[name] = {"choice": choice, "confidence": 0.9}
+        return answers
+
+
+def _answers(*, disposition="task", item="s0", work="none", executor="none",
+             assignee=None, assignee_confidence=0.9):
+    answers = _jev_answers(disposition=disposition, item=item, work=work, executor=executor)
+    if assignee is not None:
+        answers["assignee"] = {"choice": assignee, "confidence": assignee_confidence}
+    return answers
+
+
+async def _classify_and_validate(transcript, client):
+    raw = await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
+    return raw, validate_plan(raw, transcript=transcript, recorded_at=_RECORDED)
+
+
+@pytest.mark.asyncio
+async def test_jev_self_assignment_files_one_titled_task_tagged_me(monkeypatch, stores):
+    transcript = "Make a task assigned to me to buy some synthetic widgets"
+    client = _QuestionAwareJev(_answers(assignee="me"), titles={"s0": "buy some synthetic widgets"})
+    consumer = _jev_consumer(monkeypatch, stores, classifier=JevPebbleClassifier(client=client))
+    monkeypatch.setattr("api.services.pebble_capture.judge_task", lambda title: None)
+    ledger, tasks, _ = stores
+    assert await consumer.process({**_payload(), "final_text": transcript}) == "complete"
+    [task] = tasks.list_tasks()
+    assert task.description == "Buy some synthetic widgets"
+    assert list(task.tags) == ["me"]
+    [action] = ledger.load_plan(CaptureIdentity("synthetic-pebble", "capture-1"))
+    assert action.assignee_source == "jev"
+    assert action.assignee_confidence == 0.9
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "title"),
+    [
+        ("Put picking up the synthetic dry cleaning on my list", "picking up the synthetic dry cleaning"),
+        ("Make a task to email the synthetic landlord about the lease, that one's mine",
+         "email the synthetic landlord about the lease"),
+        ("Add a task to water the synthetic ferns for me please", "water the synthetic ferns"),
+    ],
+)
+async def test_jev_self_assignment_follows_the_jev_judgment_not_the_phrasing(transcript, title):
+    fragment = _segment_transcript(transcript)[0]
+    client = _QuestionAwareJev(_answers(assignee="me"), titles={"s0": title})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ("me",)
+    assert action.title.casefold() == title.casefold()
+    assert title in fragment
+
+
+@pytest.mark.asyncio
+async def test_jev_confident_none_leaves_the_task_unassigned():
+    transcript = "Make a task to charge the synthetic earbuds and assign it to me."
+    client = _QuestionAwareJev(_answers(assignee="none"))
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+    assert action.assignee_source == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["task", "delegated_task"])
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Add a task to buy synthetic milk",
+        "Make a task to fix the synthetic login bug, but don't assign it to codex",
+        "Add a task to clean the synthetic gutters. If codex were free it could do this.",
+        "Add a task to debug the synthetic webhook. Sam said codex should do it.",
+        'Add a task to "give it to codex" on the synthetic sign',
+    ],
+)
+async def test_jev_agent_assignee_without_a_positive_name_mention_is_unassigned(transcript, disposition):
+    client = _QuestionAwareJev(_answers(
+        disposition=disposition, work="s0", assignee="codex", assignee_confidence=0.99,
+    ))
+    raw, actions = await _classify_and_validate(transcript, client)
+    assert raw and raw[0]["tags"] == ["codex"]
+    assert [action.tags for action in actions] == [()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "title", "tag"),
+    [
+        ("Make a task to restart the synthetic staging server and codex should own it",
+         "restart the synthetic staging server", "codex"),
+        ("Make a task to investigate the synthetic memory leak, give it to cloud code",
+         "investigate the synthetic memory leak", "claude"),
+        ("Put upgrading the synthetic dependencies on Codex's list",
+         "upgrading the synthetic dependencies", "codex"),
+    ],
+)
+async def test_jev_agent_assignee_named_in_a_positive_clause_is_granted(transcript, title, tag):
+    client = _QuestionAwareJev(_answers(assignee=tag), titles={"s0": title})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == (tag,)
+    assert action.title.casefold() == title.casefold()
+    assert action.assignee_source == "jev"
+
+
+@pytest.mark.asyncio
+async def test_jev_delegation_judged_unassigned_files_a_plain_task_only_when_an_agent_was_named():
+    named = "Add a task to review the synthetic contract. Sam said Claude should do it."
+    client = _QuestionAwareJev(
+        _answers(disposition="delegated_task", work="s0", executor="claude", assignee="none"),
+        titles={"s0": "review the synthetic contract"},
+    )
+    _, [action] = await _classify_and_validate(named, client)
+    assert (action.title, action.tags) == ("Review the synthetic contract", ())
+
+    unnamed = _QuestionAwareJev(_answers(disposition="delegated_task", work="s0", assignee="none"))
+    raw = await JevPebbleClassifier(client=unnamed).classify(
+        "Ask someone to fix the synthetic login bug", _RECORDED
+    )
+    assert raw == []
+
+
+def _jev_task(title, tag, confidence=0.8, **extra):
+    return {
+        "kind": "task", "index": 0, "title": title, "action_evidence": title, "tags": [tag],
+        "assignee_source": "jev", "assignee_confidence": confidence, **extra,
+    }
+
+
+def test_validate_plan_accepts_a_jev_sourced_me_and_records_its_evidence():
+    transcript = "Make a task assigned to me to buy some synthetic widgets"
+    [action] = validate_plan(
+        [_jev_task("Buy some synthetic widgets", "me")], transcript=transcript, recorded_at=_RECORDED,
+    )
+    assert action.tags == ("me",)
+    assert (action.assignee_source, action.assignee_confidence) == ("jev", 0.8)
+    assert action.to_dict()["assignee_source"] == "jev"
+
+
+@pytest.mark.parametrize(
+    ("transcript", "title", "tag", "confidence"),
+    [
+        # Below the floor, or not a real number.
+        ("Make a task assigned to me to buy some synthetic widgets", "Buy some synthetic widgets", "me", 0.69),
+        ("Make a task assigned to me to buy some synthetic widgets", "Buy some synthetic widgets", "me", True),
+        ("Make a task assigned to me to buy some synthetic widgets", "Buy some synthetic widgets", "me", None),
+        # A title that is not a literal transcript span.
+        ("Make a task assigned to me to buy some synthetic widgets", "Buy synthetic widgets", "me", 0.9),
+        # An agent never named, named only in a negated clause, or only in reported speech.
+        ("Add a task to buy synthetic milk", "Buy synthetic milk", "codex", 0.99),
+        ("Add a task to buy synthetic milk, never for codex", "Buy synthetic milk", "codex", 0.99),
+        ("Add a task to buy synthetic milk. Sam said codex should.", "Buy synthetic milk", "codex", 0.99),
+    ],
+)
+def test_validate_plan_rejects_an_unproven_jev_sourced_assignee(transcript, title, tag, confidence):
+    [action] = validate_plan(
+        [_jev_task(title, tag, confidence)], transcript=transcript, recorded_at=_RECORDED,
+    )
+    assert action.tags == ()
+    assert action.assignee_source == ""
+    assert action.assignee_confidence is None
+
+
+def test_validate_plan_rejects_an_unknown_assignee_source():
+    with pytest.raises(PebbleCaptureError, match="assignee source"):
+        validate_plan(
+            [{**_jev_task("Buy synthetic milk", "me"), "assignee_source": "model"}],
+            transcript="Add a task to buy synthetic milk for me", recorded_at=_RECORDED,
+        )
+
+
+def test_llm_classifier_cannot_claim_a_jev_sourced_assignment():
+    transcript = "Add a task to buy synthetic milk"
+    response = json.dumps({"actions": [_jev_task("Buy synthetic milk", "codex", 0.99)]})
+    with pytest.raises(PebbleCaptureError, match="unauthorized task delegation"):
+        _validated_classifier_actions(response, transcript, _RECORDED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {},
+        {"assignee": "me", "title_s0": "garbage"},
+        {"assignee": {"choice": "banana", "confidence": 0.99}, "title_s0": {"choice": "t9999", "confidence": 0.9}},
+        {"assignee": {"choice": "me", "confidence": 0.4}, "title_s0": {"choice": "t0", "confidence": 0.1}},
+    ],
+)
+async def test_jev_unusable_assignee_or_title_answers_fall_back_to_transcript_rules(broken):
+    """The task is still filed: assignee from the explicit "assign it to me"
+    wording, title from stripping the filing request."""
+    transcript = "Make a task to charge the synthetic earbuds and assign it to me."
+    client = _FakeJevClient({**_jev_answers(disposition="task", item="s0"), **broken})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.title == "Charge the synthetic earbuds"
+    assert action.tags == ("me",)
+    assert action.assignee_source == ""
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_asks_assignee_and_title_questions_in_one_call():
+    transcript = "Make a task assigned to me to buy some synthetic widgets"
+    client = _QuestionAwareJev(_answers(assignee="me"))
+    await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
+    assert set(client.questions["assignee"]["criteria"]) == {"none", *ASSIGNEE_TAGS, *AGENT_EXECUTOR_TAGS}
+    options = client.questions["title_s0"]["criteria"]
+    assert "buy some synthetic widgets" in options.values()
+    assert len(options) <= 255
+
+
+def _eval_utterances():
+    return [json.loads(line)["utterance"] for line in _EVAL_CASES.read_text().splitlines() if line.strip()]
+
+
+@pytest.mark.parametrize("utterance", _eval_utterances())
+def test_title_candidates_are_literal_transcript_spans(utterance):
+    for fragment in _segment_transcript(utterance):
+        candidates = _title_candidates(fragment)
+        assert len(candidates) <= 255
+        for candidate in candidates:
+            assert candidate in fragment
+            assert candidate in utterance
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("utterance", _eval_utterances())
+async def test_every_jev_chosen_title_is_a_literal_transcript_substring(utterance):
+    """Whichever candidate Jev picks, the filed title is a literal
+    (case-insensitive) span of the transcript."""
+    first = _title_candidates(_segment_transcript(utterance)[0])
+    for pick in range(len(first)):
+        client = _QuestionAwareJev(
+            _answers(assignee="me"),
+            title_pick=lambda name, options, pick=pick: f"t{min(pick, len(options) - 1)}",
+        )
+        raw, actions = await _classify_and_validate(utterance, client)
+        for action in actions:
+            assert action.title.casefold() in utterance.casefold()
