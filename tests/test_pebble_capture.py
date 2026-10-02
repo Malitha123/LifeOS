@@ -3110,3 +3110,78 @@ async def test_jev_title_with_a_non_string_choice_falls_back_to_prefix_stripping
     _, [action] = await _classify_and_validate(transcript, client)
     assert action.title == "Charge the synthetic earbuds"
     assert action.tags == ("me",)
+
+
+# Filing disposition: a confident filing disposition decides; otherwise
+# Jev's `filing_request` probability is a second signal that can file a
+# capture, unless the disposition answer is a firm log-only.
+
+def _rescue_answers(*, disposition, confidence, probabilities, filing_request, assignee=None):
+    answers = _answers(disposition=disposition, assignee=assignee)
+    answers["disposition"] = {"choice": disposition, "confidence": confidence}
+    if probabilities is not None:
+        answers["disposition"]["probabilities"] = probabilities
+    if filing_request is not None:
+        answers["filing_request"] = {"noul": filing_request}
+    return answers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "title", "disposition", "confidence", "probabilities"),
+    [
+        ("My to-do: return the synthetic library books", "return the synthetic library books",
+         "log_only", 0.52, {"log_only": 0.62, "task": 0.38}),
+        ("Put this on my plate: schedule the synthetic piano tuner", "schedule the synthetic piano tuner",
+         "task", 0.48, {"task": 0.59, "delegated_task": 0.3, "log_only": 0.03}),
+        ("Another one for my plate: file the synthetic expense report", "file the synthetic expense report",
+         "task", 0.36, None),
+    ],
+)
+async def test_jev_filing_request_files_a_capture_the_disposition_alone_misses(
+    transcript, title, disposition, confidence, probabilities,
+):
+    item = f"s{len(_segment_transcript(transcript)) - 1}"
+    answers = _rescue_answers(
+        disposition=disposition, confidence=confidence, probabilities=probabilities,
+        filing_request=0.8, assignee="me",
+    )
+    answers["item"] = {"choice": item, "confidence": 0.9}
+    client = _QuestionAwareJev(answers, titles={item: title})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.kind == "task"
+    assert action.title.casefold() == title.casefold()
+    assert action.tags == ("me",)
+    assert "filing_request" in client.questions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("disposition", "confidence", "filing_request"),
+    [
+        ("log_only", 0.49, 0.54),   # neither signal asks for a filing
+        ("task", 0.45, 0.69),       # second signal just under its floor
+        ("log_only", 0.8, 0.95),    # a firm log-only stands
+        ("log_only", 0.6, None),    # no second signal at all
+    ],
+)
+async def test_jev_capture_without_a_filing_signal_files_nothing(disposition, confidence, filing_request):
+    answers = _rescue_answers(
+        disposition=disposition, confidence=confidence, probabilities={"task": 0.4, "log_only": 0.6},
+        filing_request=filing_request,
+    )
+    actions = await JevPebbleClassifier(client=_FakeJevClient(answers)).classify(
+        "I keep meaning to call the synthetic plumber", _RECORDED,
+    )
+    assert actions == []
+
+
+@pytest.mark.asyncio
+async def test_jev_notify_reminder_uses_the_jev_chosen_title():
+    transcript = "Remind me tomorrow at 3 PM to call the synthetic vet"
+    client = _QuestionAwareJev(
+        _answers(disposition="notify_schedule"), titles={"s0": "call the synthetic vet"},
+    )
+    [action] = await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
+    assert action["kind"] == "schedule"
+    assert action["title"] == action["message"] == "Call the synthetic vet"

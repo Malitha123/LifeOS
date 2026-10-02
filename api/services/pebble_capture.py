@@ -1151,6 +1151,45 @@ _RECURRENCE_RE = re.compile(
 )
 
 _JEV_DISPOSITIONS = frozenset({"task", "notify_schedule", "delegated_task", "agent_schedule"})
+_DISPOSITION_FLOOR = 0.5
+# Second filing signal: Jev's `filing_request` probability that the speaker
+# asked for something to be recorded as a to-do or reminder. At or above
+# this floor it files a capture whose disposition answer alone falls short,
+# unless that answer is a firm log-only (`_FIRM_LOG_ONLY`).
+_FILING_REQUEST_FLOOR = 0.7
+_FIRM_LOG_ONLY = 0.8
+
+
+def _jev_disposition(answers: dict[str, Any]) -> Optional[str]:
+    """The filing disposition to act on, or `None` for log-only.
+
+    A filing disposition at `_DISPOSITION_FLOOR` confidence or above
+    decides. Otherwise a `filing_request` probability at
+    `_FILING_REQUEST_FLOOR` or above files the capture under the most
+    probable filing disposition (`task` when the probabilities are
+    unusable) -- unless the disposition answer is log-only at
+    `_FIRM_LOG_ONLY` confidence or above, which stands.
+    """
+    disposition = answers.get("disposition") or {}
+    confidence = disposition.get("confidence")
+    choice = disposition.get("choice")
+    confident = not isinstance(confidence, bool) and isinstance(confidence, (int, float))
+    if confident and confidence >= _DISPOSITION_FLOOR and choice in _JEV_DISPOSITIONS:
+        return choice
+    if choice == "log_only" and confident and confidence >= _FIRM_LOG_ONLY:
+        return None
+    request = (answers.get("filing_request") or {}).get("noul")
+    if not _probability_at_least(request, _FILING_REQUEST_FLOOR):
+        return None
+    probabilities = disposition.get("probabilities")
+    ranked = [
+        (probability, name) for name, probability in (
+            probabilities.items() if isinstance(probabilities, dict) else ()
+        )
+        if name in _JEV_DISPOSITIONS
+        and not isinstance(probability, bool) and isinstance(probability, (int, float))
+    ]
+    return max(ranked)[1] if ranked else "task"
 
 
 def _segment_transcript(text: str) -> list[str]:
@@ -1344,6 +1383,14 @@ class JevPebbleClassifier:
                     "own to-do or sub-task."
                 ),
             }
+        questions["filing_request"] = {
+            "type": "noul",
+            "instructions": (
+                "The speaker is asking for something to be recorded as a "
+                "to-do or reminder -- not just thinking aloud, describing, "
+                "musing, or recounting what someone else asked."
+            ),
+        }
         questions["assignee"] = {
             "type": "choice",
             "instructions": (
@@ -1692,8 +1739,8 @@ def _jev_plan_from_answers(
 ) -> list[dict[str, Any]]:
     """Turn one Jev answers dict into a raw action list.
 
-    Log-only (an empty list) below the confidence floor, for a "log_only"
-    or any unrecognized disposition, for a recurring cadence a single-instant
+    Log-only (an empty list) when `_jev_disposition` finds no filing
+    disposition, for a recurring cadence a single-instant
     time parse can't represent, and for a delegation with no recognized
     executor -- never a silently reassigned or invented action. Raises
     `KeyError`/`TypeError`/`AttributeError`/`ValueError` on a malformed
@@ -1708,12 +1755,8 @@ def _jev_plan_from_answers(
     fragment with its filing request stripped.
     """
     title_options = title_options or {}
-    disposition = answers.get("disposition") or {}
-    confidence = disposition.get("confidence")
-    if not isinstance(confidence, (int, float)) or confidence < 0.5:
-        return []
-    disp = disposition.get("choice")
-    if disp not in _JEV_DISPOSITIONS:
+    disp = _jev_disposition(answers)
+    if disp is None:
         return []
 
     item_choice = (answers.get("item") or {}).get("choice")
@@ -1748,10 +1791,11 @@ def _jev_plan_from_answers(
                 item, final_text, title=_jev_title(answers, item_choice, title_options),
                 assignee=assignee,
             )]
+        reminder = _jev_title(answers, item_choice, title_options) or item
         return [{
-            "kind": "schedule", "index": 0, "title": item, "schedule_type": "once",
+            "kind": "schedule", "index": 0, "title": reminder, "schedule_type": "once",
             "schedule_value": when.isoformat(), "timezone": settings.timezone,
-            "action": "notify", "message": item,
+            "action": "notify", "message": reminder,
         }]
 
     # disp is "delegated_task" or "agent_schedule".

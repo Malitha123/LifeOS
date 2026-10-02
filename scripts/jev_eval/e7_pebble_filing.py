@@ -15,9 +15,11 @@ For each case the first filed action is compared with the labels:
     normalization and dropping trailing punctuation; a capture that files
     nothing has no title, which is correct only for a null expected title.
 
-A false agent assignment is any filed agent tag the label does not name.
-Prints per-category accuracy, the false agent assignment count, and (with
-`--show-failures`) each miss. Only the synthetic utterances in the labeled
+A false agent assignment is any filed agent tag the label does not name; a
+false filing is anything filed for a note labeled to file nothing (the
+`journal` category, plus a few traps). Prints per-category accuracy, the
+filed-correctly rate on notes that ask for a filing, both counters, and
+(with `--show-failures`) each miss. Only the synthetic utterances in the labeled
 set are sent to TypeSafe. Cost is a fraction of a cent per run.
 
     ~/.venvs/lifeos/bin/python scripts/jev_eval/e7_pebble_filing.py \
@@ -122,6 +124,15 @@ def report(results: list[dict]) -> str:
     ]
     calls = [r["jev_calls"] for r in results]
     lines.append(f"false agent assignments: {len(false_agents)}")
+    should_file = [r for r in results if r["expected_title"] is not None]
+    filed_ok = sum(r["filed"] for r in should_file) / len(should_file) if should_file else 0.0
+    false_filings = [r for r in results if r["expected_title"] is None and r["filed"]]
+    journal = [r for r in results if r["category"] == "journal"]
+    lines.append(f"filed correctly (notes asking for a filing): {filed_ok:.1%} of {len(should_file)}")
+    lines.append(
+        f"false filings: {len(false_filings)} "
+        f"(journal: {sum(r['filed'] for r in journal)} of {len(journal)})"
+    )
     lines.append(f"Jev calls per capture: min {min(calls)} max {max(calls)} mean {sum(calls) / len(calls):.2f}")
     return "\n".join(lines)
 
