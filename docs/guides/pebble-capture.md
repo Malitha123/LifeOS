@@ -169,6 +169,19 @@ fragment with its filing request stripped is the title.
 committed, synthetic-only labeled set of varied phrasings
 (`scripts/jev_eval/cases/pebble_filing_cases.jsonl`) with real Jev.
 
+A Pebble note is automatic speech-recognition output, which can mishear the
+filing request itself ("at a desk to ..." for "add a task to ..."). Every Jev
+call's state therefore carries a `source` field naming the note as a
+speech-recognition transcript whose opening request wording may be misheard,
+and the disposition, filing-request, item, assignee and title questions and
+the targeted agent confirmation say the same in their own wording, while
+reported speech stays log-only. The assignee question also counts the speaker
+claiming a task ("I'll take this one", "I'm doing it myself") as theirs. Jev
+judges what the speaker most likely said; no substitution rule rewrites the
+transcript, and a misheard request is simply left out of the literal title
+span. The eval set's `asr` and `asr_journal` categories cover misheard
+requests and the same words used in their ordinary meaning.
+
 When the Jev classifier files a task, it also asks Jev whether the task is
 software work; at 0.7 confidence or above the task carries the `software`
 tag and, when Jev's location judgment is itself confident (>= 0.6) about a
@@ -185,7 +198,7 @@ concrete project rather than the vault or home, `fields.project` names it.
 | Plain-task filing is the classifier's judgment, re-checked by eval | `scripts/eval_pebble_filing.py`; index-based classifier/validated-action pairing regression; a log-only capture still completes |
 | Relative time, timezone, elapsed trigger safety | `validate_plan`; local-time, DST gap/overlap, offset mismatch, and saved-plan elapsed cases |
 | Explicit assignment and schedule action gate | source-scoped evidence validation; positive paraphrase, negated, quoted, reported, conditional, mentioned, unknown, and Markdown-rebuild pickup cases |
-| Jev-judged filing, assignee and title | mocked-Jev plain-task-only rescue and log-only guard, agent schedule and executor-fallback locks, self-assignment, unnamed/unbound/unconfirmed agent, Jev-sourced `validate_plan` evidence, literal-title property, and fallback cases; `scripts/jev_eval/e7_pebble_filing.py` against real Jev |
+| Jev-judged filing, assignee and title | mocked-Jev plain-task-only rescue and log-only guard, agent schedule and executor-fallback locks, self-assignment, unnamed/unbound/unconfirmed agent, Jev-sourced `validate_plan` evidence, literal-title property, speech-recognition state and question wording, and fallback cases; `scripts/jev_eval/e7_pebble_filing.py` against real Jev |
 | Crash, restart, duplicate event, and revision conflict recovery | ledger consumer crash/replay and ambiguous-deletion cases; thread and process operation-key tests |
 | Human queue lifecycle | stable-key filing through `human_queue.add_card`, replay deduplication, and existing resolve-by-key transition |
 | Golden producer conformance | copied `tests/fixtures/pebble-result-*-v1.json` plus fixture-frame tests |

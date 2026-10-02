@@ -1296,8 +1296,10 @@ def _assignee_criteria() -> dict[str, str]:
     criteria = {
         "none": "Nobody: the speaker did not ask for the task to be assigned to anyone.",
         "me": (
-            "The speaker themselves: they asked for the task to be theirs "
-            "(\"assign it to me\", \"for me\", \"that's mine\", \"put it on my list\")."
+            "The speaker themselves: they asked for the task to be theirs or "
+            "claimed it for themselves (\"assign it to me\", \"for me\", "
+            "\"that's mine\", \"put it on my list\", \"my to-do\", \"I'll take "
+            "this one\", \"I'm doing it myself\")."
         ),
     }
     for tag, description in _executor_criteria().items():
@@ -1334,6 +1336,23 @@ def _title_candidates(fragment: str) -> list[str]:
     return candidates
 
 
+# A Pebble note is automatic speech-recognition output, and a misheard
+# filing request ("add a task" heard as "at a desk") is the costly
+# mishearing. Jev's state carries this beside the note, and the filing
+# questions' wording repeats it; titles still come only from literal spans,
+# so a misheard request is simply left out of the chosen one.
+_JEV_VOICE_NOTE_SOURCE = (
+    "automatic speech-recognition transcript of a spoken voice note; it may "
+    "contain misheard words, especially in the opening words where a filing "
+    "request such as \"add a task\" or \"make a task\" usually sits"
+)
+
+
+def _jev_state(final_text: str) -> dict[str, str]:
+    """The state every Pebble Jev call judges: the note and its source."""
+    return {"voice_note": final_text, "source": _JEV_VOICE_NOTE_SOURCE}
+
+
 class JevPebbleClassifier:
     """Pebble classifier backed by TypeSafe's Jev typed-judgment API.
 
@@ -1363,9 +1382,12 @@ class JevPebbleClassifier:
             "disposition": {
                 "type": "choice",
                 "instructions": (
-                    "A voice note was captured from a ring the speaker wears. "
-                    "Decide what, if anything, the speaker actively asked to "
-                    "have filed."
+                    "A voice note was captured from a ring the speaker wears "
+                    "and transcribed by automatic speech recognition, which "
+                    "can mishear words -- most often the opening filing "
+                    "request (\"add a task\" heard as \"at a desk\"). Decide "
+                    "what, if anything, the speaker most likely actively "
+                    "asked to have filed."
                 ),
                 "criteria": PEBBLE_DISPOSITION_CRITERIA,
             },
@@ -1373,9 +1395,10 @@ class JevPebbleClassifier:
                 "type": "choice",
                 "instructions": (
                     "Which fragment of the voice note names the item the "
-                    "speaker actually asked to have filed? If several things "
-                    "follow a request, only the first item asked for counts; "
-                    "the rest is thinking aloud."
+                    "speaker actually asked to have filed (a request misheard "
+                    "by speech recognition is still a request)? If several "
+                    "things follow a request, only the first item asked for "
+                    "counts; the rest is thinking aloud."
                 ),
                 "criteria": item_criteria,
             },
@@ -1427,18 +1450,23 @@ class JevPebbleClassifier:
             "type": "noul",
             "instructions": (
                 "The speaker is asking for something to be recorded as a "
-                "to-do or reminder -- not just thinking aloud, describing, "
-                "musing, or recounting what someone else asked."
+                "to-do or reminder -- even when speech recognition misheard "
+                "the request wording as similar-sounding words -- not just "
+                "thinking aloud, describing, musing, or recounting what "
+                "someone else asked."
             ),
         }
         questions["assignee"] = {
             "type": "choice",
             "instructions": (
                 "Who did the speaker ask for this task to be assigned to? Only "
-                "the speaker's own request counts. An assignment that is "
-                "negated, hypothetical or wished-for, or reported as what "
-                "someone else said, is not a request, and neither is merely "
-                "mentioning a person or agent."
+                "the speaker's own request counts, including one whose "
+                "request wording speech recognition misheard. The speaker "
+                "claiming the task for themselves (\"I'll take it\", \"that's "
+                "mine\", \"I'm doing it\", \"my to-do\") means the speaker. An "
+                "assignment that is negated, hypothetical or wished-for, or "
+                "reported as what someone else said, is not a request, and "
+                "neither is merely mentioning a person or agent."
             ),
             "criteria": _assignee_criteria(),
         }
@@ -1453,12 +1481,15 @@ class JevPebbleClassifier:
                         f'Which wording of "{fragment}" states only the to-do '
                         "itself, as the thing to be done? Leave out any request "
                         "to file or list it, who it is assigned to or who will "
-                        "do it, and filler words."
+                        "do it, and filler words. Speech recognition can "
+                        'mishear the request: in "make a cask to wash the '
+                        'windows" the speaker said "make a task to", so the '
+                        'to-do is "wash the windows".'
                     ),
                     "criteria": title_options[f"s{i}"],
                 }
         try:
-            answers = await self._client.aask({"voice_note": final_text}, questions)
+            answers = await self._client.aask(_jev_state(final_text), questions)
         except JevError:
             logger.warning("Jev Pebble classification failed; filing log-only")
             return []
@@ -1489,11 +1520,12 @@ class JevPebbleClassifier:
             f"In this voice note the speaker themself asks for this to be done by "
             f"{_EXECUTOR_DISPLAY_NAMES.get(agent, agent)} -- telling it to do it, or "
             f"assigning or handing the task to it: '{title}' (not negating it, not "
-            "imagining it, not reporting what someone else said)"
+            "imagining it, not reporting what someone else said; speech "
+            "recognition may have misheard the request wording around it)"
         )
         try:
             answers = await self._client.aask(
-                {"voice_note": final_text},
+                _jev_state(final_text),
                 {"agent_instructed": {"type": "noul", "instructions": statement}},
             )
             noul = answers["agent_instructed"]["noul"]
