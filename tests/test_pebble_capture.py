@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from api.services.agent_board import AGENT_EXECUTOR_TAGS, ASSIGNEE_TAGS
 from api.services.jev_client import JevError
 from api.services.jev_task_routing import JevAnswer, TaskJudgment
 from api.services.pebble_capture import (
@@ -23,6 +24,7 @@ from api.services.pebble_capture import (
     PebbleJournalClassifier,
     PlannedAction,
     _segment_transcript,
+    _title_candidates,
     _validated_classifier_actions,
     parse_framed_blocks,
     ready_result,
@@ -395,7 +397,7 @@ def test_model_cannot_invent_agent_schedule_authority():
         "delegation_evidence": "schedule it for #codex",
     }]
     with pytest.raises(PebbleCaptureError, match="explicit valid delegation"):
-        validate_plan(raw, transcript="Please schedule synthetic work tomorrow.", recorded_at="2030-01-01T10:00:00Z")
+        validate_plan(raw, transcript="Please schedule synthetic work tomorrow.", recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 def test_elapsed_schedule_is_held_from_recording_time():
@@ -405,7 +407,7 @@ def test_elapsed_schedule_is_held_from_recording_time():
         "timezone": "UTC", "action": "notify",
     }]
     with pytest.raises(PebbleCaptureError, match="elapsed"):
-        validate_plan(raw, transcript="synthetic", recorded_at="2030-01-01T10:00:00Z")
+        validate_plan(raw, transcript="synthetic", recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 def test_elapsed_schedule_is_also_compared_with_current_time():
@@ -415,7 +417,7 @@ def test_elapsed_schedule_is_also_compared_with_current_time():
         "timezone": "UTC", "action": "notify",
     }]
     with pytest.raises(PebbleCaptureError, match="elapsed"):
-        validate_plan(raw, transcript="synthetic", recorded_at="2020-01-01T10:00:00Z")
+        validate_plan(raw, transcript="synthetic", recorded_at="2020-01-01T10:00:00Z", jev_classified=False)
 
 
 @pytest.mark.parametrize("wall_time", [
@@ -428,7 +430,7 @@ def test_naive_nonexistent_or_ambiguous_dst_wall_time_is_held(wall_time):
             "kind": "schedule", "index": 0, "title": "Synthetic reminder",
             "schedule_type": "once", "schedule_value": wall_time,
             "timezone": "America/New_York", "action": "notify",
-        }], transcript="Synthetic reminder", recorded_at="2026-09-09T10:00:00Z")
+        }], transcript="Synthetic reminder", recorded_at="2026-09-09T10:00:00Z", jev_classified=False)
 
 
 @pytest.mark.parametrize("aware_time", [
@@ -441,7 +443,7 @@ def test_explicit_offset_must_describe_a_real_wall_time_in_declared_zone(aware_t
             "kind": "schedule", "index": 0, "title": "Synthetic reminder",
             "schedule_type": "once", "schedule_value": aware_time,
             "timezone": "America/New_York", "action": "notify",
-        }], transcript="Synthetic reminder", recorded_at="2026-09-09T10:00:00Z")
+        }], transcript="Synthetic reminder", recorded_at="2026-09-09T10:00:00Z", jev_classified=False)
 
 
 @pytest.mark.parametrize("aware_time", [
@@ -453,7 +455,7 @@ def test_explicit_valid_offset_disambiguates_dst_overlap(aware_time):
         "kind": "schedule", "index": 0, "title": "Synthetic reminder",
         "schedule_type": "once", "schedule_value": aware_time,
         "timezone": "America/New_York", "action": "notify",
-    }], transcript="Synthetic reminder", recorded_at="2026-09-09T10:00:00Z")
+    }], transcript="Synthetic reminder", recorded_at="2026-09-09T10:00:00Z", jev_classified=False)
     assert action.schedule_value == aware_time
 
 
@@ -462,7 +464,7 @@ def test_naive_unambiguous_wall_time_uses_declared_zone():
         "kind": "schedule", "index": 0, "title": "Synthetic reminder",
         "schedule_type": "once", "schedule_value": "2030-01-02T09:00:00",
         "timezone": "America/New_York", "action": "notify",
-    }], transcript="Synthetic reminder", recorded_at="2026-09-09T10:00:00Z")
+    }], transcript="Synthetic reminder", recorded_at="2026-09-09T10:00:00Z", jev_classified=False)
     assert action.schedule_value == "2030-01-02T09:00:00"
 
 
@@ -511,7 +513,7 @@ def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, 
             "action_evidence": action_evidence,
         }],
         transcript=transcript,
-        recorded_at="2030-01-01T10:00:00Z",
+        recorded_at="2030-01-01T10:00:00Z", jev_classified=False,
     )
     assert (tag in action.tags) is retained
 
@@ -540,7 +542,7 @@ def test_operator_delegated_task_capture_keeps_working():
         "kind": "task", "index": 0, "title": "Review the synthetic report", "tags": ["claude"],
         "delegation_evidence": transcript,
         "action_evidence": "review the synthetic report and send me a summary",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.tags == ("claude",)
     assert action.title == "review the synthetic report and send me a summary"
 
@@ -571,7 +573,7 @@ def test_validated_classifier_actions_pairs_by_index_not_position():
         },
     ]})
     actions = _validated_classifier_actions(response, transcript, "2030-01-01T10:00:00Z")
-    [kept] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [kept] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert kept.index == 1
     assert kept.tags == ("codex",)
 
@@ -615,7 +617,7 @@ def test_contextual_reported_speech_cannot_delegate_a_task(
         "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
         "delegation_evidence": delegation_evidence,
         "action_evidence": "code repair",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.tags == ()
 
 
@@ -630,7 +632,7 @@ def test_contextual_prefix_does_not_block_a_direct_task_delegation(transcript):
     [action] = validate_plan([{
         "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
         "delegation_evidence": transcript, "action_evidence": "code repair",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.tags == ("codex",)
 
 
@@ -641,7 +643,7 @@ def test_explicit_non_execution_label_is_retained_but_mentions_are_not():
             "action_evidence": "tag this",
         }],
         transcript="Add a task to tag this as #errand; I merely mentioned #ideas.",
-        recorded_at="2030-01-01T10:00:00Z",
+        recorded_at="2030-01-01T10:00:00Z", jev_classified=False,
     )
     assert action.tags == ("errand",)
 
@@ -656,7 +658,7 @@ def test_clear_pronoun_delegations_accept_ordinary_action_verbs(transcript, titl
         "kind": "task", "index": 0, "title": title, "tags": ["codex"],
         "delegation_evidence": transcript,
         "action_evidence": title.lower(),
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.tags == ("codex",)
 
 
@@ -726,7 +728,7 @@ def test_comma_delegation_still_files_with_its_tag_non_regression():
         "kind": "task", "index": 0, "title": "Review the synthetic report", "tags": ["claude"],
         "delegation_evidence": transcript,
         "action_evidence": "review the synthetic report",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.tags == ("claude",)
 
 
@@ -744,7 +746,7 @@ def test_comma_please_vocative_exception_non_regression():
             "kind": "task", "index": 0, "title": action_evidence, "tags": ["codex"],
             "delegation_evidence": transcript,
             "action_evidence": action_evidence,
-        }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+        }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
         assert action.tags == ("codex",)
 
 
@@ -761,7 +763,7 @@ def test_task_delegation_is_scoped_to_the_named_action_not_the_whole_capture():
             "delegation_evidence": "Assign code repair to Codex",
             "action_evidence": "code repair",
         },
-    ], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    ], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     # Execution is bound to the exact source action, never the model's
     # unrelated title: index 0's filed title is the bound evidence, not "Buy
     # milk". A second action citing the identical evidence span is dropped
@@ -778,7 +780,7 @@ def test_task_delegation_accepts_paraphrase_but_files_source_scoped_action():
         "kind": "task", "index": 0, "title": "Review authentication defect",
         "tags": ["codex"], "delegation_evidence": transcript,
         "action_evidence": "review the login bug",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.tags == ("codex",)
     assert action.title == "review the login bug"
 
@@ -792,7 +794,7 @@ def test_whole_capture_cannot_be_reused_as_delegation_evidence_for_another_actio
         "kind": "task", "index": 0, "title": "Buy milk", "tags": ["codex"],
         "delegation_evidence": transcript,
         "action_evidence": "Buy milk",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.tags == ()
 
 
@@ -810,7 +812,7 @@ def test_conditional_hypothetical_or_post_negated_task_text_never_delegates(tran
         "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
         "delegation_evidence": transcript,
         "action_evidence": "code repair",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.tags == ()
 
 
@@ -877,7 +879,7 @@ def test_natural_spoken_scheduled_delegation_retains_current_subtag(transcript):
         "timezone": "America/New_York", "action": "agent", "executor": "cloud-sonnet",
         "delegation_evidence": transcript,
         "action_evidence": action_evidence,
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.executor == "cloud-sonnet"
     assert action.title == action.message == action_evidence
 
@@ -890,7 +892,7 @@ def test_scheduled_pronoun_delegation_accepts_an_ordinary_action_verb():
         "timezone": "UTC", "action": "agent", "executor": "codex",
         "delegation_evidence": transcript,
         "action_evidence": "investigate it",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.executor == "codex"
 
 
@@ -917,7 +919,7 @@ def test_plain_task_evidence_consumption_never_aborts_an_independent_agent_sched
     fully-evidenced, independently valid agent schedule."""
     transcript, task, schedule = _plumber_task_and_schedule()
     result = validate_plan(
-        [task, schedule], transcript=transcript, recorded_at="2030-01-01T10:00:00Z"
+        [task, schedule], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False
     )
     kinds = [(a.kind, a.index) for a in result]
     assert ("schedule", 1) in kinds
@@ -926,7 +928,7 @@ def test_plain_task_evidence_consumption_never_aborts_an_independent_agent_sched
 def test_agent_schedule_files_alone_with_the_same_evidence():
     transcript, _task, schedule = _plumber_task_and_schedule()
     [action] = validate_plan(
-        [schedule], transcript=transcript, recorded_at="2030-01-01T10:00:00Z"
+        [schedule], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False
     )
     assert action.kind == "schedule"
     assert action.executor == "claude"
@@ -942,7 +944,7 @@ def test_agent_schedule_ordered_first_still_blocks_a_reused_plain_task():
     result = validate_plan(
         [schedule_first, task_second],
         transcript=transcript,
-        recorded_at="2030-01-01T10:00:00Z",
+        recorded_at="2030-01-01T10:00:00Z", jev_classified=False,
     )
     assert [(a.kind, a.index) for a in result] == [("schedule", 0)]
 
@@ -970,7 +972,7 @@ def test_negative_quoted_or_mentioned_executor_never_authorizes_schedule(transcr
             "schedule_type": "once", "schedule_value": "2030-01-02T09:00:00Z",
             "timezone": "UTC", "action": "agent", "executor": "codex",
             "delegation_evidence": transcript,
-        }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+        }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 def test_blank_or_generic_executor_never_authorizes_agent_schedule():
@@ -982,7 +984,7 @@ def test_blank_or_generic_executor_never_authorizes_agent_schedule():
                 "schedule_type": "once", "schedule_value": "2030-01-02T09:00:00Z",
                 "timezone": "UTC", "action": "agent", "executor": executor,
                 "delegation_evidence": transcript,
-            }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+            }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 @pytest.mark.parametrize(
@@ -1020,7 +1022,7 @@ def test_contextual_reported_speech_cannot_delegate_a_schedule(
             "timezone": "UTC", "action": "agent", "executor": "codex",
             "delegation_evidence": delegation_evidence,
             "action_evidence": "run the synthetic report",
-        }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+        }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 @pytest.mark.parametrize(
@@ -1037,7 +1039,7 @@ def test_contextual_prefix_does_not_block_a_direct_scheduled_delegation(transcri
         "timezone": "UTC", "action": "agent", "executor": "codex",
         "delegation_evidence": transcript,
         "action_evidence": "run the synthetic report",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.executor == "codex"
 
 
@@ -1046,7 +1048,7 @@ def test_notify_schedule_drops_model_proposed_executor_tag():
         "kind": "schedule", "index": 0, "title": "Synthetic reminder",
         "schedule_type": "once", "schedule_value": "2030-01-02T09:00:00Z",
         "timezone": "UTC", "action": "notify", "executor": "codex",
-    }], transcript="Remind me about this tomorrow.", recorded_at="2030-01-01T10:00:00Z")
+    }], transcript="Remind me about this tomorrow.", recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.executor == ""
 
 
@@ -1054,7 +1056,7 @@ def test_human_action_requires_operator_only_decision_evidence():
     with pytest.raises(PebbleCaptureError, match="operator-only"):
         validate_plan(
             [{"kind": "human", "index": 0, "title": "Maybe review", "decision_evidence": "Maybe review"}],
-            transcript="Maybe review this someday.", recorded_at="2030-01-01T10:00:00Z",
+            transcript="Maybe review this someday.", recorded_at="2030-01-01T10:00:00Z", jev_classified=False,
         )
     [action] = validate_plan(
         [{
@@ -1062,7 +1064,7 @@ def test_human_action_requires_operator_only_decision_evidence():
             "decision_evidence": "I need to decide which synthetic option to approve",
         }],
         transcript="I need to decide which synthetic option to approve.",
-        recorded_at="2030-01-01T10:00:00Z",
+        recorded_at="2030-01-01T10:00:00Z", jev_classified=False,
     )
     assert action.kind == "human"
 
@@ -1426,7 +1428,7 @@ async def test_jev_classifier_task_assigned_to_me_carries_the_me_tag_through_val
     transcript = "Make a task to charge the synthetic earbuds and assign it to me."
     client = _FakeJevClient(_jev_answers(disposition="task", item="s0"))
     raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
-    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=True)
     assert action.kind == "task"
     assert action.tags == ("me",)
     assert action.title == "Charge the synthetic earbuds"
@@ -1446,7 +1448,7 @@ async def test_jev_classifier_task_assigned_to_me_carries_the_me_tag_through_val
 async def test_jev_classifier_task_title_drops_the_filing_request(transcript, expected_title):
     client = _FakeJevClient(_jev_answers(disposition="task", item="s0"))
     raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
-    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=True)
     assert action.title == expected_title
 
 
@@ -1462,7 +1464,7 @@ async def test_jev_classifier_task_title_drops_the_filing_request(transcript, ex
 async def test_jev_classifier_task_without_positive_self_assignment_has_no_assignee(transcript):
     client = _FakeJevClient(_jev_answers(disposition="task", item="s0"))
     raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
-    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=True)
     assert action.tags == ()
 
 
@@ -1592,20 +1594,25 @@ async def test_jev_classifier_malformed_answers_shape_files_log_only():
 
 
 @pytest.mark.asyncio
-async def test_jev_classifier_agent_schedule_with_parseable_time_passes_validate_plan():
-    """The full acceptance path: a Jev `agent_schedule` disposition with a
-    definite time must survive `validate_plan`'s independent authority gate
-    unchanged, producing one schedule with action="agent"."""
+async def test_jev_classifier_unconfirmed_agent_schedule_files_an_unassigned_task():
+    """A Jev `agent_schedule` with a definite time passes the literal
+    scheduled-delegation gate, but without Jev's targeted confirmation (this
+    double never answers it) it files as an unassigned to-do, not agent
+    work."""
     transcript = "Have cloud-sonnet review the synthetic report tomorrow at 9 AM."
     client = _FakeJevClient(
         _jev_answers(disposition="agent_schedule", work="s0", executor="cloud-sonnet")
     )
     raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
-    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
-    assert action.kind == "schedule"
-    assert action.action == "agent"
-    assert action.executor == "cloud-sonnet"
-    assert action.action_evidence == raw[0]["action_evidence"]
+    assert raw[0]["kind"] == "schedule" and raw[0]["executor"] == "cloud-sonnet"
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=True)
+    assert (action.kind, action.action, action.executor, action.tags) == ("task", "", "", ())
+    assert action.title == raw[0]["action_evidence"]
+
+
+def test_validate_plan_requires_the_caller_to_state_the_classifier():
+    with pytest.raises(TypeError, match="jev_classified"):
+        validate_plan([], transcript="Synthetic note", recorded_at="2030-01-01T10:00:00Z")
 
 
 @pytest.mark.asyncio
@@ -1645,12 +1652,12 @@ async def test_jev_classifier_falls_back_to_log_only_when_jev_fails():
     ],
 )
 def test_spoken_executor_aliases_resolve_through_validate_plan(
-    transcript, action_evidence, expected_tag
+    transcript, action_evidence, expected_tag, jev_classified=False
 ):
     [action] = validate_plan([{
         "kind": "task", "index": 0, "title": action_evidence, "tags": [expected_tag],
         "delegation_evidence": transcript, "action_evidence": action_evidence,
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert action.tags == (expected_tag,)
     assert action.title == action_evidence
 
@@ -2317,7 +2324,7 @@ def test_validate_plan_links_a_child_to_an_earlier_parent():
         {"kind": "task", "index": 1, "title": "Clear the synthetic shelves",
          "action_evidence": "Clear the synthetic shelves", "parent_index": 0},
     ]
-    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert parent.parent_index is None
     assert child.parent_index == 0
 
@@ -2360,7 +2367,7 @@ def test_validate_plan_links_a_child_to_an_earlier_parent():
 )
 def test_validate_plan_rejects_an_invalid_parent_index(actions, case):
     with pytest.raises(PebbleCaptureError):
-        validate_plan(actions, transcript="Synthetic transcript.", recorded_at="2030-01-01T10:00:00Z")
+        validate_plan(actions, transcript="Synthetic transcript.", recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 def test_validate_plan_rejects_a_parent_naming_a_non_task_action():
@@ -2371,7 +2378,7 @@ def test_validate_plan_rejects_a_parent_naming_a_non_task_action():
          "parent_index": 0},
     ]
     with pytest.raises(PebbleCaptureError):
-        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 def test_validate_plan_rejects_a_child_whose_parent_was_dropped_for_reused_evidence():
@@ -2384,7 +2391,7 @@ def test_validate_plan_rejects_a_child_whose_parent_was_dropped_for_reused_evide
         {"kind": "task", "index": 2, "title": "Child", "action_evidence": "handle it too", "parent_index": 1},
     ]
     with pytest.raises(PebbleCaptureError):
-        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 def test_validate_plan_rejects_a_plain_child_under_a_delegated_parent():
@@ -2399,7 +2406,7 @@ def test_validate_plan_rejects_a_plain_child_under_a_delegated_parent():
          "action_evidence": "Update the synthetic ledger", "parent_index": 0},
     ]
     with pytest.raises(PebbleCaptureError):
-        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 def test_validate_plan_rejects_a_delegated_child_under_a_plain_parent():
@@ -2414,7 +2421,7 @@ def test_validate_plan_rejects_a_delegated_child_under_a_plain_parent():
          "action_evidence": "the synthetic report", "parent_index": 0},
     ]
     with pytest.raises(PebbleCaptureError):
-        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
 
 
 def test_validate_plan_links_a_plain_child_to_a_me_tagged_parent():
@@ -2432,7 +2439,7 @@ def test_validate_plan_links_a_plain_child_to_a_me_tagged_parent():
         {"kind": "task", "index": 1, "title": "Plug in the synthetic charger",
          "action_evidence": "Plug in the synthetic charger", "parent_index": 0},
     ]
-    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert parent.tags == ("me",)
     assert child.parent_index == 0
 
@@ -2519,7 +2526,7 @@ async def test_jev_classifier_separate_structure_files_each_requested_fragment()
         "Charge the synthetic earbuds", "Order the synthetic filters", "Call the synthetic vet",
     ]
     assert all(action.get("parent_index") is None for action in actions)
-    validated = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    validated = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=True)
     assert len(validated) == 3
 
 
@@ -2540,7 +2547,7 @@ async def test_jev_classifier_project_structure_links_children_to_the_named_pare
         "Clear the shelves", "Buy paint", "Paint the walls",
     ]
     assert all(action["parent_index"] == 0 for action in actions[1:])
-    validated = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    validated = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=True)
     assert len(validated) == 4
 
 
@@ -2596,7 +2603,7 @@ async def test_jev_classifier_single_structure_keeps_current_single_task_behavio
     transcript = "Make a task to charge the synthetic earbuds and assign it to me."
     client = _FakeJevClient(_jev_answers(disposition="task", item="s0", structure="single"))
     raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
-    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=True)
     assert action.title == "Charge the synthetic earbuds"
     assert action.tags == ("me",)
 
@@ -2632,7 +2639,7 @@ async def test_jev_classifier_only_the_first_action_may_carry_me_in_a_list():
         disposition="task", structure="separate", req={"s0": 0.9, "s1": 0.9},
     ))
     raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
-    validated = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    validated = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=True)
     assert validated[0].tags == ("me",)
     assert all(action.tags == () for action in validated[1:])
 
@@ -2647,7 +2654,7 @@ async def test_jev_classifier_only_the_parent_may_carry_me_in_a_project():
         disposition="task", structure="project", parent="s0", req={"s0": 0.9, "s1": 0.9},
     ))
     raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
-    validated = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    validated = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=True)
     assert validated[0].tags == ("me",)
     assert validated[1].tags == ()
 
@@ -2708,6 +2715,602 @@ def test_validated_classifier_actions_accepts_and_links_a_parent_index_plan():
          "action_evidence": "Clear the synthetic shelves", "parent_index": 0},
     ]})
     actions = _validated_classifier_actions(response, transcript, "2030-01-01T10:00:00Z")
-    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z", jev_classified=False)
     assert parent.parent_index is None
     assert child.parent_index == 0
+
+
+# --------------------------------------------------------------------------
+# JevPebbleClassifier: Jev judges the assignee and picks the title among
+# literal cuts of the item fragment; an agent assignee additionally needs
+# its name in a positive clause of the transcript.
+
+_RECORDED = "2030-01-01T10:00:00Z"
+_EVAL_CASES = Path(__file__).resolve().parents[1] / "scripts/jev_eval/cases/pebble_filing_cases.jsonl"
+
+
+class _QuestionAwareJev:
+    """`aask` double that sees the questions: answers the fixed choices from
+    `answers`, and each `title_s<i>` question by picking the option whose
+    text equals `titles[i]` (`title_pick` may instead pick by option key).
+    The targeted agent confirmation call is answered with `confirm`."""
+
+    def __init__(self, answers, *, titles=None, title_pick=None, confirm=0.95):
+        self.answers = answers
+        self.titles = titles or {}
+        self.title_pick = title_pick
+        self.confirm = confirm
+        self.questions = None
+        self.confirmations = []
+        self.calls = 0
+
+    async def aask(self, state, questions):
+        self.calls += 1
+        if "agent_instructed" in questions:
+            self.confirmations.append(questions["agent_instructed"]["instructions"])
+            return {"agent_instructed": {"noul": self.confirm}}
+        self.questions = questions
+        answers = dict(self.answers)
+        for name, question in questions.items():
+            if not name.startswith("title_s"):
+                continue
+            options = question["criteria"]
+            if self.title_pick is not None:
+                choice = self.title_pick(name, options)
+            else:
+                wanted = self.titles.get(name[len("title_"):])
+                choice = next((key for key, text in options.items() if text == wanted), None)
+            if choice is not None:
+                answers[name] = {"choice": choice, "confidence": 0.9}
+        return answers
+
+
+def _answers(*, disposition="task", item="s0", work="none", executor="none",
+             assignee=None, assignee_confidence=0.9):
+    answers = _jev_answers(disposition=disposition, item=item, work=work, executor=executor)
+    if assignee is not None:
+        answers["assignee"] = {"choice": assignee, "confidence": assignee_confidence}
+    return answers
+
+
+async def _classify_and_validate(transcript, client):
+    raw = await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
+    return raw, validate_plan(raw, transcript=transcript, recorded_at=_RECORDED, jev_classified=True)
+
+
+@pytest.mark.asyncio
+async def test_jev_self_assignment_files_one_titled_task_tagged_me(monkeypatch, stores):
+    transcript = "Make a task assigned to me to buy some synthetic widgets"
+    client = _QuestionAwareJev(_answers(assignee="me"), titles={"s0": "buy some synthetic widgets"})
+    consumer = _jev_consumer(monkeypatch, stores, classifier=JevPebbleClassifier(client=client))
+    monkeypatch.setattr("api.services.pebble_capture.judge_task", lambda title: None)
+    ledger, tasks, _ = stores
+    assert await consumer.process({**_payload(), "final_text": transcript}) == "complete"
+    [task] = tasks.list_tasks()
+    assert task.description == "Buy some synthetic widgets"
+    assert list(task.tags) == ["me"]
+    [action] = ledger.load_plan(CaptureIdentity("synthetic-pebble", "capture-1"))
+    assert action.assignee_source == "jev"
+    assert action.assignee_confidence == 0.9
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "title"),
+    [
+        ("Put picking up the synthetic dry cleaning on my list", "picking up the synthetic dry cleaning"),
+        ("Make a task to email the synthetic landlord about the lease, that one's mine",
+         "email the synthetic landlord about the lease"),
+        ("Add a task to water the synthetic ferns for me please", "water the synthetic ferns"),
+    ],
+)
+async def test_jev_self_assignment_follows_the_jev_judgment_not_the_phrasing(transcript, title):
+    fragment = _segment_transcript(transcript)[0]
+    client = _QuestionAwareJev(_answers(assignee="me"), titles={"s0": title})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ("me",)
+    assert action.title.casefold() == title.casefold()
+    assert title in fragment
+
+
+@pytest.mark.asyncio
+async def test_jev_confident_none_leaves_the_task_unassigned():
+    transcript = "Make a task to charge the synthetic earbuds and assign it to me."
+    client = _QuestionAwareJev(_answers(assignee="none"))
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+    assert action.assignee_source == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["task", "delegated_task"])
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Add a task to buy synthetic milk",
+        "Make a task to fix the synthetic login bug, but don't assign it to codex",
+        "Add a task to clean the synthetic gutters. If codex were free it could do this.",
+        "Add a task to debug the synthetic webhook. Sam said codex should do it.",
+        'Add a task to "give it to codex" on the synthetic sign',
+    ],
+)
+async def test_jev_agent_assignee_without_a_positive_name_mention_is_unassigned(transcript, disposition):
+    client = _QuestionAwareJev(_answers(
+        disposition=disposition, work="s0", assignee="codex", assignee_confidence=0.99,
+    ))
+    raw, actions = await _classify_and_validate(transcript, client)
+    assert raw and raw[0]["tags"] == ["codex"]
+    assert [action.tags for action in actions] == [()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "title", "tag"),
+    [
+        ("Make a task to restart the synthetic staging server and codex should own it",
+         "restart the synthetic staging server", "codex"),
+        ("Make a task to investigate the synthetic memory leak, give it to cloud code",
+         "investigate the synthetic memory leak", "claude"),
+        ("Put upgrading the synthetic dependencies on Codex's list",
+         "upgrading the synthetic dependencies", "codex"),
+    ],
+)
+async def test_jev_agent_assignee_named_in_a_positive_clause_is_granted(transcript, title, tag):
+    client = _QuestionAwareJev(_answers(assignee=tag), titles={"s0": title})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == (tag,)
+    assert action.title.casefold() == title.casefold()
+    assert action.assignee_source == "jev"
+
+
+@pytest.mark.asyncio
+async def test_jev_delegation_judged_unassigned_files_a_plain_task_only_when_an_agent_was_named():
+    named = "Add a task to review the synthetic contract. Sam said Claude should do it."
+    client = _QuestionAwareJev(
+        _answers(disposition="delegated_task", work="s0", executor="claude", assignee="none"),
+        titles={"s0": "review the synthetic contract"},
+    )
+    _, [action] = await _classify_and_validate(named, client)
+    assert (action.title, action.tags) == ("Review the synthetic contract", ())
+
+    unnamed = _QuestionAwareJev(_answers(disposition="delegated_task", work="s0", assignee="none"))
+    raw = await JevPebbleClassifier(client=unnamed).classify(
+        "Ask someone to fix the synthetic login bug", _RECORDED
+    )
+    assert raw == []
+
+
+def _jev_task(title, tag, confidence=0.8, **extra):
+    return {
+        "kind": "task", "index": 0, "title": title, "action_evidence": title, "tags": [tag],
+        "assignee_source": "jev", "assignee_confidence": confidence, **extra,
+    }
+
+
+def test_validate_plan_accepts_a_jev_sourced_me_and_records_its_evidence():
+    transcript = "Make a task assigned to me to buy some synthetic widgets"
+    [action] = validate_plan(
+        [_jev_task("Buy some synthetic widgets", "me")], transcript=transcript, recorded_at=_RECORDED, jev_classified=True,
+    )
+    assert action.tags == ("me",)
+    assert (action.assignee_source, action.assignee_confidence) == ("jev", 0.8)
+    assert action.to_dict()["assignee_source"] == "jev"
+
+
+@pytest.mark.parametrize(
+    ("transcript", "title", "tag", "confidence"),
+    [
+        # Below the floor, or not a real number.
+        ("Make a task assigned to me to buy some synthetic widgets", "Buy some synthetic widgets", "me", 0.69),
+        ("Make a task assigned to me to buy some synthetic widgets", "Buy some synthetic widgets", "me", True),
+        ("Make a task assigned to me to buy some synthetic widgets", "Buy some synthetic widgets", "me", None),
+        # A title that is not a literal transcript span.
+        ("Make a task assigned to me to buy some synthetic widgets", "Buy synthetic widgets", "me", 0.9),
+        # An agent never named, named only in a negated clause, or only in reported speech.
+        ("Add a task to buy synthetic milk", "Buy synthetic milk", "codex", 0.99),
+        ("Add a task to buy synthetic milk, never for codex", "Buy synthetic milk", "codex", 0.99),
+        ("Add a task to buy synthetic milk. Sam said codex should.", "Buy synthetic milk", "codex", 0.99),
+    ],
+)
+def test_validate_plan_rejects_an_unproven_jev_sourced_assignee(transcript, title, tag, confidence):
+    [action] = validate_plan(
+        [_jev_task(title, tag, confidence, agent_confirmation=0.99)],
+        transcript=transcript, recorded_at=_RECORDED, jev_classified=True,
+    )
+    assert action.tags == ()
+    assert action.assignee_source == ""
+    assert action.assignee_confidence is None
+
+
+def test_validate_plan_rejects_an_unknown_assignee_source():
+    with pytest.raises(PebbleCaptureError, match="assignee source"):
+        validate_plan(
+            [{**_jev_task("Buy synthetic milk", "me"), "assignee_source": "model"}],
+            transcript="Add a task to buy synthetic milk for me", recorded_at=_RECORDED, jev_classified=True,
+        )
+
+
+def test_llm_classifier_cannot_claim_a_jev_sourced_assignment():
+    transcript = "Add a task to buy synthetic milk"
+    response = json.dumps({"actions": [_jev_task("Buy synthetic milk", "codex", 0.99)]})
+    with pytest.raises(PebbleCaptureError, match="unauthorized task delegation"):
+        _validated_classifier_actions(response, transcript, _RECORDED)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {},
+        {"assignee": "me", "title_s0": "garbage"},
+        {"assignee": {"choice": "banana", "confidence": 0.99}, "title_s0": {"choice": "t9999", "confidence": 0.9}},
+        {"assignee": {"choice": "me", "confidence": 0.4}, "title_s0": {"choice": "t0", "confidence": 0.1}},
+    ],
+)
+async def test_jev_unusable_assignee_or_title_answers_fall_back_to_transcript_rules(broken):
+    """The task is still filed: assignee from the explicit "assign it to me"
+    wording, title from stripping the filing request."""
+    transcript = "Make a task to charge the synthetic earbuds and assign it to me."
+    client = _FakeJevClient({**_jev_answers(disposition="task", item="s0"), **broken})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.title == "Charge the synthetic earbuds"
+    assert action.tags == ("me",)
+    assert action.assignee_source == ""
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_asks_assignee_and_title_questions_in_one_call():
+    transcript = "Make a task assigned to me to buy some synthetic widgets"
+    client = _QuestionAwareJev(_answers(assignee="me"))
+    await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
+    assert set(client.questions["assignee"]["criteria"]) == {"none", *ASSIGNEE_TAGS, *AGENT_EXECUTOR_TAGS}
+    options = client.questions["title_s0"]["criteria"]
+    assert "buy some synthetic widgets" in options.values()
+    assert len(options) <= 255
+
+
+def _eval_utterances():
+    """The labeled eval set's utterances, or a single `None` when the file is
+    missing, so the tests below fail with a clear message rather than
+    collection erroring out."""
+    if not _EVAL_CASES.is_file():
+        return [None]
+    return [json.loads(line)["utterance"] for line in _EVAL_CASES.read_text().splitlines() if line.strip()]
+
+
+def _require_eval_utterance(utterance):
+    if utterance is None:
+        pytest.fail(f"Pebble filing eval set is missing: {_EVAL_CASES} must be committed")
+    return utterance
+
+
+@pytest.mark.parametrize("utterance", _eval_utterances())
+def test_title_candidates_are_literal_transcript_spans(utterance):
+    utterance = _require_eval_utterance(utterance)
+    for fragment in _segment_transcript(utterance):
+        candidates = _title_candidates(fragment)
+        assert len(candidates) <= 255
+        for candidate in candidates:
+            assert candidate in fragment
+            assert candidate in utterance
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("utterance", _eval_utterances())
+async def test_every_jev_chosen_title_is_a_literal_transcript_substring(utterance):
+    """Whichever candidate Jev picks, the filed title is a literal
+    (case-insensitive) span of the transcript."""
+    utterance = _require_eval_utterance(utterance)
+    first = _title_candidates(_segment_transcript(utterance)[0])
+    for pick in range(len(first)):
+        client = _QuestionAwareJev(
+            _answers(assignee="me"),
+            title_pick=lambda name, options, pick=pick: f"t{min(pick, len(options) - 1)}",
+        )
+        raw, actions = await _classify_and_validate(utterance, client)
+        for action in actions:
+            assert action.title.casefold() in utterance.casefold()
+
+
+# Agent assignment on a Jev judgment needs two independent locks: the agent's
+# name bound to the title in the same sentence, outside the title span
+# (literal), and Jev's targeted confirmation that the speaker is directly
+# instructing that agent.
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "title", "tag"),
+    [
+        # Named in another sentence than the to-do.
+        ("Claude is expensive. Add a task to buy synthetic milk", "buy synthetic milk", "claude"),
+        # Named only inside the to-do's own wording.
+        ("Add a task to ask Taylor about the claude code bill",
+         "ask Taylor about the claude code bill", "claude"),
+    ],
+)
+async def test_jev_agent_needs_its_name_bound_to_the_title(transcript, title, tag):
+    """Jev proposes and even confirms the agent; the literal binding alone
+    must still refuse it."""
+    client = _QuestionAwareJev(_answers(assignee=tag), titles={"s0": title, "s1": title}, confirm=0.99)
+    client.answers["item"] = {"choice": f"s{len(_segment_transcript(transcript)) - 1}", "confidence": 0.9}
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+    assert action.title.casefold() == title.casefold()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "title", "tag"),
+    [
+        ("Taylor told Morgan to have Claude review the synthetic contract",
+         "review the synthetic contract", "claude"),
+        ("We mustn't have Codex touch the synthetic billing code",
+         "touch the synthetic billing code", "codex"),
+        ("Imagine Claude drafting the synthetic memo", "drafting the synthetic memo", "claude"),
+    ],
+)
+async def test_jev_agent_needs_jevs_targeted_confirmation(transcript, title, tag):
+    """The name is bound to the title, so only Jev's targeted confirmation
+    (here declining) stands between Jev's first answer and the agent."""
+    client = _QuestionAwareJev(_answers(assignee=tag), titles={"s0": title}, confirm=0.1)
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+    assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_jev_confirmed_agent_named_beside_the_work_is_granted_and_recorded():
+    transcript = "Have Claude review the synthetic contract"
+    client = _QuestionAwareJev(_answers(assignee="claude"), titles={"s0": "review the synthetic contract"})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ("claude",)
+    assert action.title == "Review the synthetic contract"
+    assert (action.assignee_source, action.agent_confirmation) == ("jev", 0.95)
+    assert client.calls == 2
+    [statement] = client.confirmations
+    assert "Claude Code" in statement and "'Review the synthetic contract'" in statement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirm", [0.79, None, "yes", True])
+async def test_jev_agent_with_a_low_or_unusable_confirmation_files_unassigned(confirm):
+    transcript = "Have Claude review the synthetic contract"
+    client = _QuestionAwareJev(
+        _answers(assignee="claude"), titles={"s0": "review the synthetic contract"}, confirm=confirm,
+    )
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+    assert action.title == "Review the synthetic contract"
+
+
+@pytest.mark.asyncio
+async def test_jev_agent_confirmation_call_failing_files_unassigned():
+    class FailingConfirmation(_QuestionAwareJev):
+        async def aask(self, state, questions):
+            if "agent_instructed" in questions:
+                raise JevError("synthetic failure")
+            return await super().aask(state, questions)
+
+    transcript = "Have Claude review the synthetic contract"
+    client = FailingConfirmation(_answers(assignee="claude"), titles={"s0": "review the synthetic contract"})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+
+
+@pytest.mark.asyncio
+async def test_jev_makes_one_call_when_no_agent_is_proposed():
+    client = _QuestionAwareJev(_answers(assignee="me"), titles={"s0": "buy some synthetic widgets"})
+    await _classify_and_validate("Make a task assigned to me to buy some synthetic widgets", client)
+    assert client.calls == 1
+    assert client.confirmations == []
+
+
+def test_validate_plan_requires_the_agent_confirmation_for_a_jev_sourced_agent():
+    transcript = "Have Claude review the synthetic contract"
+    title = "review the synthetic contract"
+    [unconfirmed] = validate_plan([_jev_task(title, "claude", 0.9)], transcript=transcript, recorded_at=_RECORDED, jev_classified=True)
+    [confirmed] = validate_plan(
+        [_jev_task(title, "claude", 0.9, agent_confirmation=0.8)], transcript=transcript, recorded_at=_RECORDED, jev_classified=True,
+    )
+    assert unconfirmed.tags == ()
+    assert confirmed.tags == ("claude",)
+    assert confirmed.agent_confirmation == 0.8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_choice", [[], {"t0": 1}, 3, None])
+async def test_jev_title_with_a_non_string_choice_falls_back_to_prefix_stripping(bad_choice):
+    transcript = "Make a task to charge the synthetic earbuds and assign it to me"
+    client = _FakeJevClient({
+        **_jev_answers(disposition="task", item="s0"),
+        "title_s0": {"choice": bad_choice, "confidence": 0.9},
+    })
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.title == "Charge the synthetic earbuds"
+    assert action.tags == ("me",)
+
+
+# Filing disposition: a confident filing disposition decides; otherwise
+# Jev's `filing_request` probability rescues a capture as a plain to-do, but
+# only while the disposition itself weighs log-only below one half.
+
+def _rescue_answers(*, disposition, confidence, probabilities, filing_request, assignee=None):
+    answers = _answers(disposition=disposition, assignee=assignee)
+    answers["disposition"] = {"choice": disposition, "confidence": confidence}
+    if probabilities is not None:
+        answers["disposition"]["probabilities"] = probabilities
+    if filing_request is not None:
+        answers["filing_request"] = {"noul": filing_request}
+    return answers
+
+
+_PIANO = "Put this on my plate: schedule the synthetic piano tuner"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("assignee", "expected_tags"), [("me", ("me",)), ("codex", ())])
+async def test_jev_filing_request_rescues_a_capture_only_as_a_plain_task(assignee, expected_tags):
+    """The disposition alone falls short (0.48, though it puts more weight on
+    agent work than on log-only); the rescue files a plain to-do, the
+    speaker's or unassigned -- never agent work."""
+    answers = _rescue_answers(
+        disposition="task", confidence=0.48,
+        probabilities={"task": 0.59, "delegated_task": 0.3, "agent_schedule": 0.08, "log_only": 0.03},
+        filing_request=0.95, assignee=assignee,
+    )
+    answers["item"] = {"choice": "s1", "confidence": 0.9}
+    answers["work"] = {"choice": "s1", "confidence": 0.9}
+    answers["executor"] = {"choice": "codex", "confidence": 0.9}
+    client = _QuestionAwareJev(answers, titles={"s1": "schedule the synthetic piano tuner"}, confirm=0.99)
+    raw, [action] = await _classify_and_validate(_PIANO, client)
+    assert action.kind == "task"
+    assert action.title == "Schedule the synthetic piano tuner"
+    assert action.tags == expected_tags
+    assert all(tag not in AGENT_EXECUTOR_TAGS for item in raw for tag in item.get("tags", ()))
+    assert "filing_request" in client.questions
+
+
+@pytest.mark.asyncio
+async def test_jev_rescue_never_delegates_even_to_a_named_and_confirmed_agent():
+    """Binding and confirmation would both pass here; a rescued capture
+    still files only as an unassigned plain to-do."""
+    transcript = "Put this on codex's plate: tidy the synthetic test fixtures"
+    answers = _rescue_answers(
+        disposition="delegated_task", confidence=0.45,
+        probabilities={"delegated_task": 0.6, "task": 0.3, "log_only": 0.1},
+        filing_request=0.9, assignee="codex",
+    )
+    for key in ("item", "work"):
+        answers[key] = {"choice": "s1", "confidence": 0.9}
+    answers["executor"] = {"choice": "codex", "confidence": 0.9}
+    client = _QuestionAwareJev(answers, titles={"s1": "tidy the synthetic test fixtures"}, confirm=0.99)
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert (action.kind, action.title, action.tags) == ("task", "Tidy the synthetic test fixtures", ())
+
+
+@pytest.mark.asyncio
+async def test_jev_rescued_low_probability_reminder_files_a_plain_task_not_a_schedule():
+    transcript = "Note to self: call the synthetic vet tomorrow"
+    answers = _rescue_answers(
+        disposition="notify_schedule", confidence=0.3,
+        probabilities={"notify_schedule": 0.55, "log_only": 0.45, "task": 1e-6},
+        filing_request=0.9,
+    )
+    answers["item"] = {"choice": "s1", "confidence": 0.9}
+    _, [action] = await _classify_and_validate(transcript, _QuestionAwareJev(answers))
+    assert action.kind == "task"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "disposition", "confidence", "probabilities", "filing_request"),
+    [
+        # A fairly confident log-only is never overridden.
+        ("I enjoyed watching the synthetic rain today", "log_only", 0.79,
+         {"log_only": 0.79, "task": 0.21}, 0.71),
+        # Near-zero reminder: log-only still holds most of the weight.
+        ("Note to self: call the synthetic vet tomorrow", "log_only", 0.79,
+         {"log_only": 0.79, "notify_schedule": 0.21, "task": 1e-6}, 0.71),
+        # Log-only weighs exactly one half: not below it.
+        ("My to-do: return the synthetic library books", "log_only", 0.52,
+         {"log_only": 0.5, "task": 0.5}, 0.9),
+        # Without the disposition's own log-only probability there is no rescue.
+        ("My to-do: return the synthetic library books", "task", 0.36, None, 0.9),
+        ("My to-do: return the synthetic library books", "task", 0.36, {"task": 0.9}, 0.9),
+        ("My to-do: return the synthetic library books", "task", 0.36, {"log_only": "low"}, 0.9),
+        # The second signal itself falls short or is missing.
+        ("I keep meaning to call the synthetic plumber", "task", 0.45, {"log_only": 0.1}, 0.69),
+        ("I keep meaning to call the synthetic plumber", "task", 0.45, {"log_only": 0.1}, None),
+    ],
+)
+async def test_jev_capture_without_both_rescue_signals_files_nothing(
+    transcript, disposition, confidence, probabilities, filing_request,
+):
+    answers = _rescue_answers(
+        disposition=disposition, confidence=confidence, probabilities=probabilities,
+        filing_request=filing_request, assignee="me",
+    )
+    actions = await JevPebbleClassifier(client=_FakeJevClient(answers)).classify(transcript, _RECORDED)
+    assert actions == []
+
+
+@pytest.mark.asyncio
+async def test_jev_rescue_cannot_produce_an_agent_schedule(monkeypatch, stores):
+    """A capture the disposition reads as log-only (0.79) is never rescued
+    into an agent schedule, whatever the other answers say."""
+    transcript = "Taylor told Morgan to schedule Claude to review the synthetic contract tomorrow at 3 PM"
+    answers = _rescue_answers(
+        disposition="log_only", confidence=0.79,
+        probabilities={"log_only": 0.79, "agent_schedule": 0.21}, filing_request=0.71, assignee="claude",
+    )
+    answers["work"] = {"choice": "s0", "confidence": 0.9}
+    answers["executor"] = {"choice": "claude", "confidence": 0.9}
+    client = _QuestionAwareJev(answers, titles={"s0": "review the synthetic contract"}, confirm=0.99)
+    consumer = _jev_consumer(monkeypatch, stores, classifier=JevPebbleClassifier(client=client))
+    ledger, tasks, schedules = stores
+    await consumer.process({**_payload(), "final_text": transcript})
+    assert tasks.list_tasks() == []
+    assert schedules.list_all() == []
+
+
+_SCHEDULE_REPRO = "Taylor told Morgan to schedule Claude to review the synthetic contract tomorrow at 3 PM"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("confirm", "agent_scheduled"), [(0.1, False), (0.95, True)])
+async def test_jev_agent_schedule_needs_jevs_targeted_confirmation(confirm, agent_scheduled):
+    """The literal scheduled-delegation gate and the name binding both pass;
+    only Jev's targeted confirmation separates agent work from a to-do."""
+    answers = _answers(disposition="agent_schedule", work="s0", assignee="claude")
+    client = _QuestionAwareJev(answers, titles={"s0": "review the synthetic contract"}, confirm=confirm)
+    _, [action] = await _classify_and_validate(_SCHEDULE_REPRO, client)
+    assert client.calls == 2
+    if agent_scheduled:
+        assert (action.kind, action.action, action.executor) == ("schedule", "agent", "claude")
+        assert action.agent_confirmation == 0.95
+    else:
+        assert (action.kind, action.tags, action.executor) == ("task", (), "")
+        assert action.title == "Review the synthetic contract"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("confirm", "expected_tags"), [(0.1, ()), (0.95, ("claude",))])
+async def test_jev_executor_fallback_delegation_needs_jevs_targeted_confirmation(confirm, expected_tags):
+    """No assignee answer: the `executor` fallback and the literal
+    delegation-evidence gate pass, so the confirmation decides."""
+    transcript = "Taylor told Morgan to ask Claude to review the synthetic contract"
+    answers = _answers(disposition="delegated_task", work="s0", executor="claude")
+    client = _QuestionAwareJev(answers, titles={"s0": "review the synthetic contract"}, confirm=confirm)
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == expected_tags
+    assert client.calls == 2
+
+
+def test_validate_plan_downgrades_an_unconfirmed_jev_agent_schedule_but_rejects_an_llm_one():
+    transcript = "Schedule Claude to review the synthetic contract tomorrow at 3 PM."
+    raw = [{
+        "kind": "schedule", "index": 0, "title": "review the synthetic contract",
+        "schedule_type": "once", "schedule_value": "2030-01-02T15:00:00", "timezone": "UTC",
+        "action": "agent", "executor": "claude", "message": "review the synthetic contract",
+        "delegation_evidence": transcript.rstrip("."), "action_evidence": "review the synthetic contract",
+    }]
+    [action] = validate_plan(raw, transcript=transcript, recorded_at=_RECORDED, jev_classified=True)
+    assert (action.kind, action.tags, action.executor) == ("task", (), "")
+    [granted] = validate_plan(
+        [{**raw[0], "agent_confirmation": 0.9}], transcript=transcript, recorded_at=_RECORDED,
+        jev_classified=True,
+    )
+    assert (granted.kind, granted.executor, granted.agent_confirmation) == ("schedule", "claude", 0.9)
+    [llm] = validate_plan(raw, transcript=transcript, recorded_at=_RECORDED, jev_classified=False)
+    assert llm.executor == "claude"
+
+
+@pytest.mark.asyncio
+async def test_jev_notify_reminder_uses_the_jev_chosen_title():
+    transcript = "Remind me tomorrow at 3 PM to call the synthetic vet"
+    client = _QuestionAwareJev(
+        _answers(disposition="notify_schedule"), titles={"s0": "call the synthetic vet"},
+    )
+    [action] = await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
+    assert action["kind"] == "schedule"
+    assert action["title"] == action["message"] == "Call the synthetic vet"

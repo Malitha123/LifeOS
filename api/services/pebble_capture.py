@@ -236,6 +236,12 @@ class PlannedAction:
     human_key: str = ""
     decision_evidence: str = ""
     parent_index: Optional[int] = None
+    # Set only when a task's assignee tag was granted on a Jev assignee
+    # judgment (see `_jev_task_assignment`): "jev" plus Jev's confidence,
+    # and for an agent the probability of Jev's targeted confirmation.
+    assignee_source: str = ""
+    assignee_confidence: Optional[float] = None
+    agent_confirmation: Optional[float] = None
 
     def operation_key(self, identity: CaptureIdentity) -> str:
         raw = f"{identity.source_id}\0{identity.capture_id}\0{self.index}".encode()
@@ -251,6 +257,9 @@ class PlannedAction:
             "action_evidence": self.action_evidence,
             "human_key": self.human_key, "decision_evidence": self.decision_evidence,
             "parent_index": self.parent_index,
+            "assignee_source": self.assignee_source,
+            "assignee_confidence": self.assignee_confidence,
+            "agent_confirmation": self.agent_confirmation,
         }
 
 
@@ -686,6 +695,97 @@ def _explicit_task_delegation(
     )
 
 
+# Minimum Jev confidence for an assignee judgment to decide a task's
+# assignee; the classifier and `validate_plan` both apply it.
+_JEV_ASSIGNEE_FLOOR = 0.7
+# Minimum probability of Jev's targeted confirmation that the speaker is
+# directly instructing the proposed agent (`JevPebbleClassifier._confirm_agent`).
+_JEV_AGENT_CONFIRMATION_FLOOR = 0.8
+
+
+def _named_executors(text: str) -> set[str]:
+    """Canonical executor tags named anywhere in a positive clause.
+
+    A name mention, not a phrasing pattern: any alias in
+    `EXECUTOR_ALIASES` counts, wherever it falls in the clause. Negated,
+    hypothetical, conditional, quoted, and reported-speech clauses are
+    excluded by `_positive_clauses`.
+    """
+    named: set[str] = set()
+    for clause in _positive_clauses(text):
+        for match in _EXECUTOR_ALIAS_RE.finditer(clause):
+            named.add(EXECUTOR_ALIASES[match.group(0).casefold()])
+    return named
+
+
+def _probability_at_least(value: Any, floor: float) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and floor <= value <= 1)
+
+
+def _executor_bound_to_title(transcript: str, tag: str, title: str) -> bool:
+    """True when `tag` is named in the same sentence as `title`, outside the
+    title span itself.
+
+    A literal binding, not a phrasing pattern: the agent's name (any alias
+    in `EXECUTOR_ALIASES`) must sit beside the to-do it is said to do. A
+    mention in another sentence, or inside the to-do's own wording ("ask
+    Taylor about the claude code bill"), does not bind.
+    """
+    if not title:
+        return False
+    title_re = re.compile(re.escape(title), re.IGNORECASE)
+    for sentence in re.findall(r"[^.!?;\n]+", transcript):
+        for match in title_re.finditer(sentence):
+            outside = sentence[:match.start()] + " " + sentence[match.end():]
+            if any(EXECUTOR_ALIASES[mention.group(0).casefold()] == tag
+                   for mention in _EXECUTOR_ALIAS_RE.finditer(outside)):
+                return True
+    return False
+
+
+def _agent_locks(transcript: str, tag: str, action_evidence: str, agent_confirmation: Any) -> bool:
+    """The two independent locks every Jev-classified agent outcome needs.
+
+    (a) the agent's name bound to the to-do in the transcript
+    (`_executor_bound_to_title`, after the cheap `_named_executors`
+    positive-clause pre-filter), and (b) Jev's targeted confirmation that
+    the speaker themself asks that agent to do it, at
+    `_JEV_AGENT_CONFIRMATION_FLOOR` or above.
+    """
+    return (
+        tag in _named_executors(transcript)
+        and _executor_bound_to_title(transcript, tag, action_evidence)
+        and _probability_at_least(agent_confirmation, _JEV_AGENT_CONFIRMATION_FLOOR)
+    )
+
+
+def _jev_task_assignment(
+    transcript: str, tag: str, confidence: Any, action_evidence: str,
+    agent_confirmation: Any = None,
+) -> bool:
+    """Accept an assignee tag backed by a Jev assignee judgment.
+
+    Jev's judgment must meet `_JEV_ASSIGNEE_FLOOR` and the task's title must
+    be an exact unquoted transcript span. `me` needs nothing more. An agent
+    executor also needs both `_agent_locks`: Jev's assignee judgment alone
+    never grants execution authority.
+    """
+    if not _probability_at_least(confidence, _JEV_ASSIGNEE_FLOOR):
+        return False
+    if not isinstance(action_evidence, str) or not _scope_terms(action_evidence):
+        return False
+    try:
+        _safe_markdown_text(action_evidence, field="action_evidence", limit=500)
+    except PebbleCaptureError:
+        return False
+    if not _is_unquoted_evidence(transcript, action_evidence):
+        return False
+    if tag in _VALID_EXECUTORS:
+        return _agent_locks(transcript, tag, action_evidence, agent_confirmation)
+    return tag == "me"
+
+
 def _scheduled_executors(text: str) -> set[str]:
     """Resolve positive natural-language scheduled execution requests."""
     result: set[str] = set()
@@ -754,8 +854,18 @@ def _explicit_operator_decision(transcript: str, evidence: str) -> bool:
     ))
 
 
-def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at: str) -> list[PlannedAction]:
-    """Convert untrusted model JSON into an explicitly bounded action list."""
+def validate_plan(
+    raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at: str,
+    jev_classified: bool,
+) -> list[PlannedAction]:
+    """Convert untrusted model JSON into an explicitly bounded action list.
+
+    `jev_classified` is required, so every caller states which classifier
+    proposed the plan. With it set (a `JevPebbleClassifier` plan), every
+    agent-executable outcome -- a delegated task on any path and an agent
+    schedule -- also needs both `_agent_locks`; an agent schedule that
+    fails its gate files as an unassigned task instead.
+    """
     if not isinstance(raw, list) or len(raw) > 8:
         raise PebbleCaptureError("classifier actions must be a list of at most eight items")
     allowed_tags = _explicit_tags(transcript)
@@ -798,6 +908,13 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
         action_evidence = raw_action.get("action_evidence") or ""
         if not isinstance(evidence, str) or not isinstance(action_evidence, str):
             raise PebbleCaptureError("task delegation evidence is invalid")
+        assignee_source = raw_action.get("assignee_source") or ""
+        assignee_confidence = raw_action.get("assignee_confidence")
+        agent_confirmation = raw_action.get("agent_confirmation")
+        if assignee_source not in ("", "jev"):
+            raise PebbleCaptureError("task assignee source is invalid")
+        jev_assigned = False
+        jev_agent = False
         tags: list[str] = []
         # A span already spent by an earlier action -- for delegation or for
         # plain filing -- cannot also back this one: one governed span may
@@ -821,13 +938,25 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 tag = raw_tag.lstrip("#").lower()
                 if tag in _VALID_TASK_ASSIGNEES:
                     evidence_key = evidence.casefold()
+                    if assignee_source == "jev":
+                        granted = _jev_task_assignment(
+                            transcript, tag, assignee_confidence, action_evidence,
+                            agent_confirmation,
+                        )
+                    else:
+                        granted = _explicit_task_delegation(
+                            transcript, tag, evidence, action_evidence
+                        ) and (
+                            not jev_classified or tag not in _VALID_EXECUTORS
+                            or _agent_locks(transcript, tag, action_evidence, agent_confirmation)
+                        )
                     if (not reused_action_evidence
                             and evidence_key not in used_delegations
-                            and _explicit_task_delegation(
-                                transcript, tag, evidence, action_evidence
-                            )):
+                            and granted):
                         tags.append(tag)
                         used_delegations.add(evidence_key)
+                        jev_assigned = assignee_source == "jev"
+                        jev_agent = (jev_classified or jev_assigned) and tag in _VALID_EXECUTORS
                 elif tag not in _ROUTING_TAGS and tag in allowed_tags:
                     tags.append(tag)
         normalized_tags = tuple(dict.fromkeys(tags))
@@ -837,6 +966,9 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
             kind=kind, title=title, index=index, tags=normalized_tags,
             delegation_evidence=evidence, action_evidence=action_evidence,
             parent_index=parent_index,
+            assignee_source="jev" if jev_assigned else "",
+            assignee_confidence=float(assignee_confidence) if jev_assigned else None,
+            agent_confirmation=float(agent_confirmation) if jev_agent else None,
         )
         if kind == "task":
             due = raw_action.get("due_date", "")
@@ -901,8 +1033,27 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                         or action_key in used_scheduled_delegation_evidence
                         or not _explicit_scheduled_delegation(
                             transcript, executor, evidence, action_evidence
-                        )):
-                    raise PebbleCaptureError("agent schedule lacks explicit valid delegation")
+                        )
+                        or (jev_classified and not _agent_locks(
+                            transcript, executor, action_evidence, agent_confirmation
+                        ))):
+                    if not jev_classified:
+                        raise PebbleCaptureError("agent schedule lacks explicit valid delegation")
+                    # A Jev plan's unproven agent schedule files as the
+                    # speaker's unassigned to-do, never as agent work.
+                    task_title = title
+                    if action_evidence and action_key not in used_action_evidence:
+                        try:
+                            task_title = _safe_markdown_text(
+                                action_evidence, field="action_evidence", limit=500
+                            )
+                        except PebbleCaptureError:
+                            task_title = title
+                        used_action_evidence.add(action_key)
+                    result.append(PlannedAction(
+                        kind="task", title=task_title, index=index, action_evidence=action_evidence,
+                    ))
+                    continue
                 used_delegations.add(evidence_key)
                 used_action_evidence.add(action_key)
                 used_scheduled_delegation_evidence.add(action_key)
@@ -928,6 +1079,10 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 message=message,
                 delegation_evidence=evidence,
                 action_evidence=action_evidence,
+                agent_confirmation=(
+                    float(agent_confirmation)
+                    if jev_classified and scheduled_action == "agent" else None
+                ),
             )
         else:
             key = raw_action.get("human_key") or f"pebble:{index}"
@@ -1040,6 +1195,41 @@ _RECURRENCE_RE = re.compile(
 )
 
 _JEV_DISPOSITIONS = frozenset({"task", "notify_schedule", "delegated_task", "agent_schedule"})
+_DISPOSITION_FLOOR = 0.5
+# Second filing signal: Jev's `filing_request` probability that the speaker
+# asked for something to be recorded as a to-do or reminder. At or above
+# this floor -- and only while the disposition answer itself weighs
+# log-only below `_RESCUE_LOG_ONLY_CEILING` -- it files a capture whose
+# disposition answer alone falls short, as a plain to-do.
+_FILING_REQUEST_FLOOR = 0.7
+_RESCUE_LOG_ONLY_CEILING = 0.5
+
+
+def _jev_disposition(answers: dict[str, Any]) -> tuple[Optional[str], bool]:
+    """The filing disposition to act on (`None` for log-only), and whether
+    it came from the `filing_request` rescue.
+
+    A filing disposition at `_DISPOSITION_FLOOR` confidence or above
+    decides. Otherwise the capture files as a plain `task` -- never a
+    reminder or agent work -- only when `filing_request` reaches
+    `_FILING_REQUEST_FLOOR` and the disposition's own log-only probability
+    is present and below `_RESCUE_LOG_ONLY_CEILING`.
+    """
+    disposition = answers.get("disposition") or {}
+    confidence = disposition.get("confidence")
+    choice = disposition.get("choice")
+    if (_probability_at_least(confidence, _DISPOSITION_FLOOR)
+            and choice in _JEV_DISPOSITIONS):
+        return choice, False
+    request = (answers.get("filing_request") or {}).get("noul")
+    if not _probability_at_least(request, _FILING_REQUEST_FLOOR):
+        return None, False
+    probabilities = disposition.get("probabilities")
+    log_only = probabilities.get("log_only") if isinstance(probabilities, dict) else None
+    if (isinstance(log_only, bool) or not isinstance(log_only, (int, float))
+            or not 0 <= log_only < _RESCUE_LOG_ONLY_CEILING):
+        return None, False
+    return "task", True
 
 
 def _segment_transcript(text: str) -> list[str]:
@@ -1072,6 +1262,17 @@ _EXECUTOR_BASE_DESCRIPTIONS: dict[str, str] = {
 }
 
 
+_EXECUTOR_DISPLAY_NAMES: dict[str, str] = {
+    "claude": "Claude Code",
+    "codex": "Codex",
+    "hermes": "Hermes",
+    "local": "the local model",
+    "cloud": "DeepSeek",
+    "cloud-haiku": "Claude Haiku",
+    "cloud-sonnet": "Claude Sonnet",
+}
+
+
 def _executor_criteria() -> dict[str, str]:
     """Jev `executor` question options, generated from `EXECUTOR_ALIASES` so
     the alias table stays the only place aliases are defined."""
@@ -1090,12 +1291,57 @@ def _executor_criteria() -> dict[str, str]:
     return criteria
 
 
+def _assignee_criteria() -> dict[str, str]:
+    """Jev `assignee` question options: nobody, the speaker, or each agent."""
+    criteria = {
+        "none": "Nobody: the speaker did not ask for the task to be assigned to anyone.",
+        "me": (
+            "The speaker themselves: they asked for the task to be theirs "
+            "(\"assign it to me\", \"for me\", \"that's mine\", \"put it on my list\")."
+        ),
+    }
+    for tag, description in _executor_criteria().items():
+        if tag != "none":
+            criteria[tag] = f"The AI agent {tag}: {description}"
+    return criteria
+
+
+# Title candidates for one fragment are its word-boundary cuts: every span
+# starting within its first `_TITLE_MAX_LEAD_WORDS` words and ending at most
+# `_TITLE_MAX_TRAIL_CUT` words before its end, so a leading filing request
+# and a trailing assignee remark can each be cut away. Every candidate is an
+# exact slice of the transcript.
+_TITLE_MAX_LEAD_WORDS = 12
+_TITLE_MAX_TRAIL_CUT = 8
+_TITLE_EDGE_CHARS = " \t,.;:!?—–-"
+# Fragments past this many get no title question; their titles fall back to
+# `_strip_task_request`.
+_TITLE_QUESTION_FRAGMENTS = 8
+_JEV_TITLE_FLOOR = 0.5
+
+
+def _title_candidates(fragment: str) -> list[str]:
+    """Literal word-boundary spans of `fragment` that could be its title."""
+    words = list(re.finditer(r"\S+", fragment))
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for start in range(min(len(words), _TITLE_MAX_LEAD_WORDS)):
+        for end in range(len(words), max(start, len(words) - _TITLE_MAX_TRAIL_CUT - 1), -1):
+            span = fragment[words[start].start():words[end - 1].end()].strip(_TITLE_EDGE_CHARS)
+            if span and _scope_terms(span) and span.casefold() not in seen:
+                seen.add(span.casefold())
+                candidates.append(span)
+    return candidates
+
+
 class JevPebbleClassifier:
     """Pebble classifier backed by TypeSafe's Jev typed-judgment API.
 
     Code segments the transcript into fragments and asks Jev, in one call,
     which disposition applies, which fragment was requested, which fragment
-    is the delegated work, and which executor was named. Same `classify()`
+    is the delegated work, which executor was named, who the speaker asked
+    the task to be assigned to, and -- for each fragment -- which literal
+    cut of it states the to-do itself (`_title_candidates`). Same `classify()`
     interface as `PebbleJournalClassifier`; `_default_pebble_classifier`
     selects between them via `LIFEOS_PEBBLE_CLASSIFIER`. Every proposed
     action still passes through `validate_plan` unchanged -- this class only
@@ -1177,6 +1423,40 @@ class JevPebbleClassifier:
                     "own to-do or sub-task."
                 ),
             }
+        questions["filing_request"] = {
+            "type": "noul",
+            "instructions": (
+                "The speaker is asking for something to be recorded as a "
+                "to-do or reminder -- not just thinking aloud, describing, "
+                "musing, or recounting what someone else asked."
+            ),
+        }
+        questions["assignee"] = {
+            "type": "choice",
+            "instructions": (
+                "Who did the speaker ask for this task to be assigned to? Only "
+                "the speaker's own request counts. An assignment that is "
+                "negated, hypothetical or wished-for, or reported as what "
+                "someone else said, is not a request, and neither is merely "
+                "mentioning a person or agent."
+            ),
+            "criteria": _assignee_criteria(),
+        }
+        title_options: dict[str, dict[str, str]] = {}
+        for i, fragment in enumerate(fragments[:_TITLE_QUESTION_FRAGMENTS]):
+            candidates = _title_candidates(fragment)
+            if len(candidates) > 1:
+                title_options[f"s{i}"] = {f"t{j}": span for j, span in enumerate(candidates)}
+                questions[f"title_s{i}"] = {
+                    "type": "choice",
+                    "instructions": (
+                        f'Which wording of "{fragment}" states only the to-do '
+                        "itself, as the thing to be done? Leave out any request "
+                        "to file or list it, who it is assigned to or who will "
+                        "do it, and filler words."
+                    ),
+                    "criteria": title_options[f"s{i}"],
+                }
         try:
             answers = await self._client.aask({"voice_note": final_text}, questions)
         except JevError:
@@ -1184,10 +1464,45 @@ class JevPebbleClassifier:
             return []
         self.last_answers = answers
         try:
-            return _jev_plan_from_answers(answers, final_text, recorded_at, item_criteria, work_criteria)
+            actions = _jev_plan_from_answers(
+                answers, final_text, recorded_at, item_criteria, work_criteria, title_options
+            )
         except (KeyError, TypeError, AttributeError, ValueError):
             logger.warning("Jev Pebble classification returned a malformed answer; filing log-only")
             return []
+        for action in actions:
+            agents = [tag for tag in action.get("tags", ()) if tag in _VALID_EXECUTORS]
+            if action.get("kind") == "schedule" and action.get("executor") in _VALID_EXECUTORS:
+                agents.append(action["executor"])
+            if agents:
+                confirmation = await self._confirm_agent(final_text, agents[0], action["title"])
+                if confirmation is not None:
+                    action["agent_confirmation"] = confirmation
+        return actions
+
+    async def _confirm_agent(self, final_text: str, agent: str, title: str) -> Optional[float]:
+        """Jev's probability that the speaker is directly instructing
+        `agent` to do `title` -- a second, targeted call made only when the
+        first proposes an agent. `None` when the call fails or the answer is
+        malformed, which `validate_plan` treats as unconfirmed."""
+        statement = (
+            f"In this voice note the speaker themself asks for this to be done by "
+            f"{_EXECUTOR_DISPLAY_NAMES.get(agent, agent)} -- telling it to do it, or "
+            f"assigning or handing the task to it: '{title}' (not negating it, not "
+            "imagining it, not reporting what someone else said)"
+        )
+        try:
+            answers = await self._client.aask(
+                {"voice_note": final_text},
+                {"agent_instructed": {"type": "noul", "instructions": statement}},
+            )
+            noul = answers["agent_instructed"]["noul"]
+        except (JevError, KeyError, TypeError):
+            logger.warning("Jev Pebble agent confirmation failed; filing unassigned")
+            return None
+        if isinstance(noul, bool) or not isinstance(noul, (int, float)):
+            return None
+        return float(noul)
 
 
 # The spoken filing request in front of a task ("make a task to", "add a
@@ -1227,10 +1542,9 @@ def _jev_self_assignment(item: str, final_text: str) -> Optional[tuple[list[str]
     """Return (["me"], sentence) when the speaker explicitly self-assigned
     `item` ("... and assign it to me"), else `None`.
 
-    Jev's `executor` question only names AI agents, so self-assignment is
-    read from the transcript here. The evidence is the one sentence holding
-    both the item and the assignment; `validate_plan` re-proves it before
-    the tag survives.
+    The fallback when Jev's assignee judgment is missing or unusable. The
+    evidence is the one sentence holding both the item and the assignment;
+    `validate_plan` re-proves it before the tag survives.
     """
     for match in re.finditer(r"[^.!?;\n]+", final_text):
         sentence = match.group(0).strip()
@@ -1239,17 +1553,106 @@ def _jev_self_assignment(item: str, final_text: str) -> Optional[tuple[list[str]
     return None
 
 
-def _jev_plain_task(item: str, final_text: str) -> dict[str, Any]:
-    """A task for the speaker, titled without the spoken filing request and
-    carrying `#me` when they explicitly assigned it to themselves ("... and
-    assign it to me").
+def _capitalized(text: str) -> str:
+    return text[0].upper() + text[1:] if text else text
+
+
+def _jev_assignee(answers: dict[str, Any]) -> Optional[tuple[str, float]]:
+    """Jev's assignee judgment as `(choice, confidence)`.
+
+    `None` -- meaning "fall back to the transcript-based assignment" -- when
+    the answer is missing, malformed, not a known choice, or below
+    `_JEV_ASSIGNEE_FLOOR`.
     """
-    title = _strip_task_request(item)
+    answer = answers.get("assignee")
+    if not isinstance(answer, dict):
+        return None
+    choice = answer.get("choice")
+    confidence = answer.get("confidence")
+    if (choice not in ("none", *_VALID_TASK_ASSIGNEES)
+            or isinstance(confidence, bool) or not isinstance(confidence, (int, float))
+            or not _JEV_ASSIGNEE_FLOOR <= confidence <= 1):
+        return None
+    return choice, float(confidence)
+
+
+def _jev_title(
+    answers: dict[str, Any], key: Optional[str], title_options: dict[str, dict[str, str]],
+) -> Optional[str]:
+    """Jev's chosen title candidate for fragment `key`, capitalized, or
+    `None` when there was no title question for it or the answer is
+    missing, malformed, or below `_JEV_TITLE_FLOOR`."""
+    options = title_options.get(key) if key else None
+    if not options:
+        return None
+    answer = answers.get(f"title_{key}")
+    if not isinstance(answer, dict):
+        return None
+    choice = answer.get("choice")
+    span = options.get(choice) if isinstance(choice, str) else None
+    confidence = answer.get("confidence")
+    if (span is None or isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float)) or confidence < _JEV_TITLE_FLOOR):
+        return None
+    return _capitalized(span)
+
+
+def _jev_self_assignment_fields(
+    item: str, final_text: str, assignee: Optional[tuple[str, float]],
+) -> dict[str, Any]:
+    """Raw-action fields assigning a plain task to the speaker, if any.
+
+    A confident Jev assignee judgment decides: `me` tags the task, recording
+    Jev as the assignment's source, and any other choice leaves it
+    unassigned. Without one, the transcript's explicit "assign it to me"
+    wording (`_jev_self_assignment`) decides.
+    """
+    if assignee is not None:
+        choice, confidence = assignee
+        if choice == "me":
+            return {"tags": ["me"], "assignee_source": "jev", "assignee_confidence": confidence}
+        return {}
+    found = _jev_self_assignment(item, final_text)
+    if found is None:
+        return {}
+    tags, sentence = found
+    return {"tags": tags, "delegation_evidence": sentence}
+
+
+def _jev_plain_task(
+    item: str, final_text: str, *, title: Optional[str] = None,
+    assignee: Optional[tuple[str, float]] = None,
+) -> dict[str, Any]:
+    """A task for the speaker titled with Jev's chosen title, or else
+    without the spoken filing request, carrying `#me` when they assigned it
+    to themselves (see `_jev_self_assignment_fields`).
+    """
+    title = title or _strip_task_request(item)
     action: dict[str, Any] = {"kind": "task", "index": 0, "title": title, "action_evidence": title}
-    assignment = _jev_self_assignment(item, final_text)
-    if assignment is not None:
-        tags, sentence = assignment
-        action.update(tags=tags, delegation_evidence=sentence)
+    action.update(_jev_self_assignment_fields(item, final_text, assignee))
+    return action
+
+
+def _jev_agent_task(
+    work: str, final_text: str, executor: str, *, title: Optional[str],
+    assignee_confidence: Optional[float],
+) -> dict[str, Any]:
+    """A task delegated to `executor`, titled with Jev's chosen title or
+    else the work fragment.
+
+    With `assignee_confidence` the executor came from Jev's assignee
+    judgment and `validate_plan` checks it against `_jev_task_assignment`;
+    without it, it came from the `executor` question and faces the literal
+    delegation-evidence gate with the whole transcript as evidence.
+    """
+    title = title or work
+    action: dict[str, Any] = {
+        "kind": "task", "index": 0, "title": title, "action_evidence": title, "tags": [executor],
+    }
+    if assignee_confidence is None:
+        action["delegation_evidence"] = final_text.strip(" .")
+    else:
+        action.update(assignee_source="jev", assignee_confidence=assignee_confidence)
     return action
 
 
@@ -1276,26 +1679,24 @@ def _requested_fragment_indexes(answers: dict[str, Any], item_criteria: dict[str
 
 def _jev_multi_task_action(
     item: str, final_text: str, *, index: int, allow_me: bool, parent_index: Optional[int] = None,
+    title: Optional[str] = None, assignee: Optional[tuple[str, float]] = None,
 ) -> dict[str, Any]:
     """One task action for a list or project item.
 
-    A literal transcript span with its filing request stripped, its first
-    letter capitalized regardless of whether anything was stripped (a
-    mid-sentence fragment like "order the synthetic filters" otherwise keeps
-    the original text's lowercase leading letter). Only the first action in
-    a list, or the parent in a project, may carry `#me` -- `allow_me=False`
-    skips the self-assignment scan entirely for every other item.
+    Jev's chosen title, or else a literal transcript span with its filing
+    request stripped, its first letter capitalized regardless of whether
+    anything was stripped (a mid-sentence fragment like "order the
+    synthetic filters" otherwise keeps the original text's lowercase leading
+    letter). Only the first action in a list, or the parent in a project,
+    may carry `#me` -- `allow_me=False` skips self-assignment entirely for
+    every other item.
     """
-    stripped = _strip_task_request(item)
-    title = stripped[0].upper() + stripped[1:] if stripped else stripped
+    title = title or _capitalized(_strip_task_request(item))
     action: dict[str, Any] = {"kind": "task", "index": index, "title": title, "action_evidence": title}
     if parent_index is not None:
         action["parent_index"] = parent_index
     if allow_me:
-        assignment = _jev_self_assignment(item, final_text)
-        if assignment is not None:
-            tags, sentence = assignment
-            action.update(tags=tags, delegation_evidence=sentence)
+        action.update(_jev_self_assignment_fields(item, final_text, assignee))
     return action
 
 
@@ -1306,6 +1707,7 @@ _MAX_PLAN_ACTIONS = 8
 
 def _jev_structured_tasks(
     answers: dict[str, Any], final_text: str, item_criteria: dict[str, str],
+    title_options: dict[str, dict[str, str]], assignee: Optional[tuple[str, float]],
 ) -> list[dict[str, Any]]:
     """Turn a `task`-disposition Jev answer into one, several, or a
     parent-plus-children set of raw task actions, per the `structure`
@@ -1330,10 +1732,19 @@ def _jev_structured_tasks(
         item_criteria.get(item_choice) if item_choice and item_choice != "none" else final_text.strip(" .")
     )
     if structure_choice == "single":
-        return [_jev_plain_task(single_item, final_text)]
+        return [_jev_plain_task(
+            single_item, final_text,
+            title=_jev_title(answers, item_choice, title_options), assignee=assignee,
+        )]
 
     requested = _requested_fragment_indexes(answers, item_criteria)
     requested_items = [(i, fragments[f"s{i}"]) for i in requested]
+
+    def task(i: int, item: str, **kwargs: Any) -> dict[str, Any]:
+        return _jev_multi_task_action(
+            item, final_text, title=_jev_title(answers, f"s{i}", title_options),
+            assignee=assignee, **kwargs,
+        )
 
     if structure_choice == "project":
         parent_choice = (answers.get("parent") or {}).get("choice")
@@ -1346,15 +1757,10 @@ def _jev_structured_tasks(
             if candidate is not None and any(i == candidate for i, _ in requested_items):
                 parent_i = candidate
         if parent_i is not None:
-            parent_item = fragments[f"s{parent_i}"]
-            children = [frag for i, frag in requested_items if i != parent_i][: _MAX_PLAN_ACTIONS - 1]
-            actions = [_jev_multi_task_action(parent_item, final_text, index=0, allow_me=True)]
-            for offset, child_item in enumerate(children, start=1):
-                actions.append(
-                    _jev_multi_task_action(
-                        child_item, final_text, index=offset, allow_me=False, parent_index=0
-                    )
-                )
+            children = [(i, frag) for i, frag in requested_items if i != parent_i][: _MAX_PLAN_ACTIONS - 1]
+            actions = [task(parent_i, fragments[f"s{parent_i}"], index=0, allow_me=True)]
+            for offset, (child_i, child_item) in enumerate(children, start=1):
+                actions.append(task(child_i, child_item, index=offset, allow_me=False, parent_index=0))
             return actions
         # No valid parent named: fall back to filing the requested fragments
         # as separate to-dos rather than dropping the request entirely.
@@ -1363,42 +1769,65 @@ def _jev_structured_tasks(
         return []
     limited = requested_items[:_MAX_PLAN_ACTIONS]
     return [
-        _jev_multi_task_action(frag_item, final_text, index=position, allow_me=(position == 0))
-        for position, (_i, frag_item) in enumerate(limited)
+        task(i, frag_item, index=position, allow_me=(position == 0))
+        for position, (i, frag_item) in enumerate(limited)
     ]
 
 
 def _jev_plan_from_answers(
     answers: dict[str, Any], final_text: str, recorded_at: str,
     item_criteria: dict[str, str], work_criteria: dict[str, str],
+    title_options: Optional[dict[str, dict[str, str]]] = None,
 ) -> list[dict[str, Any]]:
     """Turn one Jev answers dict into a raw action list.
 
-    Log-only (an empty list) below the confidence floor, for a "log_only"
-    or any unrecognized disposition, for a recurring cadence a single-instant
+    Log-only (an empty list) when `_jev_disposition` finds no filing
+    disposition, for a recurring cadence a single-instant
     time parse can't represent, and for a delegation with no recognized
     executor -- never a silently reassigned or invented action. Raises
     `KeyError`/`TypeError`/`AttributeError`/`ValueError` on a malformed
     answers shape; the caller treats that the same as a failed Jev call.
+
+    A confident assignee judgment (`_jev_assignee`) decides who a task is
+    for: an agent turns a to-do into a delegated task, the speaker tags it
+    `#me`, and nobody leaves it unassigned (or log-only, for a delegation).
+    A missing or unusable one falls back to the `executor` answer and the
+    transcript's explicit self-assignment wording. Titles are Jev's chosen
+    literal cut of the fragment (`_jev_title`) when confident, else the
+    fragment with its filing request stripped.
     """
-    disposition = answers.get("disposition") or {}
-    confidence = disposition.get("confidence")
-    if not isinstance(confidence, (int, float)) or confidence < 0.5:
-        return []
-    disp = disposition.get("choice")
-    if disp not in _JEV_DISPOSITIONS:
+    title_options = title_options or {}
+    disp, rescued = _jev_disposition(answers)
+    if disp is None:
         return []
 
     item_choice = (answers.get("item") or {}).get("choice")
     item = item_criteria.get(item_choice) if item_choice and item_choice != "none" else final_text.strip(" .")
     work_choice = (answers.get("work") or {}).get("choice")
-    work = work_criteria.get(work_choice) or item
+    work = work_criteria.get(work_choice)
+    work_key = work_choice if work else item_choice
+    work = work or item
     executor_choice = (answers.get("executor") or {}).get("choice")
     executor = executor_choice if executor_choice in AGENT_EXECUTOR_TAGS else None
+    assignee = _jev_assignee(answers)
+    assignee_confidence: Optional[float] = None
     delegation_evidence = final_text.strip(" .")
 
+    if rescued:
+        # A rescued capture is only ever the speaker's own or an unassigned
+        # to-do: an agent assignee judgment is disregarded.
+        if assignee is not None and assignee[0] in _VALID_EXECUTORS:
+            assignee = ("none", assignee[1])
+        return _jev_structured_tasks(answers, final_text, item_criteria, title_options, assignee)
+
     if disp == "task":
-        return _jev_structured_tasks(answers, final_text, item_criteria)
+        if assignee is not None and assignee[0] in _VALID_EXECUTORS:
+            return [_jev_agent_task(
+                _strip_task_request(item), final_text, assignee[0],
+                title=_jev_title(answers, item_choice, title_options),
+                assignee_confidence=assignee[1],
+            )]
+        return _jev_structured_tasks(answers, final_text, item_criteria, title_options, assignee)
 
     if disp in ("notify_schedule", "agent_schedule") and _RECURRENCE_RE.search(final_text):
         return []
@@ -1407,31 +1836,47 @@ def _jev_plan_from_answers(
         recorded_local = _utc(recorded_at).astimezone(ZoneInfo(settings.timezone))
         when = parse_contextual_time(final_text, recorded_local)
         if when is None:
-            return [_jev_plain_task(item, final_text)]
+            return [_jev_plain_task(
+                item, final_text, title=_jev_title(answers, item_choice, title_options),
+                assignee=assignee,
+            )]
+        reminder = _jev_title(answers, item_choice, title_options) or item
         return [{
-            "kind": "schedule", "index": 0, "title": item, "schedule_type": "once",
+            "kind": "schedule", "index": 0, "title": reminder, "schedule_type": "once",
             "schedule_value": when.isoformat(), "timezone": settings.timezone,
-            "action": "notify", "message": item,
+            "action": "notify", "message": reminder,
         }]
 
-    if disp == "delegated_task":
-        if executor is None:
-            return []
-        return [{
-            "kind": "task", "index": 0, "title": work, "action_evidence": work,
-            "tags": [executor], "delegation_evidence": delegation_evidence,
-        }]
-
-    # disp == "agent_schedule"
+    # disp is "delegated_task" or "agent_schedule".
+    if assignee is not None:
+        choice, assignee_confidence = assignee
+        # Jev read a delegation yet judged that nobody -- or the speaker --
+        # was assigned: the filing request stands as the speaker's own
+        # to-do. With no agent named at all it stays log-only, like any
+        # delegation without an executor.
+        if choice == "me" or (choice == "none" and executor is not None):
+            return [_jev_plain_task(
+                item, final_text, title=_jev_title(answers, item_choice, title_options),
+                assignee=assignee,
+            )]
+        executor = choice if choice in _VALID_EXECUTORS else None
     if executor is None:
         return []
+    title = _jev_title(answers, work_key, title_options)
+
+    if disp == "delegated_task":
+        return [_jev_agent_task(
+            work, final_text, executor, title=title, assignee_confidence=assignee_confidence,
+        )]
+
+    # disp == "agent_schedule"
     recorded_local = _utc(recorded_at).astimezone(ZoneInfo(settings.timezone))
     when = parse_contextual_time(final_text, recorded_local)
     if when is None:
-        return [{
-            "kind": "task", "index": 0, "title": work, "action_evidence": work,
-            "tags": [executor], "delegation_evidence": delegation_evidence,
-        }]
+        return [_jev_agent_task(
+            work, final_text, executor, title=title, assignee_confidence=assignee_confidence,
+        )]
+    work = title or work
     return [{
         "kind": "schedule", "index": 0, "title": work, "schedule_type": "once",
         "schedule_value": when.isoformat(), "timezone": settings.timezone,
@@ -1468,7 +1913,17 @@ def _validated_classifier_actions(
     actions = parsed.get("actions")
     if not isinstance(actions, list):
         raise PebbleCaptureError("classifier returned no action list")
-    validated = validate_plan(actions, transcript=final_text, recorded_at=recorded_at)
+    # A Jev-sourced assignment is only ever proposed by `JevPebbleClassifier`;
+    # a generative model's claim to one is discarded so its tags face the
+    # literal delegation-evidence gate.
+    for raw_action in actions:
+        if isinstance(raw_action, dict):
+            raw_action.pop("assignee_source", None)
+            raw_action.pop("assignee_confidence", None)
+            raw_action.pop("agent_confirmation", None)
+    validated = validate_plan(
+        actions, transcript=final_text, recorded_at=recorded_at, jev_classified=False,
+    )
     # ``validate_plan`` can drop a task whose action_evidence duplicates an
     # earlier action's, so a raw action's position in ``actions`` is not
     # reliably aligned with its validated counterpart's position in
@@ -1586,7 +2041,10 @@ class PebbleCaptureConsumer:
             actions = self.ledger.load_plan(identity)
         else:
             raw_actions = await self.classifier.classify(final_text, recorded_at)
-            actions = validate_plan(raw_actions, transcript=final_text, recorded_at=recorded_at)
+            actions = validate_plan(
+                raw_actions, transcript=final_text, recorded_at=recorded_at,
+                jev_classified=isinstance(self.classifier, JevPebbleClassifier),
+            )
         selected = self.ledger.select_plan(identity, revision, digest, actions)
         if selected in {"revision_changed", "conflict"}:
             return selected
