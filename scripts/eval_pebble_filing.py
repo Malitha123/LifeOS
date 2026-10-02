@@ -142,7 +142,10 @@ def _confidence_suffix(classifier) -> str:
 async def _score_case(classifier, transcript, expect_task):
     try:
         raw = await classifier.classify(transcript, _RECORDED_AT)
-        filed = validate_plan(raw, transcript=transcript, recorded_at=_RECORDED_AT)
+        filed = validate_plan(
+            raw, transcript=transcript, recorded_at=_RECORDED_AT,
+            jev_classified=isinstance(classifier, JevPebbleClassifier),
+        )
     except Exception as exc:  # noqa: BLE001 - report, never crash the run
         return False, f"error: {exc!r}"
     tasks = _task_actions(filed)
@@ -155,7 +158,10 @@ async def _score_case(classifier, transcript, expect_task):
 async def _score_multi_item_case(classifier, transcript, expected_phrase):
     try:
         raw = await classifier.classify(transcript, _RECORDED_AT)
-        filed = validate_plan(raw, transcript=transcript, recorded_at=_RECORDED_AT)
+        filed = validate_plan(
+            raw, transcript=transcript, recorded_at=_RECORDED_AT,
+            jev_classified=isinstance(classifier, JevPebbleClassifier),
+        )
     except Exception as exc:  # noqa: BLE001
         return False, f"error: {exc!r}"
     tasks = _task_actions(filed)
@@ -171,7 +177,10 @@ async def _score_multi_item_case(classifier, transcript, expected_phrase):
 async def _score_schedule_case(classifier, transcript, expected_hour=None):
     try:
         raw = await classifier.classify(transcript, _RECORDED_AT)
-        filed = validate_plan(raw, transcript=transcript, recorded_at=_RECORDED_AT)
+        filed = validate_plan(
+            raw, transcript=transcript, recorded_at=_RECORDED_AT,
+            jev_classified=isinstance(classifier, JevPebbleClassifier),
+        )
     except Exception as exc:  # noqa: BLE001 - report, never crash the run
         return False, f"error: {exc!r}"
     schedules = [a for a in filed if a.kind == "schedule" and a.action == "notify"]

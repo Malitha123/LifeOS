@@ -856,11 +856,12 @@ def _explicit_operator_decision(transcript: str, evidence: str) -> bool:
 
 def validate_plan(
     raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at: str,
-    jev_classified: bool = False,
+    jev_classified: bool,
 ) -> list[PlannedAction]:
     """Convert untrusted model JSON into an explicitly bounded action list.
 
-    With `jev_classified` (a `JevPebbleClassifier` plan), every
+    `jev_classified` is required, so every caller states which classifier
+    proposed the plan. With it set (a `JevPebbleClassifier` plan), every
     agent-executable outcome -- a delegated task on any path and an agent
     schedule -- also needs both `_agent_locks`; an agent schedule that
     fails its gate files as an unassigned task instead.
@@ -1920,7 +1921,9 @@ def _validated_classifier_actions(
             raw_action.pop("assignee_source", None)
             raw_action.pop("assignee_confidence", None)
             raw_action.pop("agent_confirmation", None)
-    validated = validate_plan(actions, transcript=final_text, recorded_at=recorded_at)
+    validated = validate_plan(
+        actions, transcript=final_text, recorded_at=recorded_at, jev_classified=False,
+    )
     # ``validate_plan`` can drop a task whose action_evidence duplicates an
     # earlier action's, so a raw action's position in ``actions`` is not
     # reliably aligned with its validated counterpart's position in
