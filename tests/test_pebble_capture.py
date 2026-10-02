@@ -2727,15 +2727,23 @@ _EVAL_CASES = Path(__file__).resolve().parents[1] / "scripts/jev_eval/data/pebbl
 class _QuestionAwareJev:
     """`aask` double that sees the questions: answers the fixed choices from
     `answers`, and each `title_s<i>` question by picking the option whose
-    text equals `titles[i]` (`title_pick` may instead pick by option key)."""
+    text equals `titles[i]` (`title_pick` may instead pick by option key).
+    The targeted agent confirmation call is answered with `confirm`."""
 
-    def __init__(self, answers, *, titles=None, title_pick=None):
+    def __init__(self, answers, *, titles=None, title_pick=None, confirm=0.95):
         self.answers = answers
         self.titles = titles or {}
         self.title_pick = title_pick
+        self.confirm = confirm
         self.questions = None
+        self.confirmations = []
+        self.calls = 0
 
     async def aask(self, state, questions):
+        self.calls += 1
+        if "agent_instructed" in questions:
+            self.confirmations.append(questions["agent_instructed"]["instructions"])
+            return {"agent_instructed": {"noul": self.confirm}}
         self.questions = questions
         answers = dict(self.answers)
         for name, question in questions.items():
@@ -2901,7 +2909,8 @@ def test_validate_plan_accepts_a_jev_sourced_me_and_records_its_evidence():
 )
 def test_validate_plan_rejects_an_unproven_jev_sourced_assignee(transcript, title, tag, confidence):
     [action] = validate_plan(
-        [_jev_task(title, tag, confidence)], transcript=transcript, recorded_at=_RECORDED,
+        [_jev_task(title, tag, confidence, agent_confirmation=0.99)],
+        transcript=transcript, recorded_at=_RECORDED,
     )
     assert action.tags == ()
     assert action.assignee_source == ""
@@ -2983,3 +2992,121 @@ async def test_every_jev_chosen_title_is_a_literal_transcript_substring(utteranc
         raw, actions = await _classify_and_validate(utterance, client)
         for action in actions:
             assert action.title.casefold() in utterance.casefold()
+
+
+# Agent assignment on a Jev judgment needs two independent locks: the agent's
+# name bound to the title in the same sentence, outside the title span
+# (literal), and Jev's targeted confirmation that the speaker is directly
+# instructing that agent.
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "title", "tag"),
+    [
+        # Named in another sentence than the to-do.
+        ("Claude is expensive. Add a task to buy synthetic milk", "buy synthetic milk", "claude"),
+        # Named only inside the to-do's own wording.
+        ("Add a task to ask Taylor about the claude code bill",
+         "ask Taylor about the claude code bill", "claude"),
+    ],
+)
+async def test_jev_agent_needs_its_name_bound_to_the_title(transcript, title, tag):
+    """Jev proposes and even confirms the agent; the literal binding alone
+    must still refuse it."""
+    client = _QuestionAwareJev(_answers(assignee=tag), titles={"s0": title, "s1": title}, confirm=0.99)
+    client.answers["item"] = {"choice": f"s{len(_segment_transcript(transcript)) - 1}", "confidence": 0.9}
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+    assert action.title.casefold() == title.casefold()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "title", "tag"),
+    [
+        ("Taylor told Morgan to have Claude review the synthetic contract",
+         "review the synthetic contract", "claude"),
+        ("We mustn't have Codex touch the synthetic billing code",
+         "touch the synthetic billing code", "codex"),
+        ("Imagine Claude drafting the synthetic memo", "drafting the synthetic memo", "claude"),
+    ],
+)
+async def test_jev_agent_needs_jevs_targeted_confirmation(transcript, title, tag):
+    """The name is bound to the title, so only Jev's targeted confirmation
+    (here declining) stands between Jev's first answer and the agent."""
+    client = _QuestionAwareJev(_answers(assignee=tag), titles={"s0": title}, confirm=0.1)
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+    assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_jev_confirmed_agent_named_beside_the_work_is_granted_and_recorded():
+    transcript = "Have Claude review the synthetic contract"
+    client = _QuestionAwareJev(_answers(assignee="claude"), titles={"s0": "review the synthetic contract"})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ("claude",)
+    assert action.title == "Review the synthetic contract"
+    assert (action.assignee_source, action.agent_confirmation) == ("jev", 0.95)
+    assert client.calls == 2
+    [statement] = client.confirmations
+    assert "Claude Code" in statement and "'Review the synthetic contract'" in statement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirm", [0.79, None, "yes", True])
+async def test_jev_agent_with_a_low_or_unusable_confirmation_files_unassigned(confirm):
+    transcript = "Have Claude review the synthetic contract"
+    client = _QuestionAwareJev(
+        _answers(assignee="claude"), titles={"s0": "review the synthetic contract"}, confirm=confirm,
+    )
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+    assert action.title == "Review the synthetic contract"
+
+
+@pytest.mark.asyncio
+async def test_jev_agent_confirmation_call_failing_files_unassigned():
+    class FailingConfirmation(_QuestionAwareJev):
+        async def aask(self, state, questions):
+            if "agent_instructed" in questions:
+                raise JevError("synthetic failure")
+            return await super().aask(state, questions)
+
+    transcript = "Have Claude review the synthetic contract"
+    client = FailingConfirmation(_answers(assignee="claude"), titles={"s0": "review the synthetic contract"})
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == ()
+
+
+@pytest.mark.asyncio
+async def test_jev_makes_one_call_when_no_agent_is_proposed():
+    client = _QuestionAwareJev(_answers(assignee="me"), titles={"s0": "buy some synthetic widgets"})
+    await _classify_and_validate("Make a task assigned to me to buy some synthetic widgets", client)
+    assert client.calls == 1
+    assert client.confirmations == []
+
+
+def test_validate_plan_requires_the_agent_confirmation_for_a_jev_sourced_agent():
+    transcript = "Have Claude review the synthetic contract"
+    title = "review the synthetic contract"
+    [unconfirmed] = validate_plan([_jev_task(title, "claude", 0.9)], transcript=transcript, recorded_at=_RECORDED)
+    [confirmed] = validate_plan(
+        [_jev_task(title, "claude", 0.9, agent_confirmation=0.8)], transcript=transcript, recorded_at=_RECORDED,
+    )
+    assert unconfirmed.tags == ()
+    assert confirmed.tags == ("claude",)
+    assert confirmed.agent_confirmation == 0.8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_choice", [[], {"t0": 1}, 3, None])
+async def test_jev_title_with_a_non_string_choice_falls_back_to_prefix_stripping(bad_choice):
+    transcript = "Make a task to charge the synthetic earbuds and assign it to me"
+    client = _FakeJevClient({
+        **_jev_answers(disposition="task", item="s0"),
+        "title_s0": {"choice": bad_choice, "confidence": 0.9},
+    })
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.title == "Charge the synthetic earbuds"
+    assert action.tags == ("me",)

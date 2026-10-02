@@ -131,11 +131,15 @@ Who a Jev-filed task is assigned to is Jev's judgment, not a phrasing
 match: Jev chooses among nobody, the speaker, and each AI agent. At 0.7
 confidence or above the judgment decides -- the speaker files the task
 tagged `me`, and the plan records `assignee_source="jev"` with Jev's
-confidence as the assignment's evidence. An AI agent additionally needs its
-name (any alias in `EXECUTOR_ALIASES`) in a positive clause of the
-transcript -- not negated, hypothetical, conditional, quoted, or reported
-speech -- which `validate_plan` re-checks before the tag survives; without
-it the task files unassigned. Below the floor, or on a missing or malformed
+confidence as the assignment's evidence. An AI agent additionally needs two
+independent locks, both enforced by `validate_plan`: its name (any alias in
+`EXECUTOR_ALIASES`) in the same sentence as the task's title and outside the
+title span itself, and a second, targeted Jev call -- made only when the
+first proposes an agent -- confirming at 0.8 or above that the speaker
+themself asks that agent to do this task (not negated, imagined, or
+reported), whose probability the plan records as `agent_confirmation`.
+Failing either, the task files unassigned. A capture therefore makes one
+Jev call, or two when an agent is proposed. Below the floor, or on a missing or malformed
 answer, the explicit "assign it to me" wording and the `executor` answer
 decide instead. Agent schedules keep the literal scheduled-delegation
 evidence gate.
@@ -166,7 +170,7 @@ concrete project rather than the vault or home, `fields.project` names it.
 | Plain-task filing is the classifier's judgment, re-checked by eval | `scripts/eval_pebble_filing.py`; index-based classifier/validated-action pairing regression; a log-only capture still completes |
 | Relative time, timezone, elapsed trigger safety | `validate_plan`; local-time, DST gap/overlap, offset mismatch, and saved-plan elapsed cases |
 | Explicit assignment and schedule action gate | source-scoped evidence validation; positive paraphrase, negated, quoted, reported, conditional, mentioned, unknown, and Markdown-rebuild pickup cases |
-| Jev-judged assignee and title | mocked-Jev self-assignment, unnamed/negated/reported agent, Jev-sourced `validate_plan` evidence, literal-title property, and fallback cases; `scripts/jev_eval/e7_pebble_filing.py` against real Jev |
+| Jev-judged assignee and title | mocked-Jev self-assignment, unnamed/unbound/unconfirmed agent, Jev-sourced `validate_plan` evidence, literal-title property, and fallback cases; `scripts/jev_eval/e7_pebble_filing.py` against real Jev |
 | Crash, restart, duplicate event, and revision conflict recovery | ledger consumer crash/replay and ambiguous-deletion cases; thread and process operation-key tests |
 | Human queue lifecycle | stable-key filing through `human_queue.add_card`, replay deduplication, and existing resolve-by-key transition |
 | Golden producer conformance | copied `tests/fixtures/pebble-result-*-v1.json` plus fixture-frame tests |

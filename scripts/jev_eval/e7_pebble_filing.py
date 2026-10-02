@@ -4,7 +4,8 @@ Scores the production `JevPebbleClassifier` followed by `validate_plan` (the
 same path a captured Pebble note takes) over the committed, synthetic-only
 labeled set `scripts/jev_eval/data/pebble_filing_cases.jsonl`. Each line is
 `{utterance, expected_title, expected_assignee, category}`, where
-`expected_assignee` is `none`, `me`, or an agent executor tag.
+`expected_assignee` is `none`, `me`, or an agent executor tag, and a null
+`expected_title` marks a note that asks for nothing to be filed.
 
 For each case the first filed action is compared with the labels:
 
@@ -12,7 +13,7 @@ For each case the first filed action is compared with the labels:
     none or nothing was filed;
   - title: equal to the expected title after case-folding, whitespace
     normalization and dropping trailing punctuation; a capture that files
-    nothing has no title and counts as wrong.
+    nothing has no title, which is correct only for a null expected title.
 
 A false agent assignment is any filed agent tag the label does not name.
 Prints per-category accuracy, the false agent assignment count, and (with
@@ -89,7 +90,10 @@ async def run_case(case: dict, client, semaphore) -> dict:
         "filed": bool(actions),
         "jev_calls": counting.calls,
         "assignee_ok": assignee == case["expected_assignee"],
-        "title_ok": normalize_title(title) == normalize_title(case["expected_title"]) and title is not None,
+        "title_ok": (
+            title is None if case["expected_title"] is None
+            else title is not None and normalize_title(title) == normalize_title(case["expected_title"])
+        ),
     }
 
 
@@ -127,7 +131,8 @@ async def main_async(args) -> list[dict]:
 
     cases = load_cases(Path(args.cases))
     for case in cases:
-        if case["expected_title"].casefold() not in case["utterance"].casefold():
+        expected = case["expected_title"]
+        if expected is not None and expected.casefold() not in case["utterance"].casefold():
             raise SystemExit(f"label is not a literal span of its utterance: {case['utterance']!r}")
     client = JevClient()
     semaphore = asyncio.Semaphore(args.concurrency)

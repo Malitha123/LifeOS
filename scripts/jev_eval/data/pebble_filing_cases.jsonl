@@ -54,3 +54,8 @@
 {"utterance": "Add a task to defrost the synthetic freezer — that's for me to do", "expected_title": "Defrost the synthetic freezer", "expected_assignee": "me", "category": "mixed"}
 {"utterance": "Make a task to restart the synthetic staging server and codex should own it", "expected_title": "Restart the synthetic staging server", "expected_assignee": "codex", "category": "mixed"}
 {"utterance": "Add a task to water the synthetic ferns for me please", "expected_title": "Water the synthetic ferns", "expected_assignee": "me", "category": "mixed"}
+{"utterance": "Taylor told Morgan to have Claude review the synthetic contract", "expected_title": null, "expected_assignee": "none", "category": "trap"}
+{"utterance": "Claude is expensive. Add a task to buy synthetic milk", "expected_title": "Buy synthetic milk", "expected_assignee": "none", "category": "trap"}
+{"utterance": "Add a task to ask Taylor about the claude code bill", "expected_title": "Ask Taylor about the claude code bill", "expected_assignee": "none", "category": "trap"}
+{"utterance": "We mustn't have Codex touch the synthetic billing code", "expected_title": null, "expected_assignee": "none", "category": "trap"}
+{"utterance": "Imagine Claude drafting the synthetic memo", "expected_title": null, "expected_assignee": "none", "category": "trap"}
