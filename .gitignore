@@ -173,3 +173,6 @@ config/vault_taxonomy.local.yaml
 
 # Retrieval eval labeled set (real queries and file names)
 data/retrieval_eval/
+
+# Operator-local tailnet routes (see config/tailscale-routes.example)
+config/tailscale-routes.local

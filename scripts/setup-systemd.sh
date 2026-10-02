@@ -176,6 +176,35 @@ echo "  lifeos-gpu-watchdog.timer: $(systemctl is-active lifeos-gpu-watchdog.tim
 systemctl enable --now lifeos-network-watchdog.timer
 echo "  lifeos-network-watchdog.timer: $(systemctl is-active lifeos-network-watchdog.timer)"
 
+# The infra watchdog is a USER unit: re-applying tailnet routes and relaunching
+# Obsidian (systemd-run --user) both need the login user's session manager,
+# which a system unit does not have. Installed into the user's unit dir and
+# enabled through that user's manager.
+USER_UNIT_SRC="$SYSTEMD_SRC/user"
+USER_UNIT_DST="$REAL_HOME/.config/systemd/user"
+REAL_UID=$(id -u "$REAL_USER")
+if [ -d "$USER_UNIT_SRC" ]; then
+    runuser -u "$REAL_USER" -- mkdir -p "$USER_UNIT_DST"
+    for unit in "$USER_UNIT_SRC"/*.service "$USER_UNIT_SRC"/*.timer; do
+        [ -f "$unit" ] || continue
+        sed -e "s|__LIFEOS_DIR__|$PROJECT_DIR|g" "$unit" \
+            | runuser -u "$REAL_USER" -- tee "$USER_UNIT_DST/$(basename "$unit")" > /dev/null
+        echo "  Installed user unit $(basename "$unit")"
+    done
+    # Without lingering the user manager (and its timers) stops at logout and
+    # does not start at boot with nobody logged in.
+    if ! "$SCRIPT_DIR/ensure-linger.sh" "$REAL_USER"; then
+        echo "  lifeos-infra-watchdog.timer: NOT enabled (lingering unavailable)" >&2
+        INFRA_TIMER_FAILED=1
+    fi
+    if [ "${INFRA_TIMER_FAILED:-0}" != "1" ]; then
+        if ! runuser -u "$REAL_USER" -- env "XDG_RUNTIME_DIR=/run/user/$REAL_UID" \
+                "$SCRIPT_DIR/enable-user-timer.sh" lifeos-infra-watchdog.timer; then
+            INFRA_TIMER_FAILED=1
+        fi
+    fi
+fi
+
 systemctl enable --now lifeos-sync.timer
 echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
 
@@ -296,4 +325,9 @@ echo "=== Timer Status ==="
 systemctl list-timers lifeos-* --no-pager 2>/dev/null || true
 
 echo ""
+if [ "${INFRA_TIMER_FAILED:-0}" = "1" ]; then
+    echo "Setup finished with errors: the infra watchdog timer was not enabled (see the warnings above)." >&2
+    exit 1
+fi
+
 echo "Setup complete. Check health with: curl http://localhost:8000/health/full | jq"
