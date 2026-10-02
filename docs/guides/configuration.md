@@ -417,7 +417,7 @@ Read directly from the environment by `scripts/setup-tailscale.sh` and `scripts/
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_TAILSCALE_ROUTES_FILE` | path | `config/tailscale-routes.local` | Operator-local file declaring extra tailnet routes, one `https=<port> path=<path> target=<url>` per line. Absent means only the LifeOS route is applied. |
-| `LIFEOS_TAILSCALE_ALLOW_FUNNEL` | bool | `false` | Permit `funnel=on` route lines (publishes that route to the public internet). Without it such a line is rejected. |
+| `LIFEOS_TAILSCALE_ALLOW_FUNNEL` | bool | `false` | Permit `funnel=on` route lines (publishes that route to the public internet). Without it such a line is applied privately and reported. Never honoured on the LifeOS port (443). |
 | `LIFEOS_PEBBLE_HEALTH_URL` | str | — | Health endpoint of the Pebble receiver. Unset skips the check; 3 consecutive failures alert. |
 | `LIFEOS_EXPECT_OBSIDIAN_SYNC` | bool | `false` | When `true`, the infra watchdog relaunches Obsidian if it is not running and alerts if it stays down. |
 | `LIFEOS_OBSIDIAN_LAUNCH_CMD` | str | `systemd-run --user --collect --unit=obsidian-session-$(date +%s) snap run obsidian` | Command (run through `bash -c`) that launches Obsidian in the user session. |

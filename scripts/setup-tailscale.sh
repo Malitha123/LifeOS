@@ -45,9 +45,8 @@ for port in $(ts_declared_ports); do
     fi
   elif ts_port_public "$port"; then
     echo "Port https=${port} is public but declared private; turning funnel off." >&2
-    tailscale funnel --https="$port" off || true
-    if ts_port_public "$port"; then
-      echo "STILL PUBLIC: https=${port}" >&2
+    if ! ts_make_private "$port"; then
+      echo "NOT PRIVATE: https=${port} (route missing or still public)" >&2
       missing=1
     fi
   fi

@@ -197,14 +197,11 @@ if [ -d "$USER_UNIT_SRC" ]; then
         echo "  lifeos-infra-watchdog.timer: NOT enabled (lingering unavailable)" >&2
         INFRA_TIMER_FAILED=1
     fi
-    USER_SYSTEMCTL=(runuser -u "$REAL_USER" -- env "XDG_RUNTIME_DIR=/run/user/$REAL_UID" systemctl --user)
-    if [ "${INFRA_TIMER_FAILED:-0}" = "1" ]; then
-        :
-    elif "${USER_SYSTEMCTL[@]}" daemon-reload 2>/dev/null; then
-        "${USER_SYSTEMCTL[@]}" enable --now lifeos-infra-watchdog.timer
-        echo "  lifeos-infra-watchdog.timer (user): $("${USER_SYSTEMCTL[@]}" is-active lifeos-infra-watchdog.timer)"
-    else
-        echo "  lifeos-infra-watchdog.timer: no user session for $REAL_USER; run 'systemctl --user enable --now lifeos-infra-watchdog.timer' from a login session"
+    if [ "${INFRA_TIMER_FAILED:-0}" != "1" ]; then
+        if ! runuser -u "$REAL_USER" -- env "XDG_RUNTIME_DIR=/run/user/$REAL_UID" \
+                "$SCRIPT_DIR/enable-user-timer.sh" lifeos-infra-watchdog.timer; then
+            INFRA_TIMER_FAILED=1
+        fi
     fi
 fi
 
@@ -329,7 +326,7 @@ systemctl list-timers lifeos-* --no-pager 2>/dev/null || true
 
 echo ""
 if [ "${INFRA_TIMER_FAILED:-0}" = "1" ]; then
-    echo "Setup finished with errors: the infra watchdog timer was not enabled (see the linger warning above)." >&2
+    echo "Setup finished with errors: the infra watchdog timer was not enabled (see the warnings above)." >&2
     exit 1
 fi
 

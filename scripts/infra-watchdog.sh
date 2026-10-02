@@ -131,13 +131,12 @@ check_exposure() {
                 alert "exposure-${port}" "LifeOS host: tailnet port ${port} is declared public (funnel=on) but is not, and could not be restored."
             fi
         elif ts_port_public "$port"; then
-            tailscale funnel --https="$port" off > /dev/null 2>&1
-            if ts_port_public "$port"; then
-                log "exposure: https=${port} is public, declared private; funnel off FAILED"
-                alert "exposure-${port}" "LifeOS host: tailnet port ${port} is publicly exposed (Funnel) but declared private, and it could not be turned off."
+            if ts_make_private "$port"; then
+                log "exposure: https=${port} was public, declared private; funnel turned off and routes re-applied"
+                alert "exposure-${port}" "LifeOS host: tailnet port ${port} was publicly exposed (Funnel) but declared private. Funnel has been turned off and its routes re-applied."
             else
-                log "exposure: https=${port} was public, declared private; funnel turned off"
-                alert "exposure-${port}" "LifeOS host: tailnet port ${port} was publicly exposed (Funnel) but declared private. Funnel has been turned off."
+                log "exposure: https=${port} is public or incomplete, declared private; make-private FAILED"
+                alert "exposure-${port}" "LifeOS host: tailnet port ${port} is declared private but is still public or missing routes after turning Funnel off."
             fi
         fi
     done

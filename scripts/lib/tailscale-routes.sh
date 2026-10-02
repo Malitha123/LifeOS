@@ -8,6 +8,8 @@
 
 # Populates the global ROUTES array with "port|path|target|funnel" entries.
 # Prints one message per problem to stderr and returns 1 if the file is invalid.
+LIFEOS_ROUTE_PORT=443
+
 ts_load_routes() {
     local routes_file="$1" port="${LIFEOS_PORT:-8000}"
     ROUTES=("443|/|http://127.0.0.1:${port}|off")
@@ -43,9 +45,16 @@ ts_load_routes() {
         case "$r_funnel" in
             off) ;;
             on)
-                if [[ "${LIFEOS_TAILSCALE_ALLOW_FUNNEL:-false}" != "true" ]]; then
-                    echo "$routes_file:$lineno: funnel=on publishes to the internet and requires LIFEOS_TAILSCALE_ALLOW_FUNNEL=true" >&2
+                if [[ "$r_port" == "$LIFEOS_ROUTE_PORT" ]]; then
+                    # Funnel is port-wide: it would publish the LifeOS API itself.
+                    echo "$routes_file:$lineno: funnel=on is never allowed on the LifeOS port (https=$LIFEOS_ROUTE_PORT)" >&2
                     bad=1
+                elif [[ "${LIFEOS_TAILSCALE_ALLOW_FUNNEL:-false}" != "true" ]]; then
+                    # Without the opt-in the line is a private declaration, and
+                    # still reported so the ignored setting is not silent.
+                    echo "$routes_file:$lineno: funnel=on ignored (LIFEOS_TAILSCALE_ALLOW_FUNNEL is not true); route applied privately" >&2
+                    r_funnel="off"
+                    rc=1
                 fi
                 ;;
             *) echo "$routes_file:$lineno: funnel must be on or off" >&2; bad=1 ;;
@@ -126,4 +135,21 @@ ts_declared_ports() {
         IFS='|' read -r r_port _ <<< "$route"
         echo "$r_port"
     done | sort -un
+}
+
+# Closes public exposure on a port and restores its declared routes privately.
+# `tailscale funnel --https=<port> off` removes the port's web handlers as well
+# as the exposure, so every declared route on the port is re-applied afterwards.
+# Succeeds only when each route is present again and the port is not public.
+ts_make_private() {
+    local port="$1" route r_port r_path r_target ok=0
+    tailscale funnel --https="$port" off > /dev/null 2>&1
+    for route in "${ROUTES[@]}"; do
+        IFS='|' read -r r_port r_path r_target _ <<< "$route"
+        [[ "$r_port" == "$port" ]] || continue
+        tailscale serve --bg --https="$port" --set-path "$r_path" "$r_target" > /dev/null 2>&1
+        ts_route_present "$r_port" "$r_path" "$r_target" || ok=1
+    done
+    ts_port_public "$port" && ok=1
+    return $ok
 }
