@@ -17,7 +17,10 @@ For each case the first filed action is compared with the labels:
 
 A false agent assignment is any filed agent tag the label does not name; a
 false filing is anything filed for a note labeled to file nothing (the
-`journal` category, plus a few traps). Prints per-category accuracy, the
+`journal` and `asr_journal` categories, plus a few traps). The `asr`
+category holds filing requests whose request wording speech recognition
+misheard ("at a desk to ..." for "add a task to ..."); `asr_journal` holds
+notes that use such words in their ordinary meaning. Prints per-category accuracy, the
 filed-correctly rate on notes that ask for a filing, both counters, and
 (with `--show-failures`) each miss. Only the synthetic utterances in the labeled
 set are sent to TypeSafe. Cost is a fraction of a cent per run.

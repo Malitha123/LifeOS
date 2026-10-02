@@ -38,12 +38,14 @@ PEBBLE_DISPOSITION_CRITERIA: dict[str, str] = {
         "speaker describes, notes, muses, plans, hedges (\"I should...\", "
         "\"I need to ... at some point\", \"I keep meaning to\"), states a "
         "fact, asks a question, or gives a bare imperative without asking "
-        "for it to be filed."
+        "for it to be filed. Reporting what someone else said, asked or "
+        "wants is not a request either."
     ),
     "task": (
         "The speaker actively asks for a to-do for themselves to be filed: "
         "\"add a task to...\", \"put X on my list\", \"remind me to X\" with "
-        "no definite time, or \"assign it to me\"."
+        "no definite time, or \"assign it to me\". A request that speech "
+        "recognition misheard as similar-sounding words counts too."
     ),
     "notify_schedule": (
         "The speaker asks to be reminded at a definite future time or on a "

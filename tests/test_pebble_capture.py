@@ -3012,6 +3012,47 @@ async def test_every_jev_chosen_title_is_a_literal_transcript_substring(utteranc
             assert action.title.casefold() in utterance.casefold()
 
 
+# Pebble notes are speech-recognition output: every Jev call sees that in
+# its state, and the filing questions name it in their own wording.
+
+class _StateRecordingJev(_QuestionAwareJev):
+    """`_QuestionAwareJev` that also records the state of every call."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.states = []
+
+    async def aask(self, state, questions):
+        self.states.append(state)
+        return await super().aask(state, questions)
+
+
+@pytest.mark.asyncio
+async def test_jev_state_marks_the_note_as_a_speech_recognition_transcript():
+    transcript = "At a desk for Claude to review the synthetic contract"
+    client = _StateRecordingJev(
+        _answers(disposition="delegated_task", assignee="claude"),
+        titles={"s0": "review the synthetic contract"},
+    )
+    await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
+    assert client.calls == 2
+    for state in client.states:
+        assert state["voice_note"] == transcript
+        assert "speech-recognition transcript" in state["source"]
+        assert "misheard" in state["source"]
+
+
+@pytest.mark.asyncio
+async def test_jev_filing_questions_name_misheard_request_wording():
+    client = _StateRecordingJev(_answers(), titles={"s0": "buy synthetic batteries"})
+    await JevPebbleClassifier(client=client).classify("At a desk to buy synthetic batteries", _RECORDED)
+    questions = client.questions
+    for name in ("disposition", "filing_request", "item", "assignee", "title_s0"):
+        assert "speech recognition" in questions[name]["instructions"].casefold(), name
+    assert "misheard" in questions["disposition"]["criteria"]["task"]
+    assert "Reporting what someone else said" in questions["disposition"]["criteria"]["log_only"]
+
+
 # Agent assignment on a Jev judgment needs two independent locks: the agent's
 # name bound to the title in the same sentence, outside the title span
 # (literal), and Jev's targeted confirmation that the speaker is directly
