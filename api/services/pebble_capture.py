@@ -744,6 +744,22 @@ def _executor_bound_to_title(transcript: str, tag: str, title: str) -> bool:
     return False
 
 
+def _agent_locks(transcript: str, tag: str, action_evidence: str, agent_confirmation: Any) -> bool:
+    """The two independent locks every Jev-classified agent outcome needs.
+
+    (a) the agent's name bound to the to-do in the transcript
+    (`_executor_bound_to_title`, after the cheap `_named_executors`
+    positive-clause pre-filter), and (b) Jev's targeted confirmation that
+    the speaker themself asks that agent to do it, at
+    `_JEV_AGENT_CONFIRMATION_FLOOR` or above.
+    """
+    return (
+        tag in _named_executors(transcript)
+        and _executor_bound_to_title(transcript, tag, action_evidence)
+        and _probability_at_least(agent_confirmation, _JEV_AGENT_CONFIRMATION_FLOOR)
+    )
+
+
 def _jev_task_assignment(
     transcript: str, tag: str, confidence: Any, action_evidence: str,
     agent_confirmation: Any = None,
@@ -752,11 +768,7 @@ def _jev_task_assignment(
 
     Jev's judgment must meet `_JEV_ASSIGNEE_FLOOR` and the task's title must
     be an exact unquoted transcript span. `me` needs nothing more. An agent
-    executor needs two independent locks on top: its name bound to the
-    title in the transcript (`_executor_bound_to_title`, after the cheap
-    `_named_executors` positive-clause pre-filter), and Jev's targeted
-    confirmation that the speaker is directly instructing that agent at
-    `_JEV_AGENT_CONFIRMATION_FLOOR` or above. Jev's assignee judgment alone
+    executor also needs both `_agent_locks`: Jev's assignee judgment alone
     never grants execution authority.
     """
     if not _probability_at_least(confidence, _JEV_ASSIGNEE_FLOOR):
@@ -770,11 +782,7 @@ def _jev_task_assignment(
     if not _is_unquoted_evidence(transcript, action_evidence):
         return False
     if tag in _VALID_EXECUTORS:
-        return (
-            tag in _named_executors(transcript)
-            and _executor_bound_to_title(transcript, tag, action_evidence)
-            and _probability_at_least(agent_confirmation, _JEV_AGENT_CONFIRMATION_FLOOR)
-        )
+        return _agent_locks(transcript, tag, action_evidence, agent_confirmation)
     return tag == "me"
 
 
@@ -846,8 +854,17 @@ def _explicit_operator_decision(transcript: str, evidence: str) -> bool:
     ))
 
 
-def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at: str) -> list[PlannedAction]:
-    """Convert untrusted model JSON into an explicitly bounded action list."""
+def validate_plan(
+    raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at: str,
+    jev_classified: bool = False,
+) -> list[PlannedAction]:
+    """Convert untrusted model JSON into an explicitly bounded action list.
+
+    With `jev_classified` (a `JevPebbleClassifier` plan), every
+    agent-executable outcome -- a delegated task on any path and an agent
+    schedule -- also needs both `_agent_locks`; an agent schedule that
+    fails its gate files as an unassigned task instead.
+    """
     if not isinstance(raw, list) or len(raw) > 8:
         raise PebbleCaptureError("classifier actions must be a list of at most eight items")
     allowed_tags = _explicit_tags(transcript)
@@ -928,6 +945,9 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                     else:
                         granted = _explicit_task_delegation(
                             transcript, tag, evidence, action_evidence
+                        ) and (
+                            not jev_classified or tag not in _VALID_EXECUTORS
+                            or _agent_locks(transcript, tag, action_evidence, agent_confirmation)
                         )
                     if (not reused_action_evidence
                             and evidence_key not in used_delegations
@@ -935,7 +955,7 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                         tags.append(tag)
                         used_delegations.add(evidence_key)
                         jev_assigned = assignee_source == "jev"
-                        jev_agent = jev_assigned and tag in _VALID_EXECUTORS
+                        jev_agent = (jev_classified or jev_assigned) and tag in _VALID_EXECUTORS
                 elif tag not in _ROUTING_TAGS and tag in allowed_tags:
                     tags.append(tag)
         normalized_tags = tuple(dict.fromkeys(tags))
@@ -1012,8 +1032,27 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                         or action_key in used_scheduled_delegation_evidence
                         or not _explicit_scheduled_delegation(
                             transcript, executor, evidence, action_evidence
-                        )):
-                    raise PebbleCaptureError("agent schedule lacks explicit valid delegation")
+                        )
+                        or (jev_classified and not _agent_locks(
+                            transcript, executor, action_evidence, agent_confirmation
+                        ))):
+                    if not jev_classified:
+                        raise PebbleCaptureError("agent schedule lacks explicit valid delegation")
+                    # A Jev plan's unproven agent schedule files as the
+                    # speaker's unassigned to-do, never as agent work.
+                    task_title = title
+                    if action_evidence and action_key not in used_action_evidence:
+                        try:
+                            task_title = _safe_markdown_text(
+                                action_evidence, field="action_evidence", limit=500
+                            )
+                        except PebbleCaptureError:
+                            task_title = title
+                        used_action_evidence.add(action_key)
+                    result.append(PlannedAction(
+                        kind="task", title=task_title, index=index, action_evidence=action_evidence,
+                    ))
+                    continue
                 used_delegations.add(evidence_key)
                 used_action_evidence.add(action_key)
                 used_scheduled_delegation_evidence.add(action_key)
@@ -1039,6 +1078,10 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 message=message,
                 delegation_evidence=evidence,
                 action_evidence=action_evidence,
+                agent_confirmation=(
+                    float(agent_confirmation)
+                    if jev_classified and scheduled_action == "agent" else None
+                ),
             )
         else:
             key = raw_action.get("human_key") or f"pebble:{index}"
@@ -1154,42 +1197,38 @@ _JEV_DISPOSITIONS = frozenset({"task", "notify_schedule", "delegated_task", "age
 _DISPOSITION_FLOOR = 0.5
 # Second filing signal: Jev's `filing_request` probability that the speaker
 # asked for something to be recorded as a to-do or reminder. At or above
-# this floor it files a capture whose disposition answer alone falls short,
-# unless that answer is a firm log-only (`_FIRM_LOG_ONLY`).
+# this floor -- and only while the disposition answer itself weighs
+# log-only below `_RESCUE_LOG_ONLY_CEILING` -- it files a capture whose
+# disposition answer alone falls short, as a plain to-do.
 _FILING_REQUEST_FLOOR = 0.7
-_FIRM_LOG_ONLY = 0.8
+_RESCUE_LOG_ONLY_CEILING = 0.5
 
 
-def _jev_disposition(answers: dict[str, Any]) -> Optional[str]:
-    """The filing disposition to act on, or `None` for log-only.
+def _jev_disposition(answers: dict[str, Any]) -> tuple[Optional[str], bool]:
+    """The filing disposition to act on (`None` for log-only), and whether
+    it came from the `filing_request` rescue.
 
     A filing disposition at `_DISPOSITION_FLOOR` confidence or above
-    decides. Otherwise a `filing_request` probability at
-    `_FILING_REQUEST_FLOOR` or above files the capture under the most
-    probable filing disposition (`task` when the probabilities are
-    unusable) -- unless the disposition answer is log-only at
-    `_FIRM_LOG_ONLY` confidence or above, which stands.
+    decides. Otherwise the capture files as a plain `task` -- never a
+    reminder or agent work -- only when `filing_request` reaches
+    `_FILING_REQUEST_FLOOR` and the disposition's own log-only probability
+    is present and below `_RESCUE_LOG_ONLY_CEILING`.
     """
     disposition = answers.get("disposition") or {}
     confidence = disposition.get("confidence")
     choice = disposition.get("choice")
-    confident = not isinstance(confidence, bool) and isinstance(confidence, (int, float))
-    if confident and confidence >= _DISPOSITION_FLOOR and choice in _JEV_DISPOSITIONS:
-        return choice
-    if choice == "log_only" and confident and confidence >= _FIRM_LOG_ONLY:
-        return None
+    if (_probability_at_least(confidence, _DISPOSITION_FLOOR)
+            and choice in _JEV_DISPOSITIONS):
+        return choice, False
     request = (answers.get("filing_request") or {}).get("noul")
     if not _probability_at_least(request, _FILING_REQUEST_FLOOR):
-        return None
+        return None, False
     probabilities = disposition.get("probabilities")
-    ranked = [
-        (probability, name) for name, probability in (
-            probabilities.items() if isinstance(probabilities, dict) else ()
-        )
-        if name in _JEV_DISPOSITIONS
-        and not isinstance(probability, bool) and isinstance(probability, (int, float))
-    ]
-    return max(ranked)[1] if ranked else "task"
+    log_only = probabilities.get("log_only") if isinstance(probabilities, dict) else None
+    if (isinstance(log_only, bool) or not isinstance(log_only, (int, float))
+            or not 0 <= log_only < _RESCUE_LOG_ONLY_CEILING):
+        return None, False
+    return "task", True
 
 
 def _segment_transcript(text: str) -> list[str]:
@@ -1432,7 +1471,9 @@ class JevPebbleClassifier:
             return []
         for action in actions:
             agents = [tag for tag in action.get("tags", ()) if tag in _VALID_EXECUTORS]
-            if action.get("assignee_source") == "jev" and agents:
+            if action.get("kind") == "schedule" and action.get("executor") in _VALID_EXECUTORS:
+                agents.append(action["executor"])
+            if agents:
                 confirmation = await self._confirm_agent(final_text, agents[0], action["title"])
                 if confirmation is not None:
                     action["agent_confirmation"] = confirmation
@@ -1755,7 +1796,7 @@ def _jev_plan_from_answers(
     fragment with its filing request stripped.
     """
     title_options = title_options or {}
-    disp = _jev_disposition(answers)
+    disp, rescued = _jev_disposition(answers)
     if disp is None:
         return []
 
@@ -1770,6 +1811,13 @@ def _jev_plan_from_answers(
     assignee = _jev_assignee(answers)
     assignee_confidence: Optional[float] = None
     delegation_evidence = final_text.strip(" .")
+
+    if rescued:
+        # A rescued capture is only ever the speaker's own or an unassigned
+        # to-do: an agent assignee judgment is disregarded.
+        if assignee is not None and assignee[0] in _VALID_EXECUTORS:
+            assignee = ("none", assignee[1])
+        return _jev_structured_tasks(answers, final_text, item_criteria, title_options, assignee)
 
     if disp == "task":
         if assignee is not None and assignee[0] in _VALID_EXECUTORS:
@@ -1990,7 +2038,10 @@ class PebbleCaptureConsumer:
             actions = self.ledger.load_plan(identity)
         else:
             raw_actions = await self.classifier.classify(final_text, recorded_at)
-            actions = validate_plan(raw_actions, transcript=final_text, recorded_at=recorded_at)
+            actions = validate_plan(
+                raw_actions, transcript=final_text, recorded_at=recorded_at,
+                jev_classified=isinstance(self.classifier, JevPebbleClassifier),
+            )
         selected = self.ledger.select_plan(identity, revision, digest, actions)
         if selected in {"revision_changed", "conflict"}:
             return selected

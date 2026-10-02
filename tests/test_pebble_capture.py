@@ -2770,7 +2770,7 @@ def _answers(*, disposition="task", item="s0", work="none", executor="none",
 
 async def _classify_and_validate(transcript, client):
     raw = await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
-    return raw, validate_plan(raw, transcript=transcript, recorded_at=_RECORDED)
+    return raw, validate_plan(raw, transcript=transcript, recorded_at=_RECORDED, jev_classified=True)
 
 
 @pytest.mark.asyncio
@@ -3113,8 +3113,8 @@ async def test_jev_title_with_a_non_string_choice_falls_back_to_prefix_stripping
 
 
 # Filing disposition: a confident filing disposition decides; otherwise
-# Jev's `filing_request` probability is a second signal that can file a
-# capture, unless the disposition answer is a firm log-only.
+# Jev's `filing_request` probability rescues a capture as a plain to-do, but
+# only while the disposition itself weighs log-only below one half.
 
 def _rescue_answers(*, disposition, confidence, probabilities, filing_request, assignee=None):
     answers = _answers(disposition=disposition, assignee=assignee)
@@ -3126,54 +3126,165 @@ def _rescue_answers(*, disposition, confidence, probabilities, filing_request, a
     return answers
 
 
+_PIANO = "Put this on my plate: schedule the synthetic piano tuner"
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("transcript", "title", "disposition", "confidence", "probabilities"),
-    [
-        ("My to-do: return the synthetic library books", "return the synthetic library books",
-         "log_only", 0.52, {"log_only": 0.62, "task": 0.38}),
-        ("Put this on my plate: schedule the synthetic piano tuner", "schedule the synthetic piano tuner",
-         "task", 0.48, {"task": 0.59, "delegated_task": 0.3, "log_only": 0.03}),
-        ("Another one for my plate: file the synthetic expense report", "file the synthetic expense report",
-         "task", 0.36, None),
-    ],
-)
-async def test_jev_filing_request_files_a_capture_the_disposition_alone_misses(
-    transcript, title, disposition, confidence, probabilities,
-):
-    item = f"s{len(_segment_transcript(transcript)) - 1}"
+@pytest.mark.parametrize(("assignee", "expected_tags"), [("me", ("me",)), ("codex", ())])
+async def test_jev_filing_request_rescues_a_capture_only_as_a_plain_task(assignee, expected_tags):
+    """The disposition alone falls short (0.48, though it puts more weight on
+    agent work than on log-only); the rescue files a plain to-do, the
+    speaker's or unassigned -- never agent work."""
     answers = _rescue_answers(
-        disposition=disposition, confidence=confidence, probabilities=probabilities,
-        filing_request=0.8, assignee="me",
+        disposition="task", confidence=0.48,
+        probabilities={"task": 0.59, "delegated_task": 0.3, "agent_schedule": 0.08, "log_only": 0.03},
+        filing_request=0.95, assignee=assignee,
     )
-    answers["item"] = {"choice": item, "confidence": 0.9}
-    client = _QuestionAwareJev(answers, titles={item: title})
-    _, [action] = await _classify_and_validate(transcript, client)
+    answers["item"] = {"choice": "s1", "confidence": 0.9}
+    answers["work"] = {"choice": "s1", "confidence": 0.9}
+    answers["executor"] = {"choice": "codex", "confidence": 0.9}
+    client = _QuestionAwareJev(answers, titles={"s1": "schedule the synthetic piano tuner"}, confirm=0.99)
+    raw, [action] = await _classify_and_validate(_PIANO, client)
     assert action.kind == "task"
-    assert action.title.casefold() == title.casefold()
-    assert action.tags == ("me",)
+    assert action.title == "Schedule the synthetic piano tuner"
+    assert action.tags == expected_tags
+    assert all(tag not in AGENT_EXECUTOR_TAGS for item in raw for tag in item.get("tags", ()))
     assert "filing_request" in client.questions
 
 
 @pytest.mark.asyncio
+async def test_jev_rescue_never_delegates_even_to_a_named_and_confirmed_agent():
+    """Binding and confirmation would both pass here; a rescued capture
+    still files only as an unassigned plain to-do."""
+    transcript = "Put this on codex's plate: tidy the synthetic test fixtures"
+    answers = _rescue_answers(
+        disposition="delegated_task", confidence=0.45,
+        probabilities={"delegated_task": 0.6, "task": 0.3, "log_only": 0.1},
+        filing_request=0.9, assignee="codex",
+    )
+    for key in ("item", "work"):
+        answers[key] = {"choice": "s1", "confidence": 0.9}
+    answers["executor"] = {"choice": "codex", "confidence": 0.9}
+    client = _QuestionAwareJev(answers, titles={"s1": "tidy the synthetic test fixtures"}, confirm=0.99)
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert (action.kind, action.title, action.tags) == ("task", "Tidy the synthetic test fixtures", ())
+
+
+@pytest.mark.asyncio
+async def test_jev_rescued_low_probability_reminder_files_a_plain_task_not_a_schedule():
+    transcript = "Note to self: call the synthetic vet tomorrow"
+    answers = _rescue_answers(
+        disposition="notify_schedule", confidence=0.3,
+        probabilities={"notify_schedule": 0.55, "log_only": 0.45, "task": 1e-6},
+        filing_request=0.9,
+    )
+    answers["item"] = {"choice": "s1", "confidence": 0.9}
+    _, [action] = await _classify_and_validate(transcript, _QuestionAwareJev(answers))
+    assert action.kind == "task"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("disposition", "confidence", "filing_request"),
+    ("transcript", "disposition", "confidence", "probabilities", "filing_request"),
     [
-        ("log_only", 0.49, 0.54),   # neither signal asks for a filing
-        ("task", 0.45, 0.69),       # second signal just under its floor
-        ("log_only", 0.8, 0.95),    # a firm log-only stands
-        ("log_only", 0.6, None),    # no second signal at all
+        # A fairly confident log-only is never overridden.
+        ("I enjoyed watching the synthetic rain today", "log_only", 0.79,
+         {"log_only": 0.79, "task": 0.21}, 0.71),
+        # Near-zero reminder: log-only still holds most of the weight.
+        ("Note to self: call the synthetic vet tomorrow", "log_only", 0.79,
+         {"log_only": 0.79, "notify_schedule": 0.21, "task": 1e-6}, 0.71),
+        # Log-only weighs exactly one half: not below it.
+        ("My to-do: return the synthetic library books", "log_only", 0.52,
+         {"log_only": 0.5, "task": 0.5}, 0.9),
+        # Without the disposition's own log-only probability there is no rescue.
+        ("My to-do: return the synthetic library books", "task", 0.36, None, 0.9),
+        ("My to-do: return the synthetic library books", "task", 0.36, {"task": 0.9}, 0.9),
+        ("My to-do: return the synthetic library books", "task", 0.36, {"log_only": "low"}, 0.9),
+        # The second signal itself falls short or is missing.
+        ("I keep meaning to call the synthetic plumber", "task", 0.45, {"log_only": 0.1}, 0.69),
+        ("I keep meaning to call the synthetic plumber", "task", 0.45, {"log_only": 0.1}, None),
     ],
 )
-async def test_jev_capture_without_a_filing_signal_files_nothing(disposition, confidence, filing_request):
+async def test_jev_capture_without_both_rescue_signals_files_nothing(
+    transcript, disposition, confidence, probabilities, filing_request,
+):
     answers = _rescue_answers(
-        disposition=disposition, confidence=confidence, probabilities={"task": 0.4, "log_only": 0.6},
-        filing_request=filing_request,
+        disposition=disposition, confidence=confidence, probabilities=probabilities,
+        filing_request=filing_request, assignee="me",
     )
-    actions = await JevPebbleClassifier(client=_FakeJevClient(answers)).classify(
-        "I keep meaning to call the synthetic plumber", _RECORDED,
-    )
+    actions = await JevPebbleClassifier(client=_FakeJevClient(answers)).classify(transcript, _RECORDED)
     assert actions == []
+
+
+@pytest.mark.asyncio
+async def test_jev_rescue_cannot_produce_an_agent_schedule(monkeypatch, stores):
+    """A capture the disposition reads as log-only (0.79) is never rescued
+    into an agent schedule, whatever the other answers say."""
+    transcript = "Taylor told Morgan to schedule Claude to review the synthetic contract tomorrow at 3 PM"
+    answers = _rescue_answers(
+        disposition="log_only", confidence=0.79,
+        probabilities={"log_only": 0.79, "agent_schedule": 0.21}, filing_request=0.71, assignee="claude",
+    )
+    answers["work"] = {"choice": "s0", "confidence": 0.9}
+    answers["executor"] = {"choice": "claude", "confidence": 0.9}
+    client = _QuestionAwareJev(answers, titles={"s0": "review the synthetic contract"}, confirm=0.99)
+    consumer = _jev_consumer(monkeypatch, stores, classifier=JevPebbleClassifier(client=client))
+    ledger, tasks, schedules = stores
+    await consumer.process({**_payload(), "final_text": transcript})
+    assert tasks.list_tasks() == []
+    assert schedules.list_all() == []
+
+
+_SCHEDULE_REPRO = "Taylor told Morgan to schedule Claude to review the synthetic contract tomorrow at 3 PM"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("confirm", "agent_scheduled"), [(0.1, False), (0.95, True)])
+async def test_jev_agent_schedule_needs_jevs_targeted_confirmation(confirm, agent_scheduled):
+    """The literal scheduled-delegation gate and the name binding both pass;
+    only Jev's targeted confirmation separates agent work from a to-do."""
+    answers = _answers(disposition="agent_schedule", work="s0", assignee="claude")
+    client = _QuestionAwareJev(answers, titles={"s0": "review the synthetic contract"}, confirm=confirm)
+    _, [action] = await _classify_and_validate(_SCHEDULE_REPRO, client)
+    assert client.calls == 2
+    if agent_scheduled:
+        assert (action.kind, action.action, action.executor) == ("schedule", "agent", "claude")
+        assert action.agent_confirmation == 0.95
+    else:
+        assert (action.kind, action.tags, action.executor) == ("task", (), "")
+        assert action.title == "Review the synthetic contract"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("confirm", "expected_tags"), [(0.1, ()), (0.95, ("claude",))])
+async def test_jev_executor_fallback_delegation_needs_jevs_targeted_confirmation(confirm, expected_tags):
+    """No assignee answer: the `executor` fallback and the literal
+    delegation-evidence gate pass, so the confirmation decides."""
+    transcript = "Taylor told Morgan to ask Claude to review the synthetic contract"
+    answers = _answers(disposition="delegated_task", work="s0", executor="claude")
+    client = _QuestionAwareJev(answers, titles={"s0": "review the synthetic contract"}, confirm=confirm)
+    _, [action] = await _classify_and_validate(transcript, client)
+    assert action.tags == expected_tags
+    assert client.calls == 2
+
+
+def test_validate_plan_downgrades_an_unconfirmed_jev_agent_schedule_but_rejects_an_llm_one():
+    transcript = "Schedule Claude to review the synthetic contract tomorrow at 3 PM."
+    raw = [{
+        "kind": "schedule", "index": 0, "title": "review the synthetic contract",
+        "schedule_type": "once", "schedule_value": "2030-01-02T15:00:00", "timezone": "UTC",
+        "action": "agent", "executor": "claude", "message": "review the synthetic contract",
+        "delegation_evidence": transcript.rstrip("."), "action_evidence": "review the synthetic contract",
+    }]
+    [action] = validate_plan(raw, transcript=transcript, recorded_at=_RECORDED, jev_classified=True)
+    assert (action.kind, action.tags, action.executor) == ("task", (), "")
+    [granted] = validate_plan(
+        [{**raw[0], "agent_confirmation": 0.9}], transcript=transcript, recorded_at=_RECORDED,
+        jev_classified=True,
+    )
+    assert (granted.kind, granted.executor, granted.agent_confirmation) == ("schedule", "claude", 0.9)
+    [llm] = validate_plan(raw, transcript=transcript, recorded_at=_RECORDED)
+    assert llm.executor == "claude"
 
 
 @pytest.mark.asyncio

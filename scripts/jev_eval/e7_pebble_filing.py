@@ -81,7 +81,9 @@ async def run_case(case: dict, client, semaphore) -> dict:
     async with semaphore:
         raw = await JevPebbleClassifier(client=counting).classify(case["utterance"], RECORDED_AT)
     try:
-        actions = validate_plan(raw, transcript=case["utterance"], recorded_at=RECORDED_AT)
+        actions = validate_plan(
+            raw, transcript=case["utterance"], recorded_at=RECORDED_AT, jev_classified=True,
+        )
     except PebbleCaptureError:
         actions = []
     assignee, title = predicted(actions)

@@ -127,30 +127,37 @@ at whatever hour happened to parse. `PebbleJournalClassifier` has no such
 limit -- the model emits a `cron` schedule directly, so it still files
 recurring reminders as schedules.
 
-Whether a capture files at all rests on two Jev signals from the same call:
-the `disposition` choice decides when a filing disposition reaches 0.5
-confidence; otherwise a `filing_request` probability (the speaker asked for
-something to be recorded as a to-do or reminder) of 0.7 or above files it
-under the most probable filing disposition, unless `disposition` is a firm
-log-only (0.8 or above). This catches terse requests ("My to-do: ...",
-"put this on my plate: ...") without filing reflections or thinking aloud.
+Whether a capture files at all rests on two Jev signals from the same call.
+The `disposition` choice decides when a filing disposition reaches 0.5
+confidence. Otherwise a `filing_request` probability (the speaker asked for
+something to be recorded as a to-do or reminder) of 0.7 or above rescues the
+capture -- but only while the disposition's own log-only probability is
+present and below 0.5, and only ever as a plain to-do, the speaker's or
+unassigned: never a reminder or agent work. This catches terse requests
+("put this on my plate: ...") without filing reflections or thinking aloud.
 
 Who a Jev-filed task is assigned to is Jev's judgment, not a phrasing
 match: Jev chooses among nobody, the speaker, and each AI agent. At 0.7
 confidence or above the judgment decides -- the speaker files the task
 tagged `me`, and the plan records `assignee_source="jev"` with Jev's
-confidence as the assignment's evidence. An AI agent additionally needs two
-independent locks, both enforced by `validate_plan`: its name (any alias in
-`EXECUTOR_ALIASES`) in the same sentence as the task's title and outside the
-title span itself, and a second, targeted Jev call -- made only when the
-first proposes an agent -- confirming at 0.8 or above that the speaker
-themself asks that agent to do this task (not negated, imagined, or
-reported), whose probability the plan records as `agent_confirmation`.
-Failing either, the task files unassigned. A capture therefore makes one
-Jev call, or two when an agent is proposed. Below the floor, or on a missing or malformed
-answer, the explicit "assign it to me" wording and the `executor` answer
-decide instead. Agent schedules keep the literal scheduled-delegation
-evidence gate.
+confidence as the assignment's evidence. Below the floor, or on a missing or
+malformed answer, the explicit "assign it to me" wording and the `executor`
+answer decide instead.
+
+Every agent-executable outcome of a Jev plan -- a delegated task on any
+path, including the `executor` fallback, and an agent schedule -- needs two
+independent locks, both enforced by `validate_plan` for a Jev-classified
+capture: the agent's name (any alias in `EXECUTOR_ALIASES`) in the same
+sentence as the to-do and outside the to-do's own span, and a second,
+targeted Jev call -- made only when the first proposes agent work --
+confirming at 0.8 or above that the speaker themself asks that agent to do
+it (not negated, imagined, or reported), whose probability the plan records
+as `agent_confirmation`. These sit on top of the literal delegation-evidence
+gates. Failing either, the work files as an unassigned to-do. A capture
+therefore makes one Jev call, or two when agent work is proposed. The
+accepted residual: reported or negated speech that binds the agent's name
+beside the to-do still becomes agent work if both independent Jev judgments
+-- the assignee choice and the targeted confirmation -- are wrong about it.
 
 A Jev-filed title is Jev's choice among literal cuts of the chosen fragment:
 every span starting within its first 12 words and ending at most 8 words
@@ -178,7 +185,7 @@ concrete project rather than the vault or home, `fields.project` names it.
 | Plain-task filing is the classifier's judgment, re-checked by eval | `scripts/eval_pebble_filing.py`; index-based classifier/validated-action pairing regression; a log-only capture still completes |
 | Relative time, timezone, elapsed trigger safety | `validate_plan`; local-time, DST gap/overlap, offset mismatch, and saved-plan elapsed cases |
 | Explicit assignment and schedule action gate | source-scoped evidence validation; positive paraphrase, negated, quoted, reported, conditional, mentioned, unknown, and Markdown-rebuild pickup cases |
-| Jev-judged filing, assignee and title | mocked-Jev filing-request rescue and firm log-only, self-assignment, unnamed/unbound/unconfirmed agent, Jev-sourced `validate_plan` evidence, literal-title property, and fallback cases; `scripts/jev_eval/e7_pebble_filing.py` against real Jev |
+| Jev-judged filing, assignee and title | mocked-Jev plain-task-only rescue and log-only guard, agent schedule and executor-fallback locks, self-assignment, unnamed/unbound/unconfirmed agent, Jev-sourced `validate_plan` evidence, literal-title property, and fallback cases; `scripts/jev_eval/e7_pebble_filing.py` against real Jev |
 | Crash, restart, duplicate event, and revision conflict recovery | ledger consumer crash/replay and ambiguous-deletion cases; thread and process operation-key tests |
 | Human queue lifecycle | stable-key filing through `human_queue.add_card`, replay deduplication, and existing resolve-by-key transition |
 | Golden producer conformance | copied `tests/fixtures/pebble-result-*-v1.json` plus fixture-frame tests |
