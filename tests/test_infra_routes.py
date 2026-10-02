@@ -28,6 +28,17 @@ HOST = "example-host.tailnet.ts.net"
 TAILSCALE_FAKE = '''#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
+
+
+def go_uint(text):
+    # Go flag.UintVar: 0x... is hex, a leading 0 is octal, otherwise decimal.
+    if text.lower().startswith("0x"):
+        return int(text[2:], 16)
+    if len(text) > 1 and text.startswith("0"):
+        return int(text[1:], 8)
+    return int(text)
+
+
 with open(os.environ["FAKE_ACTIONS"], "a") as f:
     f.write("tailscale " + " ".join(args) + "\\n")
 state_path = os.environ["FAKE_TS_STATE"]
@@ -51,13 +62,13 @@ elif args[:2] == ["serve", "status"]:
     print("fake serve status")
     sys.exit(0)
 elif args[0] == "funnel" and args[-1] == "off":
-    port = next(a.split("=", 1)[1] for a in args if a.startswith("--https="))
+    port = str(go_uint(next(a.split("=", 1)[1] for a in args if a.startswith("--https="))))
     # Upstream semantics: turning funnel off removes the port's web handlers too.
     if not os.environ.get("FAKE_FUNNEL_STUCK"):
         for key in [k for k in state if k.startswith(port + "|") or k == "funnel|" + port]:
             state.pop(key)
 elif args[0] in ("serve", "funnel"):
-    port = next(a.split("=", 1)[1] for a in args if a.startswith("--https="))
+    port = str(go_uint(next(a.split("=", 1)[1] for a in args if a.startswith("--https="))))
     path = args[args.index("--set-path") + 1]
     target = args[-1]
     if port != os.environ.get("FAKE_TS_DROP_PORT"):
@@ -527,3 +538,22 @@ def test_make_private_failure_is_reported_when_routes_cannot_be_restored(box):
     box.ts_state.write_text(json.dumps({"funnel|8443": True}))
     box.watch({"FAKE_TS_DROP_PORT": "8443"})
     assert "make-private FAILED" in (box.state_dir / "infra-watchdog.log").read_text()
+
+
+@pytest.mark.parametrize("port", ["0673", "0443", "0x1BB", "+443", "70000", "0", " 443"])
+def test_non_canonical_ports_are_malformed_lines(box, port):
+    box.routes.write_text(f"https={port} path=/x target=http://127.0.0.1:9000/x funnel=on\n")
+    r = box.setup({"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "true"})
+    assert r.returncode != 0
+    assert "must be a decimal number" in r.stderr or "expected key=value" in r.stderr
+    assert not any(a.startswith("tailscale funnel") for a in box.log())
+    assert not any(k.startswith("funnel|") for k in box.table())
+    assert set(box.table()) == {"443|/"}
+
+
+def test_trailing_space_after_the_port_is_the_canonical_port(box):
+    box.routes.write_text("https=443  path=/x target=http://127.0.0.1:9000/x funnel=on \n")
+    r = box.setup({"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "true"})
+    assert r.returncode != 0
+    assert "never allowed on the LifeOS port" in r.stderr
+    assert set(box.table()) == {"443|/"}

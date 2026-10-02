@@ -39,7 +39,12 @@ ts_load_routes() {
                 *) echo "$routes_file:$lineno: unknown field '$key'" >&2; bad=1 ;;
             esac
         done
-        [[ "$r_port" =~ ^[0-9]+$ ]] || { echo "$routes_file:$lineno: https=<port> must be a number" >&2; bad=1; }
+        # Canonical decimal only: Tailscale parses a leading 0 as octal and 0x as
+        # hex, so "0673" would silently mean port 443.
+        if ! [[ "$r_port" =~ ^[1-9][0-9]{0,4}$ ]] || (( r_port > 65535 )); then
+            echo "$routes_file:$lineno: https=<port> must be a decimal number from 1 to 65535 without leading zeros" >&2
+            bad=1
+        fi
         [[ "$r_path" == /* ]] || { echo "$routes_file:$lineno: path=<mount path> must start with /" >&2; bad=1; }
         [[ "$r_target" =~ ^https?://[^[:space:]]+$ ]] || { echo "$routes_file:$lineno: target=<url> must be an http(s) URL" >&2; bad=1; }
         case "$r_funnel" in
