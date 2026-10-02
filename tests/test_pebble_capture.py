@@ -3036,6 +3036,7 @@ async def test_jev_state_marks_the_note_as_a_speech_recognition_transcript():
     )
     await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
     assert client.calls == 2
+    assert "speech recognition" in client.confirmations[0]
     for state in client.states:
         assert state["voice_note"] == transcript
         assert "speech-recognition transcript" in state["source"]
@@ -3051,6 +3052,7 @@ async def test_jev_filing_questions_name_misheard_request_wording():
         assert "speech recognition" in questions[name]["instructions"].casefold(), name
     assert "misheard" in questions["disposition"]["criteria"]["task"]
     assert "Reporting what someone else said" in questions["disposition"]["criteria"]["log_only"]
+    assert "I'll take this one" in questions["assignee"]["criteria"]["me"]
 
 
 # Agent assignment on a Jev judgment needs two independent locks: the agent's

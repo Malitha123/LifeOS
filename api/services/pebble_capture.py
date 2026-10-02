@@ -1296,8 +1296,10 @@ def _assignee_criteria() -> dict[str, str]:
     criteria = {
         "none": "Nobody: the speaker did not ask for the task to be assigned to anyone.",
         "me": (
-            "The speaker themselves: they asked for the task to be theirs "
-            "(\"assign it to me\", \"for me\", \"that's mine\", \"put it on my list\")."
+            "The speaker themselves: they asked for the task to be theirs or "
+            "claimed it for themselves (\"assign it to me\", \"for me\", "
+            "\"that's mine\", \"put it on my list\", \"my to-do\", \"I'll take "
+            "this one\", \"I'm doing it myself\")."
         ),
     }
     for tag, description in _executor_criteria().items():
@@ -1459,10 +1461,12 @@ class JevPebbleClassifier:
             "instructions": (
                 "Who did the speaker ask for this task to be assigned to? Only "
                 "the speaker's own request counts, including one whose "
-                "request wording speech recognition misheard. An assignment "
-                "that is negated, hypothetical or wished-for, or reported as "
-                "what someone else said, is not a request, and neither is "
-                "merely mentioning a person or agent."
+                "request wording speech recognition misheard. The speaker "
+                "claiming the task for themselves (\"I'll take it\", \"that's "
+                "mine\", \"I'm doing it\", \"my to-do\") means the speaker. An "
+                "assignment that is negated, hypothetical or wished-for, or "
+                "reported as what someone else said, is not a request, and "
+                "neither is merely mentioning a person or agent."
             ),
             "criteria": _assignee_criteria(),
         }
@@ -1516,7 +1520,8 @@ class JevPebbleClassifier:
             f"In this voice note the speaker themself asks for this to be done by "
             f"{_EXECUTOR_DISPLAY_NAMES.get(agent, agent)} -- telling it to do it, or "
             f"assigning or handing the task to it: '{title}' (not negating it, not "
-            "imagining it, not reporting what someone else said)"
+            "imagining it, not reporting what someone else said; speech "
+            "recognition may have misheard the request wording around it)"
         )
         try:
             answers = await self._client.aask(

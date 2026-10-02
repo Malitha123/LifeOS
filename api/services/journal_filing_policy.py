@@ -39,7 +39,7 @@ PEBBLE_DISPOSITION_CRITERIA: dict[str, str] = {
         "\"I need to ... at some point\", \"I keep meaning to\"), states a "
         "fact, asks a question, or gives a bare imperative without asking "
         "for it to be filed. Reporting what someone else said, asked or "
-        "wants is not a request either."
+        "wants is not the speaker's request either."
     ),
     "task": (
         "The speaker actively asks for a to-do for themselves to be filed: "

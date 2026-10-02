@@ -173,8 +173,10 @@ A Pebble note is automatic speech-recognition output, which can mishear the
 filing request itself ("at a desk to ..." for "add a task to ..."). Every Jev
 call's state therefore carries a `source` field naming the note as a
 speech-recognition transcript whose opening request wording may be misheard,
-and the disposition, filing-request, item, assignee and title questions say
-the same in their own wording, while reported speech stays log-only. Jev
+and the disposition, filing-request, item, assignee and title questions and
+the targeted agent confirmation say the same in their own wording, while
+reported speech stays log-only. The assignee question also counts the speaker
+claiming a task ("I'll take this one", "I'm doing it myself") as theirs. Jev
 judges what the speaker most likely said; no substitution rule rewrites the
 transcript, and a misheard request is simply left out of the literal title
 span. The eval set's `asr` and `asr_journal` categories cover misheard
