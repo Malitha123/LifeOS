@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# LifeOS Infra Watchdog
+# Runs every 5 minutes (user unit lifeos-infra-watchdog.timer) and checks the
+# host dependencies other devices rely on:
+#   - Declared tailnet routes (LifeOS's own plus config/tailscale-routes.local):
+#     re-applies any that are missing, alerts if one is still missing.
+#   - LIFEOS_PEBBLE_HEALTH_URL (unset = skipped): alerts after 3 consecutive
+#     failed health checks.
+#   - LIFEOS_EXPECT_OBSIDIAN_SYNC=true: relaunches Obsidian in the user session
+#     when it is not running, and alerts if it is still absent on the next run.
+#
+# Alerts go to Telegram with a per-kind cooldown. Handled failures exit 0 so
+# the timer never crash-loops.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=lib/tailscale-routes.sh
+source "$SCRIPT_DIR/lib/tailscale-routes.sh"
+
+STATE_DIR="${LIFEOS_INFRA_STATE_DIR:-$PROJECT_DIR/logs}"
+LOG_FILE="$STATE_DIR/infra-watchdog.log"
+ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
+ROUTES_FILE="${LIFEOS_TAILSCALE_ROUTES_FILE:-$PROJECT_DIR/config/tailscale-routes.local}"
+COOLDOWN_MIN="${LIFEOS_INFRA_ALERT_COOLDOWN_MIN:-360}"
+PEBBLE_STRIKES="${LIFEOS_INFRA_PEBBLE_STRIKES:-3}"
+OBSIDIAN_LAUNCH_CMD="${LIFEOS_OBSIDIAN_LAUNCH_CMD:-systemd-run --user --collect --unit=obsidian-session-\$(date +%s) snap run obsidian}"
+
+mkdir -p "$STATE_DIR"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+send_telegram() {
+    local message="$1" bot_token chat_id
+    [ -f "$ENV_FILE" ] || return 1
+    bot_token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
+    chat_id=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2-)
+    [ -n "$bot_token" ] && [ -n "$chat_id" ] || return 1
+    "${LIFEOS_WATCHDOG_CURL:-/usr/bin/curl}" -s -f -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" > /dev/null 2>&1
+}
+
+# alert <kind> <message>: send at most once per cooldown per kind. The stamp is
+# written only when the send succeeds, so a failed send retries next run.
+alert() {
+    local kind="$1" message="$2" stamp last now
+    stamp="$STATE_DIR/infra-watchdog-alert-${kind}.stamp"
+    now=$(date +%s)
+    if [ -f "$stamp" ]; then
+        last=$(cat "$stamp")
+        if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < COOLDOWN_MIN * 60 )); then
+            log "alert '$kind' suppressed (cooldown)"
+            return 0
+        fi
+    fi
+    if send_telegram "$message"; then
+        echo "$now" > "$stamp"
+        log "alert '$kind' sent"
+    else
+        log "alert '$kind' not sent (Telegram failed); will retry next run"
+    fi
+}
+
+read_count() {
+    local n
+    n=$(cat "$1" 2>/dev/null || echo 0)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    echo "$n"
+}
+
+check_routes() {
+    if ! command -v tailscale > /dev/null 2>&1; then
+        log "routes: tailscale not installed; skipped"
+        return 0
+    fi
+    local err errfile="$STATE_DIR/infra-watchdog-routes.err"
+    # Not command substitution: ROUTES must be set in this shell.
+    if ! ts_load_routes "$ROUTES_FILE" 2> "$errfile"; then
+        err=$(cat "$errfile")
+        log "routes: invalid routes file: ${err//$'\n'/ }"
+        alert routes-config "LifeOS host: tailnet routes file is invalid, so no declared routes are being checked. ${err}"
+        return 0
+    fi
+
+    local route port path target missing=() reapplied=() still=()
+    for route in "${ROUTES[@]}"; do
+        IFS='|' read -r port path target _ <<< "$route"
+        ts_route_present "$port" "$path" "$target" || missing+=("$route")
+    done
+    if [ ${#missing[@]} -eq 0 ]; then
+        log "routes: ${#ROUTES[@]} declared, all present"
+        return 0
+    fi
+
+    for route in "${missing[@]}"; do
+        IFS='|' read -r port path target _ <<< "$route"
+        ts_apply_route "$route" > /dev/null 2>&1
+        if ts_route_present "$port" "$path" "$target"; then
+            reapplied+=("https=${port} path=${path}")
+        else
+            still+=("https=${port} path=${path}")
+        fi
+    done
+    [ ${#reapplied[@]} -eq 0 ] || log "routes: re-applied missing route(s): ${reapplied[*]}"
+    if [ ${#still[@]} -gt 0 ]; then
+        log "routes: still missing after re-apply: ${still[*]}"
+        alert routes "LifeOS host: tailnet route(s) missing and could not be re-applied: ${still[*]}"
+    fi
+}
+
+check_pebble() {
+    local url="${LIFEOS_PEBBLE_HEALTH_URL:-}" count_file="$STATE_DIR/infra-watchdog-pebble.count" n
+    if [ -z "$url" ]; then
+        return 0
+    fi
+    if curl -sf -m 10 -o /dev/null "$url"; then
+        echo 0 > "$count_file"
+        log "pebble: healthy"
+        return 0
+    fi
+    n=$(( $(read_count "$count_file") + 1 ))
+    echo "$n" > "$count_file"
+    log "pebble: health check failed ($n consecutive)"
+    if (( n >= PEBBLE_STRIKES )); then
+        alert pebble "LifeOS host: the Pebble receiver health check has failed ${n} consecutive times."
+    fi
+}
+
+check_obsidian() {
+    local launched="$STATE_DIR/infra-watchdog-obsidian-launched.stamp"
+    [ "${LIFEOS_EXPECT_OBSIDIAN_SYNC:-false}" = "true" ] || return 0
+    if pgrep -x obsidian > /dev/null 2>&1; then
+        rm -f "$launched"
+        log "obsidian: running"
+        return 0
+    fi
+    if [ -f "$launched" ]; then
+        log "obsidian: still not running after relaunch"
+        alert obsidian "LifeOS host: Obsidian is not running and a relaunch did not bring it back, so vault sync is stalled."
+        return 0
+    fi
+    date +%s > "$launched"
+    if bash -c "$OBSIDIAN_LAUNCH_CMD" >> "$LOG_FILE" 2>&1; then
+        log "obsidian: not running; relaunch requested"
+    else
+        log "obsidian: not running; relaunch command failed"
+    fi
+}
+
+check_routes
+check_pebble
+check_obsidian
+exit 0

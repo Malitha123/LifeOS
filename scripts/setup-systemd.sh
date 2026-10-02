@@ -176,6 +176,30 @@ echo "  lifeos-gpu-watchdog.timer: $(systemctl is-active lifeos-gpu-watchdog.tim
 systemctl enable --now lifeos-network-watchdog.timer
 echo "  lifeos-network-watchdog.timer: $(systemctl is-active lifeos-network-watchdog.timer)"
 
+# The infra watchdog is a USER unit: re-applying tailnet routes and relaunching
+# Obsidian (systemd-run --user) both need the login user's session manager,
+# which a system unit does not have. Installed into the user's unit dir and
+# enabled through that user's manager.
+USER_UNIT_SRC="$SYSTEMD_SRC/user"
+USER_UNIT_DST="$REAL_HOME/.config/systemd/user"
+REAL_UID=$(id -u "$REAL_USER")
+if [ -d "$USER_UNIT_SRC" ]; then
+    runuser -u "$REAL_USER" -- mkdir -p "$USER_UNIT_DST"
+    for unit in "$USER_UNIT_SRC"/*.service "$USER_UNIT_SRC"/*.timer; do
+        [ -f "$unit" ] || continue
+        sed -e "s|__LIFEOS_DIR__|$PROJECT_DIR|g" "$unit" \
+            | runuser -u "$REAL_USER" -- tee "$USER_UNIT_DST/$(basename "$unit")" > /dev/null
+        echo "  Installed user unit $(basename "$unit")"
+    done
+    USER_SYSTEMCTL=(runuser -u "$REAL_USER" -- env "XDG_RUNTIME_DIR=/run/user/$REAL_UID" systemctl --user)
+    if "${USER_SYSTEMCTL[@]}" daemon-reload 2>/dev/null; then
+        "${USER_SYSTEMCTL[@]}" enable --now lifeos-infra-watchdog.timer
+        echo "  lifeos-infra-watchdog.timer (user): $("${USER_SYSTEMCTL[@]}" is-active lifeos-infra-watchdog.timer)"
+    else
+        echo "  lifeos-infra-watchdog.timer: no user session for $REAL_USER; run 'systemctl --user enable --now lifeos-infra-watchdog.timer' from a login session"
+    fi
+fi
+
 systemctl enable --now lifeos-sync.timer
 echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
 

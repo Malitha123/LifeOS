@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Shared helpers for declared tailnet routes. Sourced by setup-tailscale.sh and
+# infra-watchdog.sh; defines functions only.
+#
+# Routes come from LifeOS's own front (https=443 path=/ -> the local API) plus
+# every line of the operator-local routes file (config/tailscale-routes.local,
+# git-ignored; see config/tailscale-routes.example for the format).
+
+# Populates the global ROUTES array with "port|path|target|funnel" entries.
+# Prints one message per problem to stderr and returns 1 if the file is invalid.
+ts_load_routes() {
+    local routes_file="$1" port="${LIFEOS_PORT:-8000}"
+    ROUTES=("443|/|http://127.0.0.1:${port}|off")
+    [[ -f "$routes_file" ]] || return 0
+
+    local line lineno=0 rc=0 token key value bad
+    local r_port r_path r_target r_funnel
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line%%#*}"
+        [[ -n "${line//[[:space:]]/}" ]] || continue
+        r_port="" r_path="" r_target="" r_funnel="off" bad=0
+        for token in $line; do
+            if [[ "$token" != *=* ]]; then
+                echo "$routes_file:$lineno: expected key=value, got '$token'" >&2
+                bad=1
+                continue
+            fi
+            key="${token%%=*}"
+            value="${token#*=}"
+            case "$key" in
+                https) r_port="$value" ;;
+                path) r_path="$value" ;;
+                target) r_target="$value" ;;
+                funnel) r_funnel="$value" ;;
+                *) echo "$routes_file:$lineno: unknown field '$key'" >&2; bad=1 ;;
+            esac
+        done
+        [[ "$r_port" =~ ^[0-9]+$ ]] || { echo "$routes_file:$lineno: https=<port> must be a number" >&2; bad=1; }
+        [[ "$r_path" == /* ]] || { echo "$routes_file:$lineno: path=<mount path> must start with /" >&2; bad=1; }
+        [[ "$r_target" =~ ^https?://[^[:space:]]+$ ]] || { echo "$routes_file:$lineno: target=<url> must be an http(s) URL" >&2; bad=1; }
+        case "$r_funnel" in
+            off) ;;
+            on)
+                if [[ "${LIFEOS_TAILSCALE_ALLOW_FUNNEL:-false}" != "true" ]]; then
+                    echo "$routes_file:$lineno: funnel=on publishes to the internet and requires LIFEOS_TAILSCALE_ALLOW_FUNNEL=true" >&2
+                    bad=1
+                fi
+                ;;
+            *) echo "$routes_file:$lineno: funnel must be on or off" >&2; bad=1 ;;
+        esac
+        if [[ $bad -eq 1 ]]; then
+            rc=1
+        else
+            ROUTES+=("${r_port}|${r_path}|${r_target}|${r_funnel}")
+        fi
+    done < "$routes_file"
+    return $rc
+}
+
+# Succeeds when `tailscale serve status --json` shows a handler for the route
+# whose proxy target matches. The tailnet hostname is not needed: any
+# "<host>:<port>" web entry on that port counts.
+ts_route_present() {
+    local port="$1" path="$2" target="$3"
+    tailscale serve status --json 2>/dev/null | python3 -c '
+import json, sys
+port, path, target = sys.argv[1:4]
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+for hostport, web in (data.get("Web") or {}).items():
+    if hostport.rsplit(":", 1)[-1] != port:
+        continue
+    handler = (web.get("Handlers") or {}).get(path) or {}
+    if (handler.get("Proxy") or "").rstrip("/") == target.rstrip("/"):
+        sys.exit(0)
+sys.exit(1)
+' "$port" "$path" "$target"
+}
+
+# Applies one "port|path|target|funnel" entry. Never resets other routes.
+ts_apply_route() {
+    local port path target funnel
+    IFS='|' read -r port path target funnel <<< "$1"
+    if [[ "$funnel" == "on" ]]; then
+        tailscale funnel --bg --https="$port" --set-path "$path" "$target"
+    else
+        tailscale serve --bg --https="$port" --set-path "$path" "$target"
+    fi
+}

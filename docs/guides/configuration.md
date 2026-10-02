@@ -410,6 +410,19 @@ A capture device (e.g. the Pebble Index ring) posts transcriptions here. See [jo
 | `LIFEOS_PEBBLE_CAPTURE_DIR` | str | `LifeOS/Log/Pebble` | Producer-owned Pebble archive directory under the vault. |
 | `LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS` | int | `60` | Startup/periodic recovery scan interval, seconds (minimum `10`). |
 
+## Host Routes and Dependencies
+
+Read directly from the environment by `scripts/setup-tailscale.sh` and `scripts/infra-watchdog.sh` (not `config/settings.py` fields). See [operations.md](operations.md#host-routes-and-dependencies).
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_TAILSCALE_ROUTES_FILE` | path | `config/tailscale-routes.local` | Operator-local file declaring extra tailnet routes, one `https=<port> path=<path> target=<url>` per line. Absent means only the LifeOS route is applied. |
+| `LIFEOS_TAILSCALE_ALLOW_FUNNEL` | bool | `false` | Permit `funnel=on` route lines (publishes that route to the public internet). Without it such a line is rejected. |
+| `LIFEOS_PEBBLE_HEALTH_URL` | str | — | Health endpoint of the Pebble receiver. Unset skips the check; 3 consecutive failures alert. |
+| `LIFEOS_EXPECT_OBSIDIAN_SYNC` | bool | `false` | When `true`, the infra watchdog relaunches Obsidian if it is not running and alerts if it stays down. |
+| `LIFEOS_OBSIDIAN_LAUNCH_CMD` | str | `systemd-run --user --collect --unit=obsidian-session-$(date +%s) snap run obsidian` | Command (run through `bash -c`) that launches Obsidian in the user session. |
+| `LIFEOS_INFRA_ALERT_COOLDOWN_MIN` | int | `360` | Minutes between repeat Telegram alerts of the same kind from the infra watchdog. |
+
 ## Notifications
 
 | Variable | Type | Default | Sets |

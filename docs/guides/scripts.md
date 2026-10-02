@@ -302,6 +302,7 @@ The display `sources` column stores each call as `tool(json-args)` cut to 80 cha
 | `gpu-watchdog.sh` | Alerts via Telegram when GPU VRAM usage crosses a threshold, to catch impending OOM lockups before an embedding-heavy sync triggers one. Linux only (AMDGPU sysfs). Installed as `lifeos-gpu-watchdog.timer` by `setup-systemd.sh`. |
 | `server-watchdog.sh` | Detects and restarts a stuck/duplicated API server (duplicate uvicorn processes, unresponsive after long syncs). Installed as `lifeos-server-watchdog.timer` by `setup-systemd.sh`; on macOS, run from a cron entry via the `LifeOS.app` FDA wrapper. |
 | `network-watchdog.sh` | WiFi link health check and gentle self-heal (`nmcli device connect` re-activate only — deliberately never bounces the radio, reloads the driver, or restarts NetworkManager, since those can deadlock some WiFi drivers). Also self-heals a Tailscale address loss: when `tailscale` is installed and `tailscale status --json` reports `BackendState Running` but `tailscale0` has no IPv4 address, restarts `tailscaled` (rate-limited) and alerts with the outcome — a no-op on a host without Tailscale. Opt-in via `LIFEOS_NETWORK_WATCHDOG_ENABLED`; installed as `lifeos-network-watchdog.timer` by `setup-systemd.sh`. |
+| `infra-watchdog.sh` | Checks declared tailnet routes (re-applies missing ones), the optional Pebble receiver health URL, and, when declared, that Obsidian is running. Alerts via Telegram with a per-kind cooldown. Installed as the user unit `lifeos-infra-watchdog.timer` by `setup-systemd.sh` — see [operations.md](operations.md#host-routes-and-dependencies). |
 | `auto-deploy.sh` | Poll `origin/main`; on a fast-forward advance, pull and restart the code services that changed. Pull-based, guarded (main branch + clean tree + `--ff-only`), opt-in via `LIFEOS_AUTODEPLOY_ENABLED`. Run by `lifeos-autodeploy.timer`. |
 | `auto-update-macos.sh` | The macOS analog of `auto-deploy.sh` for the launchd-managed API service. Same opt-in flag and guards; not installed as a timer by this repo — an operator adds their own cron/launchd entry. See [Auto-Deploy on macOS](operations.md#auto-deploy-on-macos-self-hosted-redeploy) in operations.md. |
 | `cleanup-worktrees.sh` | Idempotent git-worktree pruning plus targeted removal of a stale worktree/branch; safe to call pre-flight before `git worktree add`. |
@@ -378,7 +379,7 @@ Re-running never silently replaces a differently-configured, already-installed p
 
 ### setup-tailscale.sh
 
-Expose LifeOS on the tailnet HTTPS front (port 443) via `tailscale serve`, so `/chat` voice works (the mic needs a secure context). Reverse-proxies to the local API; whisper-relay stays on localhost. Reads `LIFEOS_PORT` / `TAILNET_HTTPS_URL` from the environment.
+Expose LifeOS on the tailnet HTTPS front (port 443) via `tailscale serve`, so `/chat` voice works (the mic needs a secure context). Reverse-proxies to the local API; whisper-relay stays on localhost. Also applies every route declared in `config/tailscale-routes.local` and verifies each is live, exiting non-zero if one is missing; it never resets routes it does not declare — see [operations.md](operations.md#host-routes-and-dependencies). Reads `LIFEOS_PORT` / `TAILNET_HTTPS_URL` from the environment.
 
 ```bash
 ./scripts/setup-tailscale.sh
