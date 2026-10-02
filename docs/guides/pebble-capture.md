@@ -167,7 +167,7 @@ away. Titles therefore stay exact transcript spans. Below 0.5 confidence the
 fragment with its filing request stripped is the title.
 `scripts/jev_eval/e7_pebble_filing.py` scores both judgments against a
 committed, synthetic-only labeled set of varied phrasings
-(`scripts/jev_eval/data/pebble_filing_cases.jsonl`) with real Jev.
+(`scripts/jev_eval/cases/pebble_filing_cases.jsonl`) with real Jev.
 
 When the Jev classifier files a task, it also asks Jev whether the task is
 software work; at 0.7 confidence or above the task carries the `software`

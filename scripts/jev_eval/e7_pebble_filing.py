@@ -2,7 +2,7 @@
 
 Scores the production `JevPebbleClassifier` followed by `validate_plan` (the
 same path a captured Pebble note takes) over the committed, synthetic-only
-labeled set `scripts/jev_eval/data/pebble_filing_cases.jsonl`. Each line is
+labeled set `scripts/jev_eval/cases/pebble_filing_cases.jsonl`. Each line is
 `{utterance, expected_title, expected_assignee, category}`, where
 `expected_assignee` is `none`, `me`, or an agent executor tag, and a null
 `expected_title` marks a note that asks for nothing to be filed.
@@ -36,7 +36,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-CASES = Path(__file__).resolve().parent / "data" / "pebble_filing_cases.jsonl"
+CASES = Path(__file__).resolve().parent / "cases" / "pebble_filing_cases.jsonl"
 RECORDED_AT = "2030-01-01T10:00:00Z"
 
 

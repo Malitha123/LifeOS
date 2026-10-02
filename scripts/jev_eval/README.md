@@ -57,9 +57,10 @@ python scripts/jev_eval/e5_latency.py     # 500 Jev calls, ~$0.02
 `e7_pebble_filing.py` scores the production `JevPebbleClassifier` plus
 `validate_plan` on Pebble task filing: per-category assignee and title
 accuracy and the count of false agent assignments. Its labeled set,
-`scripts/jev_eval/data/pebble_filing_cases.jsonl`, is synthetic-only and is
-the one dataset in this directory that is committed (re-included in
-`.gitignore`); only its utterances are sent to TypeSafe.
+`scripts/jev_eval/cases/pebble_filing_cases.jsonl`, is synthetic-only and is
+the one dataset in this directory that is committed -- it lives outside any
+`data/` directory, which is never committed; only its utterances are sent
+to TypeSafe.
 
 ```
 python scripts/jev_eval/e7_pebble_filing.py --env-file <LifeOS .env> --show-failures

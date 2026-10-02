@@ -30,8 +30,6 @@ uv.lock
 # DATA (all personal data lives in data/)
 # =============================================================================
 data/
-# Committed, synthetic-only labeled eval sets (never personal data).
-!scripts/jev_eval/data/
 *.db
 *.sqlite
 

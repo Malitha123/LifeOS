@@ -2726,7 +2726,7 @@ def test_validated_classifier_actions_accepts_and_links_a_parent_index_plan():
 # its name in a positive clause of the transcript.
 
 _RECORDED = "2030-01-01T10:00:00Z"
-_EVAL_CASES = Path(__file__).resolve().parents[1] / "scripts/jev_eval/data/pebble_filing_cases.jsonl"
+_EVAL_CASES = Path(__file__).resolve().parents[1] / "scripts/jev_eval/cases/pebble_filing_cases.jsonl"
 
 
 class _QuestionAwareJev:
@@ -2970,11 +2970,23 @@ async def test_jev_classifier_asks_assignee_and_title_questions_in_one_call():
 
 
 def _eval_utterances():
+    """The labeled eval set's utterances, or a single `None` when the file is
+    missing, so the tests below fail with a clear message rather than
+    collection erroring out."""
+    if not _EVAL_CASES.is_file():
+        return [None]
     return [json.loads(line)["utterance"] for line in _EVAL_CASES.read_text().splitlines() if line.strip()]
+
+
+def _require_eval_utterance(utterance):
+    if utterance is None:
+        pytest.fail(f"Pebble filing eval set is missing: {_EVAL_CASES} must be committed")
+    return utterance
 
 
 @pytest.mark.parametrize("utterance", _eval_utterances())
 def test_title_candidates_are_literal_transcript_spans(utterance):
+    utterance = _require_eval_utterance(utterance)
     for fragment in _segment_transcript(utterance):
         candidates = _title_candidates(fragment)
         assert len(candidates) <= 255
@@ -2988,6 +3000,7 @@ def test_title_candidates_are_literal_transcript_spans(utterance):
 async def test_every_jev_chosen_title_is_a_literal_transcript_substring(utterance):
     """Whichever candidate Jev picks, the filed title is a literal
     (case-insensitive) span of the transcript."""
+    utterance = _require_eval_utterance(utterance)
     first = _title_candidates(_segment_transcript(utterance)[0])
     for pick in range(len(first)):
         client = _QuestionAwareJev(
