@@ -1207,6 +1207,8 @@ def test_served_transport_sees_the_proxy_peer_not_x_forwarded_for(server, config
 
     import uvicorn
 
+    # A permissive trusted-proxy setting must not bring X-Forwarded-For back.
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
     captured: dict[str, Any] = {}
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: captured.update(app=app, kw=kw))
     mcp_server.run_http(server, "127.0.0.1", 0, BEARER, oauth=config)
@@ -1236,6 +1238,16 @@ def test_served_transport_sees_the_proxy_peer_not_x_forwarded_for(server, config
         # Past the identity check: refused only for the missing client (400).
         assert status(forwarded) == 400
         assert status({"X-Forwarded-For": "100.64.0.7", "Tailscale-User-Login": "guest@example.com"}) == 403
+        assert status({**forwarded, "Tailscale-Funnel-Request": "?1"}) == 403
+
+        mcp = urllib.request.Request(
+            f"http://127.0.0.1:{port}/mcp", method="POST",
+            data=b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+            headers={"Content-Type": "application/json", "Tailscale-Funnel-Request": "?1"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as unauthenticated:
+            urllib.request.urlopen(mcp, timeout=10)
+        assert unauthenticated.value.code == 401
     finally:
         srv.should_exit = True
         thread.join(timeout=10)

@@ -594,3 +594,34 @@ def test_public_port_with_only_funnel_routes_is_published(box):
     assert table["funnel|10000"] is True
     assert table["10000|/mcp"] == "http://127.0.0.1:8765/mcp"
     assert "funnel|8443" not in table
+
+
+def test_setup_closes_an_already_public_port_once_it_is_declared_mixed(box):
+    box.ts_state.write_text(json.dumps({
+        "10000|/mcp": "http://127.0.0.1:8765/mcp",
+        "10000|/private": "http://127.0.0.1:9000/private",
+        "funnel|10000": True,
+    }))
+    box.routes.write_text(MCP_PUBLIC_LINES + "https=10000 path=/private target=http://127.0.0.1:9000/private\n")
+    r = box.setup({"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "true"})
+    assert r.returncode != 0
+    assert "tailscale funnel --https=10000 off" in box.log()
+    assert "funnel|10000" not in box.table()
+
+
+def test_watchdog_closes_an_already_public_port_once_it_is_declared_mixed(box):
+    box.ts_state.write_text(json.dumps({"10000|/mcp": "http://127.0.0.1:8765/mcp", "funnel|10000": True}))
+    box.routes.write_text(MCP_PUBLIC_LINES + "https=10000 path=/private target=http://127.0.0.1:9000/private\n")
+    box.watch({"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "true"})
+    assert "funnel|10000" not in box.table()
+    assert len(box.telegrams()) >= 1
+
+
+def test_withdrawing_the_opt_in_closes_the_public_mcp_port(box):
+    box.routes.write_text(MCP_PUBLIC_LINES)
+    assert box.setup({"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "true"}).returncode == 0
+    assert "funnel|10000" in box.table()
+    box.watch({"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "false"})
+    table = box.table()
+    assert "funnel|10000" not in table
+    assert table["10000|/mcp"] == "http://127.0.0.1:8765/mcp"

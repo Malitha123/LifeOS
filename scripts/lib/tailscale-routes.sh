@@ -6,13 +6,16 @@
 # every line of the operator-local routes file (config/tailscale-routes.local,
 # git-ignored; see config/tailscale-routes.example for the format).
 
-# Populates the global ROUTES array with "port|path|target|funnel" entries.
-# Prints one message per problem to stderr and returns 1 if the file is invalid.
+# Populates the global ROUTES array with "port|path|target|funnel" entries, and
+# REJECTED_PORTS with ports whose routes were all refused for mixing public and
+# private routes. Prints one message per problem to stderr and returns 1 if the
+# file is invalid.
 LIFEOS_ROUTE_PORT=443
 
 ts_load_routes() {
     local routes_file="$1" port="${LIFEOS_PORT:-8000}"
     ROUTES=("443|/|http://127.0.0.1:${port}|off")
+    REJECTED_PORTS=()
     [[ -f "$routes_file" ]] || return 0
 
     local line lineno=0 rc=0 token key value bad
@@ -83,7 +86,10 @@ ts_load_routes() {
         mixed=0
         [[ "$port_on" == *" $r_port "* && "$port_off" == *" $r_port "* ]] && mixed=1
         if [[ $mixed -eq 1 ]]; then
-            echo "$routes_file: https=$r_port mixes funnel=on and private routes; Funnel is port-wide, so no route on that port is applied" >&2
+            if [[ " ${REJECTED_PORTS[*]} " != *" $r_port "* ]]; then
+                echo "$routes_file: https=$r_port mixes funnel=on and private routes; Funnel is port-wide, so no route on that port is applied and the port is kept private" >&2
+                REJECTED_PORTS+=("$r_port")
+            fi
             rc=1
         else
             kept+=("$route")
@@ -153,13 +159,19 @@ ts_wants_public() {
     return 1
 }
 
-# Declared ports, one per line, without duplicates.
+# Declared ports, one per line, without duplicates. A rejected (mixed) port is
+# included: it declares no route, so exposure checks keep it private.
 ts_declared_ports() {
     local route r_port
-    for route in "${ROUTES[@]}"; do
-        IFS='|' read -r r_port _ <<< "$route"
-        echo "$r_port"
-    done | sort -un
+    {
+        for route in "${ROUTES[@]}"; do
+            IFS='|' read -r r_port _ <<< "$route"
+            echo "$r_port"
+        done
+        for r_port in "${REJECTED_PORTS[@]}"; do
+            echo "$r_port"
+        done
+    } | sort -un
 }
 
 # Closes public exposure on a port and restores its declared routes privately.

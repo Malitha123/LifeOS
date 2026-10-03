@@ -24,6 +24,8 @@ Funnel ports are limited to `443`, `8443` and `10000`, and exposure is port-wide
 
 ## Set up the host
 
+The MCP HTTP transport must already run: `LIFEOS_MCP_BEARER_TOKEN` set and the `lifeos-mcp-http` unit enabled, as in [Agent Worker Setup](agent-worker-setup.md#step-3--enable-the-mcp-http-systemd-unit). Without the bearer token the transport does not start.
+
 1. Add to `.env`, with your tailnet hostname and your Tailscale login:
 
    ```bash
@@ -35,7 +37,7 @@ Funnel ports are limited to `443`, `8443` and `10000`, and exposure is port-wide
 
    `tailscale status --json` shows your login under `User`. List only your own login: anyone listed can approve an app.
 
-2. Add the routes to `config/tailscale-routes.local` (the commented block in `config/tailscale-routes.example` has them). Every route on `10000` carries `funnel=on`; the consent route on `8443` does not. A port that mixes the two is refused whole, so a private route can never ride along on a public port.
+2. Add the routes to `config/tailscale-routes.local` (the commented block in `config/tailscale-routes.example` has them). Every route on `10000` carries `funnel=on`; the consent route on `8443` does not. A port that mixes the two is refused whole and kept private, so a declared private route never rides along on a public port.
 
 3. Restart the transport and apply the routes:
 
@@ -66,11 +68,11 @@ The app opens the consent page. Open it on a device that is on the tailnet and s
 ~/.venvs/lifeos/bin/python scripts/mcp_oauth.py revoke <client_id>
 ```
 
-Revoking deletes the app's tokens at once; the app has to be approved again to reconnect. Removing the connector inside the app does not revoke anything on the LifeOS side.
+Revoking deletes the app's registration and tokens at once; to reconnect, the app registers again and is approved again. Removing the connector inside the app does not revoke anything on the LifeOS side.
 
 ## Turn it off
 
-- **Close public access:** set `LIFEOS_TAILSCALE_ALLOW_FUNNEL=false` (or drop the `funnel=on` lines). The infra watchdog turns Funnel off on its next run and re-applies the routes privately.
+- **Close public access:** set `LIFEOS_TAILSCALE_ALLOW_FUNNEL=false` and keep the route lines. The infra watchdog turns Funnel off on its next run and re-applies the routes privately. Deleting the lines instead leaves the port unmanaged, and an already-public port stays public until `tailscale funnel --https=10000 off`.
 - **Disable OAuth entirely:** empty `LIFEOS_OAUTH_OPERATOR_LOGINS` and restart `lifeos-mcp-http`. Every OAuth endpoint then returns `404`, and issued tokens stop working.
 
 ## Troubleshooting
