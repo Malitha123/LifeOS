@@ -17,6 +17,7 @@ import httpx
 import hmac
 import logging
 import os
+from collections import OrderedDict
 from pathlib import Path
 
 # Configure logging to stderr (stdout is for MCP protocol)
@@ -576,6 +577,37 @@ CURATED_ENDPOINTS = {
 # curated tools plus 11 lifeos_agent_* tools = 82.
 CURATED_TOOL_COUNT = 72
 
+# `search` and `fetch` in the shape ChatGPT connectors expect. Offered only to
+# OAuth-authenticated HTTP requests (see `OAuthToolAccess`); the stdio and
+# bearer catalogs do not include them.
+CHATGPT_TOOLS = [
+    {
+        "name": "search",
+        "description": "Search the LifeOS vault. Returns matching documents as {results: [{id, title, url, text}]}; pass an id to fetch for the full document.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Search query."}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "fetch",
+        "description": "Fetch the full text of a document returned by search, as {id, title, text, url, metadata}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "description": "Document id from search results."}},
+            "required": ["id"],
+        },
+    },
+]
+CHATGPT_TOOL_NAMES = frozenset(t["name"] for t in CHATGPT_TOOLS)
+_CHATGPT_SEARCH_TOP_K = 10
+_CHATGPT_SNIPPET_CHARS = 500
+_CHATGPT_FETCH_MAX_CHARS = 200_000
+# Fetch serves only documents a search in this process returned, so it never
+# reaches a vault file the search index did not surface.
+_CHATGPT_FETCHABLE_MAX = 2048
+
 
 class LifeOSMCPServer:
     """MCP Server that dynamically discovers LifeOS API endpoints."""
@@ -595,6 +627,9 @@ class LifeOSMCPServer:
         self._trusted_attempt_id = os.environ.get("LIFEOS_AGENT_ATTEMPT_ID", "").strip()
         self._trusted_turn_id = os.environ.get("LIFEOS_AGENT_TURN_ID", "").strip()
         self._mcp_transport_secret = ""
+        # Vault-relative id -> resolved path for documents `chatgpt_search`
+        # returned; `chatgpt_fetch` serves only these.
+        self._chatgpt_fetchable: OrderedDict[str, Path] = OrderedDict()
         # Per-session tool-result cache. Bypassed when the caller
         # doesn't supply a session id (which is the common case for local-CLI
         # tool calls; cache hits matter most on managed-agent HTTP calls).
@@ -1613,6 +1648,86 @@ class LifeOSMCPServer:
         except httpx.RequestError as e:
             return {"error": f"Request failed: {e}"}
 
+    def _vault_root(self) -> Path:
+        from config.settings import settings as _settings
+
+        return Path(_settings.vault_path).resolve()
+
+    def _vault_document(self, file_path: str) -> tuple[str, Path] | None:
+        """(vault-relative id, resolved path) for a file inside the vault, else None."""
+        if not isinstance(file_path, str) or not file_path:
+            return None
+        root = self._vault_root()
+        candidate = Path(file_path)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            resolved = candidate.resolve()
+            rel = resolved.relative_to(root)
+        except (OSError, ValueError):
+            return None
+        if not resolved.is_file():
+            return None
+        return rel.as_posix(), resolved
+
+    def _obsidian_url(self, rel: str) -> str:
+        from urllib.parse import quote
+
+        return (
+            f"obsidian://open?vault={quote(self._vault_root().name, safe='')}"
+            f"&file={quote(rel, safe='')}"
+        )
+
+    def chatgpt_search(self, arguments: dict) -> dict:
+        """ChatGPT `search`: vault search grouped to one result per document."""
+        query = arguments.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "query must be a non-empty string"}
+        data = self._call_api("lifeos_search", {"query": query.strip(), "top_k": _CHATGPT_SEARCH_TOP_K})
+        if not isinstance(data, dict) or "error" in data:
+            return {"error": (data or {}).get("error", "search failed")}
+        results: list[dict] = []
+        seen: set[str] = set()
+        for item in data.get("results", []):
+            doc = self._vault_document(item.get("file_path", ""))
+            if doc is None or doc[0] in seen:
+                continue
+            rel, resolved = doc
+            seen.add(rel)
+            self._chatgpt_fetchable[rel] = resolved
+            self._chatgpt_fetchable.move_to_end(rel)
+            while len(self._chatgpt_fetchable) > _CHATGPT_FETCHABLE_MAX:
+                self._chatgpt_fetchable.popitem(last=False)
+            results.append({
+                "id": rel,
+                "title": item.get("file_name") or Path(rel).stem,
+                "url": self._obsidian_url(rel),
+                "text": (item.get("content") or "")[:_CHATGPT_SNIPPET_CHARS],
+            })
+        return {"results": results}
+
+    def chatgpt_fetch(self, arguments: dict) -> dict:
+        """ChatGPT `fetch`: the full text of a document an earlier search returned."""
+        doc_id = arguments.get("id")
+        fetchable = self._chatgpt_fetchable
+        if not isinstance(doc_id, str) or doc_id not in fetchable:
+            return {"error": "unknown document id; call search first"}
+        doc = self._vault_document(str(fetchable[doc_id]))
+        if doc is None or doc[0] != doc_id:
+            return {"error": "document is no longer available"}
+        rel, resolved = doc
+        try:
+            text = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return {"error": "document could not be read"}
+        return {
+            "id": rel,
+            "title": resolved.stem,
+            "text": text[:_CHATGPT_FETCH_MAX_CHARS],
+            "url": self._obsidian_url(rel),
+            "metadata": {"path": rel, "truncated": len(text) > _CHATGPT_FETCH_MAX_CHARS},
+        }
+
     @staticmethod
     def _cache_eligible(tool_name: str) -> bool:
         """Tools whose results are safe to cache for 60s within a session.
@@ -2569,11 +2684,77 @@ def _err(request_id, message: str, code: int = -32000) -> dict:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def dispatch(server: "LifeOSMCPServer", request: dict) -> dict | None:
+class OAuthToolAccess:
+    """Tool view for an OAuth-authenticated HTTP request.
+
+    Lists and calls only tools in `api/services/mcp_tool_tier.OAUTH_TOOL_TIER`
+    marked allowed, with annotations, plus the ChatGPT-shaped `search` and
+    `fetch` wrappers. A tool outside the tier is reported exactly like an
+    unknown tool.
+    """
+
+    def __init__(self, server: "LifeOSMCPServer"):
+        from api.services.mcp_tool_tier import OAUTH_ALLOWED_TOOLS, tool_annotations
+
+        self.server = server
+        self.allowed = OAUTH_ALLOWED_TOOLS
+        self._annotations = tool_annotations
+
+    def tools(self) -> list[dict]:
+        listed = []
+        for tool in [*self.server.tools, *CHATGPT_TOOLS]:
+            if tool["name"] in self.allowed:
+                listed.append({**tool, "annotations": self._annotations(tool["name"])})
+        return listed
+
+    def callable(self, name: object) -> bool:
+        if not isinstance(name, str) or name not in self.allowed:
+            return False
+        return name in CHATGPT_TOOL_NAMES or any(t["name"] == name for t in self.server.tools)
+
+    def call(self, name: str, arguments: object) -> dict:
+        from api.services.mcp_tool_tier import check_oauth_arguments
+
+        if not isinstance(arguments, dict):
+            return _tool_error("arguments must be an object")
+        refusal = check_oauth_arguments(name, arguments)
+        if refusal:
+            return _tool_error(refusal)
+        if name in CHATGPT_TOOL_NAMES:
+            if name == "search":
+                payload = self.server.chatgpt_search(arguments)
+            else:
+                payload = self.server.chatgpt_fetch(arguments)
+            if "error" in payload:
+                return _tool_error(payload["error"])
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "structuredContent": payload,
+            }
+        data = self.server._call_api(name, arguments)
+        text = self.server._format_response(name, data, arguments)
+        result = {"content": [{"type": "text", "text": text}]}
+        if isinstance(data, dict) and "error" in data:
+            result["isError"] = True
+        return result
+
+
+def _tool_error(message: str) -> dict:
+    return {"content": [{"type": "text", "text": f"Error: {message}"}], "isError": True}
+
+
+def dispatch(
+    server: "LifeOSMCPServer",
+    request: dict,
+    *,
+    access: OAuthToolAccess | None = None,
+) -> dict | None:
     """Handle a single JSON-RPC request.
 
     Returns the response dict, or None for notifications (requests with no id).
     Used by both the stdio and HTTP transports so behavior stays identical.
+    `access` is set only for an OAuth-authenticated HTTP request; it narrows
+    `tools/list` and `tools/call` to the OAuth tool tier.
     """
     method = request.get("method")
     request_id = request.get("id")
@@ -2592,7 +2773,18 @@ def dispatch(server: "LifeOSMCPServer", request: dict) -> dict | None:
             return None
 
         if method == "tools/list":
-            return None if is_notification else _ok(request_id, {"tools": server.tools})
+            tools = access.tools() if access is not None else server.tools
+            return None if is_notification else _ok(request_id, {"tools": tools})
+
+        if method == "tools/call" and access is not None:
+            params = request.get("params") or {}
+            tool_name = params.get("name")
+            if not access.callable(tool_name):
+                return None if is_notification else _err(
+                    request_id, f"Unknown tool: {tool_name}", code=-32602,
+                )
+            result = access.call(tool_name, params.get("arguments") or {})
+            return None if is_notification else _ok(request_id, result)
 
         if method == "tools/call":
             params = request.get("params", {})
@@ -2638,13 +2830,18 @@ def run_stdio(server: "LifeOSMCPServer") -> None:
             print(json.dumps(response), flush=True)
 
 
-def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
+def build_http_app(server: "LifeOSMCPServer", bearer_token: str, oauth=None):
     """Build a FastAPI app exposing the MCP server over HTTP.
 
     A non-empty `bearer_token` is required — the HTTP transport is intended for
     public exposure (e.g., behind a Cloudflare Tunnel for Anthropic Managed
     Agents), so unauthenticated mode is not allowed. Local Claude Code keeps
     using the stdio transport, which has no bearer check.
+
+    `oauth` (an `api.services.mcp_oauth.OAuthConfig`) additionally mounts the
+    single-operator OAuth 2.1 endpoints and accepts their access tokens on the
+    MCP endpoint, restricted to the OAuth tool tier. The bearer token keeps
+    full access either way.
     """
     if not bearer_token:
         raise ValueError(
@@ -2664,14 +2861,37 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
 
     app = FastAPI(title="LifeOS MCP", docs_url=None, redoc_url=None, openapi_url=None)
 
-    def _check_auth(request: Request) -> None:
+    oauth_access = None
+    if oauth is not None:
+        from api.services.mcp_oauth import TIER_READ_SAFE_WRITES
+        from api.services.mcp_oauth_http import install_oauth_routes
+
+        install_oauth_routes(app, oauth, bearer_token=bearer_token)
+        oauth_access = OAuthToolAccess(server)
+
+    def _unauthorized(detail: str, *, invalid_token: bool) -> HTTPException:
+        headers = None
+        if oauth is not None:
+            challenge = f'Bearer resource_metadata="{oauth.resource_metadata_url}"'
+            if invalid_token:
+                challenge += ', error="invalid_token"'
+            headers = {"WWW-Authenticate": challenge}
+        return HTTPException(status_code=401, detail=detail, headers=headers)
+
+    def _check_auth(request: Request) -> OAuthToolAccess | None:
+        """None for the bearer token (full access); the tier view for an OAuth token."""
         header = request.headers.get("authorization", "")
         scheme, _, token = header.partition(" ")
         token = token.strip()
         if scheme.lower() != "bearer" or not token:
-            raise HTTPException(status_code=401, detail="missing bearer token")
-        if not hmac.compare_digest(token, bearer_token):
-            raise HTTPException(status_code=401, detail="invalid bearer token")
+            raise _unauthorized("missing bearer token", invalid_token=False)
+        if hmac.compare_digest(token, bearer_token):
+            return None
+        if oauth is not None:
+            grant = oauth.store.validate_access_token(token, resource=oauth.resource)
+            if grant is not None and grant.tier == TIER_READ_SAFE_WRITES:
+                return oauth_access
+        raise _unauthorized("invalid bearer token", invalid_token=True)
 
     def _parse_error_response() -> JSONResponse:
         """JSON-RPC -32700 Parse error per the spec — id is null when unparseable."""
@@ -2683,19 +2903,21 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
         return JSONResponse(envelope, status_code=400)
 
     async def _handle(request: Request) -> Response:
-        _check_auth(request)
+        access = _check_auth(request)
         try:
             body = await request.json()
         except json.JSONDecodeError:
             return _parse_error_response()
 
         if isinstance(body, list):
-            responses = [r for r in (dispatch(server, req) for req in body) if r is not None]
+            responses = [
+                r for r in (dispatch(server, req, access=access) for req in body) if r is not None
+            ]
             if not responses:
                 return Response(status_code=202)
             return JSONResponse(responses)
 
-        response = dispatch(server, body)
+        response = dispatch(server, body, access=access)
         if response is None:
             return Response(status_code=202)
         return JSONResponse(response)
@@ -2711,11 +2933,13 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
     return app
 
 
-def run_http(server: "LifeOSMCPServer", host: str, port: int, bearer_token: str) -> None:
+def run_http(
+    server: "LifeOSMCPServer", host: str, port: int, bearer_token: str, oauth=None,
+) -> None:
     """Run the HTTP transport via uvicorn."""
     import uvicorn  # local import — only needed for HTTP mode
 
-    app = build_http_app(server, bearer_token=bearer_token)
+    app = build_http_app(server, bearer_token=bearer_token, oauth=oauth)
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
@@ -2758,7 +2982,40 @@ def main():
         sys.exit(2)
 
     logger.info(f"LifeOS MCP HTTP transport listening on {args.host}:{args.port}")
-    run_http(server, host=args.host, port=args.port, bearer_token=bearer_token)
+    run_http(
+        server, host=args.host, port=args.port, bearer_token=bearer_token,
+        oauth=_oauth_config_from_settings(),
+    )
+
+
+def _oauth_config_from_settings():
+    """OAuthConfig when `LIFEOS_OAUTH_OPERATOR_LOGINS` and an https `LIFEOS_OAUTH_ISSUER_URL` are set."""
+    from config.settings import settings as _settings
+
+    logins = frozenset(
+        login.strip().lower()
+        for login in (_settings.oauth_operator_logins or "").split(",")
+        if login.strip()
+    )
+    if not logins:
+        return None
+    issuer = (_settings.oauth_issuer_url or "").strip().rstrip("/")
+    if not issuer.startswith("https://"):
+        logger.error(
+            "LIFEOS_OAUTH_OPERATOR_LOGINS is set but LIFEOS_OAUTH_ISSUER_URL is not an "
+            "https URL; OAuth stays disabled."
+        )
+        return None
+    from api.services.mcp_oauth import OAuthConfig, OAuthStore
+
+    store = OAuthStore(Path(_settings.chroma_path).parent / "mcp_oauth.db")
+    logger.info("MCP OAuth enabled for %d operator login(s)", len(logins))
+    return OAuthConfig(
+        issuer=issuer,
+        operator_logins=logins,
+        store=store,
+        authorize_url=(_settings.oauth_authorize_url or "").strip(),
+    )
 
 
 if __name__ == "__main__":

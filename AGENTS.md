@@ -69,6 +69,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | What can I do with tasks (statuses, API, chat)? | [specs/product/task-management.md](docs/specs/product/task-management.md) |
 | How do I set up the agent worker? | [guides/agent-worker-setup.md](docs/guides/agent-worker-setup.md) |
 | How does the doctor self-repair bot work? | [guides/doctor-bot.md](docs/guides/doctor-bot.md) |
+| How do Claude/ChatGPT apps authenticate to MCP, and which tools can they use? | [specs/technical/mcp-oauth.md](docs/specs/technical/mcp-oauth.md) |
 | How do agents hand work to the human? | [guides/human-queue.md](docs/guides/human-queue.md) |
 | How do I pause/resume household internet access via eero? | [guides/home-eero.md](docs/guides/home-eero.md) |
 | How do schedules (triggers + actions) work? | [guides/scheduler.md](docs/guides/scheduler.md) |
