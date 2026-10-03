@@ -9,6 +9,7 @@ This directory contains technical specifications — how the system is built fro
 - `claude-code-orchestration.md` — Implementation of the Claude Code orchestration surface (skill discovery, MCP server wiring)
 - `data-and-sync.md` — Seven-phase nightly sync pipeline; per-phase responsibilities and failure modes
 - `frontend.md` — Vanilla HTML/JS architecture (no build step), shared components, page conventions
+- `mcp-oauth.md` — Single-operator OAuth 2.1 on the MCP HTTP transport (tailnet-identity consent, token store, connected-app tool tier)
 - `observability.md` — Performance tracing (spans, SQLite), health checks, alerting tiers
 - `scheduler.md` — Scheduler internals (markdown source of truth + index cache, round-trip, watcher reindex, firing/dispatch)
 - `search-indexing.md` — Hybrid search internals (vector + BM25 fusion, embedding pipeline integration)

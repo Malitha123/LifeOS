@@ -151,7 +151,7 @@ Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012
 
 ## MCP HTTP Transport
 
-The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropic Managed Agents — see [ADR-008](../adr/008-managed-agents-cloud-routing.md)). Bearer-token gated. See [agent-worker-setup.md](agent-worker-setup.md#mcp-http-transport) for the operator setup.
+The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropic Managed Agents — see [ADR-008](../adr/008-managed-agents-cloud-routing.md)). Bearer-token gated; with the `LIFEOS_OAUTH_*` settings it also issues OAuth tokens for connected apps, limited to a restricted tool tier ([mcp-oauth.md](../specs/technical/mcp-oauth.md)). See [agent-worker-setup.md](agent-worker-setup.md#mcp-http-transport) for the operator setup.
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
@@ -159,6 +159,10 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_MCP_HTTP_PORT` | int | `8765` | Port. |
 | `LIFEOS_MCP_BEARER_TOKEN` | str | — | Required for any non-loopback request. Generate with `openssl rand -hex 32`. Treat as a secret. |
 | `LIFEOS_MCP_HTTP_URL` | str | — | Public URL Managed Agents uses to reach the MCP server. |
+| `LIFEOS_OAUTH_OPERATOR_LOGINS` | str (comma-separated) | — | Tailscale logins (e.g. `operator@example.com`) allowed to approve an app on the MCP OAuth consent page. Empty disables every OAuth endpoint, so a fresh install stays bearer-only. See [mcp-oauth.md](../specs/technical/mcp-oauth.md). |
+| `LIFEOS_OAUTH_ISSUER_URL` | str | — | Public `https://` base URL of the MCP HTTP transport. Advertised as the OAuth issuer; the protected resource is `<issuer>/mcp`. OAuth stays disabled unless this is an `https` URL. |
+| `LIFEOS_OAUTH_ALLOWED_REDIRECT_HOSTS` | str (comma-separated) | `claude.ai,claude.com,chatgpt.com` | Hosts an `https` redirect URI may name at OAuth dynamic client registration (exact host match). Loopback redirects (`localhost`, `127.0.0.1`, `[::1]`, any port) are always allowed, and are the only `http` redirects accepted. Add a host to connect another OAuth app. |
+| `LIFEOS_OAUTH_AUTHORIZE_URL` | str | `<issuer>/oauth/authorize` | Consent-page URL advertised as the authorization endpoint. Set it when the consent page is served on a tailnet-only origin different from the public issuer. |
 
 ## Agent Worker — Defaults and Budgets
 

@@ -757,6 +757,30 @@ class Settings(BaseSettings):
         description="Bearer token required by the MCP HTTP transport. Generate with "
                     "`openssl rand -hex 32`. Empty disables the HTTP transport."
     )
+    oauth_operator_logins: str = Field(
+        default="",
+        alias="LIFEOS_OAUTH_OPERATOR_LOGINS",
+        description="Comma-separated Tailscale logins allowed to approve apps on the MCP "
+                    "OAuth consent page. Empty disables the OAuth endpoints entirely."
+    )
+    oauth_issuer_url: str = Field(
+        default="",
+        alias="LIFEOS_OAUTH_ISSUER_URL",
+        description="Public https base URL of the MCP HTTP transport, advertised as the "
+                    "OAuth issuer and used to build the metadata, token and resource URLs."
+    )
+    oauth_allowed_redirect_hosts: str = Field(
+        default="claude.ai,claude.com,chatgpt.com",
+        alias="LIFEOS_OAUTH_ALLOWED_REDIRECT_HOSTS",
+        description="Comma-separated hosts an https OAuth redirect URI may name at dynamic "
+                    "client registration. Loopback redirects are always allowed."
+    )
+    oauth_authorize_url: str = Field(
+        default="",
+        alias="LIFEOS_OAUTH_AUTHORIZE_URL",
+        description="Tailnet-only URL of the OAuth consent page, when it is served on a "
+                    "different origin from the issuer. Empty means <issuer>/oauth/authorize."
+    )
 
     # Agent Worker — external worker that picks up #agent-tagged tasks.
     # See docs/guides/agent-worker-setup.md and epic #98 for the full design.
