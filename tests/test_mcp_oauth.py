@@ -33,6 +33,7 @@ OTHER_OPERATOR = "second.operator@example.com"
 CLAUDE_REDIRECT = "https://claude.example.com/api/mcp/auth_callback"
 OPERATOR_HEADERS = {"Tailscale-User-Login": OPERATOR}
 LOOPBACK = ("127.0.0.1", 51000)
+ALLOWED_HOSTS = frozenset({"claude.example.com", "app.example.com", "spam.example.com"})
 
 
 class Clock:
@@ -106,7 +107,8 @@ def server(monkeypatch, calls, vault) -> mcp_server.LifeOSMCPServer:
 
 @pytest.fixture
 def config(store) -> OAuthConfig:
-    return OAuthConfig(issuer=ISSUER, operator_logins=frozenset({OPERATOR, OTHER_OPERATOR}), store=store)
+    return OAuthConfig(issuer=ISSUER, operator_logins=frozenset({OPERATOR, OTHER_OPERATOR}), store=store,
+                       allowed_redirect_hosts=ALLOWED_HOSTS)
 
 
 @pytest.fixture
@@ -287,12 +289,115 @@ def test_registration_spam_does_not_lock_out_a_real_app(client, store):
     assert "spam.example.com" not in page.text
 
 
-def test_storage_ceiling_rejects_only_beyond_it(client, monkeypatch):
+def _spam(client: TestClient, n: int) -> None:
+    for _ in range(n):
+        resp = client.post("/oauth/register", json={"redirect_uris": ["https://spam.example.com/cb"]})
+        assert resp.status_code == 201
+
+
+def test_registration_at_the_ceiling_evicts_the_oldest_unprotected(client, store, monkeypatch, calls):
+    monkeypatch.setattr(mcp_oauth, "MAX_PENDING_CLIENTS", 5)
+    _spam(client, 5)
+    real = _register(client)["client_id"]
+    verifier, challenge = _pkce()
+    form = _consent_form(client.get("/oauth/authorize", params=_authorize_params(real, challenge),
+                                    headers=OPERATOR_HEADERS))
+    _spam(client, 12)  # keeps evicting; the consent-protected registration survives
+    assert sum(1 for c in store.list_clients() if c["approved_at"] is None) == 5
+    resp = _post_form(client, "/oauth/authorize", {**form, "decision": "approve"}, OPERATOR_HEADERS)
+    assert resp.status_code == 303
+    code = parse_qs(urlsplit(resp.headers["location"]).query)["code"][0]
+    _spam(client, 6)
+    tokens = _exchange(client, real, code, verifier).json()
+    body = _rpc(client, tokens["access_token"], "tools/call", {"name": "lifeos_health", "arguments": {}}).json()
+    assert "result" in body
+    assert calls == [("lifeos_health", {})]
+
+
+def test_registration_is_refused_only_when_every_slot_is_consent_protected(client, monkeypatch):
     monkeypatch.setattr(mcp_oauth, "MAX_PENDING_CLIENTS", 2)
-    _register(client)
-    _register(client)
+    for _ in range(2):
+        client_id = _register(client)["client_id"]
+        _, challenge = _pkce()
+        assert client.get("/oauth/authorize", params=_authorize_params(client_id, challenge),
+                          headers=OPERATOR_HEADERS).status_code == 200
     resp = client.post("/oauth/register", json={"redirect_uris": [CLAUDE_REDIRECT]})
     assert resp.status_code == 429
+
+
+@pytest.mark.parametrize("uri", [
+    "https://attacker.example.net/cb",
+    "https://claude.example.com.attacker.example.net/cb",
+    "https://claude.example.com@attacker.example.net/cb",
+    "http://claude.example.com/cb",
+])
+def test_registration_rejects_a_redirect_host_outside_the_allowlist(client, uri):
+    resp = client.post("/oauth/register", json={"redirect_uris": [uri]})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_redirect_uri"
+
+
+def test_default_redirect_allowlist_is_the_claude_and_chatgpt_hosts(server, store):
+    cfg = OAuthConfig(issuer=ISSUER, operator_logins=frozenset({OPERATOR}), store=store)
+    c = TestClient(mcp_server.build_http_app(server, bearer_token=BEARER, oauth=cfg), client=LOOPBACK)
+    for uri in ("https://claude.ai/api/mcp/auth_callback", "https://chatgpt.com/connector_platform_oauth_redirect",
+                "https://claude.com/cb", "https://127.0.0.1:8443/cb", "http://localhost:3118/callback"):
+        assert c.post("/oauth/register", json={"redirect_uris": [uri]}).status_code == 201, uri
+    resp = c.post("/oauth/register", json={"redirect_uris": [CLAUDE_REDIRECT]})
+    assert resp.status_code == 400
+
+
+def test_allowed_redirect_hosts_setting_reaches_the_config(monkeypatch, tmp_path):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "oauth_operator_logins", OPERATOR)
+    monkeypatch.setattr(settings, "oauth_issuer_url", ISSUER)
+    monkeypatch.setattr(settings, "oauth_allowed_redirect_hosts", " Claude.AI , chatgpt.com ,")
+    monkeypatch.setattr(settings, "chroma_path", str(tmp_path / "chromadb"))
+    cfg = mcp_server._oauth_config_from_settings()
+    assert cfg.allowed_redirect_hosts == frozenset({"claude.ai", "chatgpt.com"})
+
+
+def test_approval_survives_a_prune_at_the_ttl_boundary(client, store, clock):
+    """A prune that lands mid-approval cannot delete the client being approved."""
+    import threading
+
+    client_id = _register(client)["client_id"]
+    clock.now += 14 * 60
+    verifier, challenge = _pkce()
+    form = _consent_form(client.get("/oauth/authorize", params=_authorize_params(client_id, challenge),
+                                    headers=OPERATOR_HEADERS))
+    clock.now += 2 * 60  # 16 minutes after registration
+    pruner = threading.Thread(target=store.prune)
+
+    def interleave_prune():
+        pruner.start()
+        pruner.join(timeout=1.0)  # a prune that can run now, runs to completion here
+
+    store._after_consent_consumed = interleave_prune
+    resp = _post_form(client, "/oauth/authorize", {**form, "decision": "approve"}, OPERATOR_HEADERS)
+    pruner.join(timeout=15)
+    assert not pruner.is_alive()
+    assert resp.status_code == 303, resp.text
+    code = parse_qs(urlsplit(resp.headers["location"]).query)["code"][0]
+    assert _exchange(client, client_id, code, verifier).status_code == 200
+
+
+def test_prune_spares_a_client_holding_an_unexpired_code(store, clock):
+    info = store.register_client({"redirect_uris": [CLAUDE_REDIRECT]}, allowed_redirect_hosts=ALLOWED_HOSTS)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "INSERT INTO auth_codes (code_hash, client_id, redirect_uri, code_challenge, resource, tier, "
+            "expires_at) VALUES ('h', ?, ?, 'c', ?, 't', ?)",
+            (info["client_id"], CLAUDE_REDIRECT, RESOURCE, clock.now + 20 * 60),
+        )
+    conn.close()
+    clock.now += 16 * 60
+    store.prune()
+    assert store.get_client(info["client_id"]) is not None
+    clock.now += 5 * 60
+    store.prune()
+    assert store.get_client(info["client_id"]) is None
 
 
 def test_unapproved_registrations_expire_after_fifteen_minutes(client, clock, store):
@@ -436,6 +541,9 @@ def test_plain_task_create_is_allowed(client, calls):
     {"description": "Synthetic task", "tags": ["\uff03claude"]},
     {"description": "Synthetic task", "tags": ["ok\n#claude"]},
     {"description": "Synthetic task", "tags": ["ok #errand"]},
+    {"description": "Synthetic task", "tags": ["errand\n"]},
+    {"description": "Synthetic task", "tags": ["errand\r"]},
+    {"description": "Synthetic task", "tags": ["\uff43odex"]},
     {"description": "Synthetic task \uff03claude"},
     {"description": "Synthetic task #\uff43laude"},
     {"description": "Synthetic task\n- [ ] TODO #claude"},
@@ -443,6 +551,7 @@ def test_plain_task_create_is_allowed(client, calls):
     {"description": "Synthetic task", "priority": "#cloud"},
     {"description": "Synthetic task", "operation_key": "k #agent"},
 ], ids=["embedded-tag", "comma-tag", "fullwidth-hash-tag", "newline-tag", "spaced-tag",
+        "trailing-newline-tag", "trailing-cr-tag", "fullwidth-letter-tag",
         "fullwidth-hash-description", "fullwidth-letters-description", "newline-description",
         "notes-checkbox", "priority-tag", "operation-key-tag"])
 def test_task_create_refuses_smuggled_tags(client, calls, arguments):
@@ -479,8 +588,9 @@ def test_task_create_default_context_requires_an_existing_inbox(client, calls, v
     assert calls == [("lifeos_task_create", args)]
 
 
-def test_oauth_task_create_end_to_end_never_yields_an_engine_tag(client, server, vault, tmp_path):
-    """Drive the real task route and TaskManager behind the MCP server."""
+@pytest.fixture
+def real_tasks(server, vault, tmp_path, monkeypatch):
+    """The real task route and TaskManager behind the MCP server's API calls."""
     from fastapi import FastAPI
 
     from api.routes import tasks as task_routes
@@ -490,29 +600,75 @@ def test_oauth_task_create_end_to_end_never_yields_an_engine_tag(client, server,
                           live_session_checker=lambda *a: False, live_coordinator_checker=lambda *a: False)
     backend = FastAPI()
     backend.include_router(task_routes.router)
+    monkeypatch.setattr(task_routes, "get_task_manager", lambda: manager)
+    monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", _ORIGINAL_CALL_API)
+    monkeypatch.setattr(mcp_server, "API_BASE", "http://testserver")
+    server.client = TestClient(backend)
+    return manager
+
+
+def _create_task(client: TestClient, token: str, arguments: dict) -> dict:
+    return _rpc(client, token, "tools/call",
+                {"name": "lifeos_task_create", "arguments": arguments}).json()["result"]
+
+
+FORBIDDEN = {"agent", "claude", "codex", "hermes", "local", "cloud", "cloud-haiku", "cloud-sonnet", "human"}
+
+
+def test_oauth_task_create_end_to_end_never_yields_an_engine_tag(client, real_tasks, tmp_path):
     _, tokens, _ = _connect(client)
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(task_routes, "get_task_manager", lambda: manager)
-        mp.setattr(mcp_server.LifeOSMCPServer, "_call_api", _ORIGINAL_CALL_API)
-        mp.setattr(mcp_server, "API_BASE", "http://testserver")
-        server.client = TestClient(backend)
-        for arguments in (
-            {"description": "Synthetic execution request", "tags": ["ordinary #codex"]},
-            {"description": "Synthetic task #codex"},
-            {"description": "Synthetic task", "context": str(tmp_path / "outside")},
-        ):
-            result = _rpc(client, tokens["access_token"], "tools/call",
-                          {"name": "lifeos_task_create", "arguments": arguments}).json()["result"]
-            assert result["isError"] is True, arguments
-        ok = _rpc(client, tokens["access_token"], "tools/call", {
-            "name": "lifeos_task_create",
-            "arguments": {"description": "Synthetic errand", "tags": ["errand"], "context": "Personal"},
-        }).json()["result"]
-        assert "isError" not in ok, ok
-    manager.rebuild_index()
-    reparsed = [set(t.tags) for t in manager._tasks.values()]
-    assert reparsed == [{"errand"}]
+    for arguments in (
+        {"description": "Synthetic execution request", "tags": ["ordinary #codex"]},
+        {"description": "Synthetic task #codex"},
+        {"description": "Synthetic task", "context": str(tmp_path / "outside")},
+        {"description": "Synthetic task", "tags": ["errand\n"]},
+    ):
+        assert _create_task(client, tokens["access_token"], arguments)["isError"] is True, arguments
+    ok = _create_task(client, tokens["access_token"],
+                      {"description": "Synthetic errand", "tags": ["errand"], "context": "Personal"})
+    assert "isError" not in ok, ok
+    real_tasks.rebuild_index()
+    assert [set(t.tags) for t in real_tasks._tasks.values()] == [{"errand"}]
     assert (tmp_path / "outside.md").read_text() == "outside the vault\n"
+
+
+def test_cyrillic_lookalike_tag_never_becomes_an_engine_tag(client, real_tasks):
+    _, tokens, _ = _connect(client)
+    lookalike = "c\u043edex"  # Cyrillic small o
+    result = _create_task(client, tokens["access_token"], {"description": f"Synthetic #{lookalike} note"})
+    assert "isError" not in result, result
+    real_tasks.rebuild_index()
+    tags = {tag for t in real_tasks._tasks.values() for tag in t.tags}
+    assert tags == {lookalike}
+    assert not {t.lower() for t in tags} & FORBIDDEN
+
+
+def test_fullwidth_engine_tag_is_refused_end_to_end(client, real_tasks):
+    _, tokens, _ = _connect(client)
+    for arguments in ({"description": "Synthetic \uff03codex"}, {"description": "Synthetic #\uff43odex"},
+                      {"description": "Synthetic", "tags": ["\uff43odex"]}):
+        assert _create_task(client, tokens["access_token"], arguments)["isError"] is True, arguments
+    assert real_tasks._tasks == {}
+
+
+def test_watcher_reindex_of_oauth_created_tasks_yields_no_forbidden_tag(client, real_tasks):
+    _, tokens, _ = _connect(client)
+    attempts = [
+        {"description": "Synthetic errand", "tags": ["errand"], "context": "Personal"},
+        {"description": "Synthetic plain task"},
+        {"description": "Synthetic", "notes": "first\n- [ ] TODO #claude\n#hermes", "context": "Personal"},
+        {"description": "Synthetic #c\u043edex", "context": "Personal"},
+        {"description": "Synthetic", "tags": ["ok #codex"], "context": "Personal"},
+    ]
+    for arguments in attempts:
+        _create_task(client, tokens["access_token"], arguments)
+    tasks_dir = real_tasks.tasks_dir
+    for name in ("Personal.md", "Inbox.md"):
+        real_tasks.reindex_file(str(tasks_dir / name))
+    tags = {tag.lower() for t in real_tasks._tasks.values() for tag in t.tags}
+    assert {"errand"} <= tags
+    assert not tags & FORBIDDEN
+    assert not any(t.startswith("agent") for t in tags)
 
 
 @pytest.mark.parametrize("arguments", [
@@ -952,7 +1108,8 @@ def test_empty_operator_logins_disables_oauth(monkeypatch):
 
 
 def test_empty_login_set_refuses_every_consent(server, store):
-    cfg = OAuthConfig(issuer=ISSUER, operator_logins=frozenset(), store=store)
+    cfg = OAuthConfig(issuer=ISSUER, operator_logins=frozenset(), store=store,
+                      allowed_redirect_hosts=ALLOWED_HOSTS)
     c = TestClient(mcp_server.build_http_app(server, bearer_token=BEARER, oauth=cfg),
                    client=LOOPBACK, follow_redirects=False)
     client_id = _register(c)["client_id"]

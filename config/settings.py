@@ -769,6 +769,12 @@ class Settings(BaseSettings):
         description="Public https base URL of the MCP HTTP transport, advertised as the "
                     "OAuth issuer and used to build the metadata, token and resource URLs."
     )
+    oauth_allowed_redirect_hosts: str = Field(
+        default="claude.ai,claude.com,chatgpt.com",
+        alias="LIFEOS_OAUTH_ALLOWED_REDIRECT_HOSTS",
+        description="Comma-separated hosts an https OAuth redirect URI may name at dynamic "
+                    "client registration. Loopback redirects are always allowed."
+    )
     oauth_authorize_url: str = Field(
         default="",
         alias="LIFEOS_OAUTH_AUTHORIZE_URL",

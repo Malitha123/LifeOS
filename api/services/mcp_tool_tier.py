@@ -166,7 +166,7 @@ _TASK_CREATE_KEYS = frozenset(
     {"description", "context", "status", "priority", "due_date", "tags", "notes", "operation_key"}
 )
 # One canonical tag per list entry: no `#`, whitespace, punctuation or markup.
-_CANONICAL_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,63}$")
+_CANONICAL_TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_/-]{0,63}")
 _SINGLE_LINE_KEYS = ("description", "context", "status", "priority", "due_date", "operation_key")
 _TAG_REFUSAL = "engine, execution and #human tags cannot be set by connected apps"
 
@@ -217,7 +217,7 @@ def _check_task_create(arguments: dict, existing_contexts: Callable[[], set[str]
     if tags is not None:
         if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
             return "tags must be a list of strings"
-        if not all(_CANONICAL_TAG_RE.match(t) for t in tags):
+        if not all(_CANONICAL_TAG_RE.fullmatch(t) for t in tags):
             return "each tag must be one plain tag (letters, digits, _ / -), without '#'"
         if any(_forbidden_tag(t) for t in tags):
             return _TAG_REFUSAL

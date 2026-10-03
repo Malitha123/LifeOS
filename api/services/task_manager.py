@@ -74,12 +74,12 @@ _RESERVED_FIELD_KEYS = _KNOWN_FIELD_KEYS | {"id"}
 _FIELD_KEY_RE = re.compile(r"^\w+$")
 # A context names its file, `<tasks_dir>/<context>.md`, so it is a single
 # plain file-name stem: no path separators, dots or leading punctuation.
-CONTEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _&'-]{0,63}$")
+CONTEXT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _&'-]{0,63}")
 
 
 def validate_context(context: object) -> None:
     """Raise `ValueError` unless `context` is a plain context name (`CONTEXT_RE`)."""
-    if not isinstance(context, str) or not CONTEXT_RE.match(context):
+    if not isinstance(context, str) or not CONTEXT_RE.fullmatch(context):
         raise ValueError(
             "context must be 1-64 letters, digits, spaces or _&'- characters, "
             "starting with a letter or digit"

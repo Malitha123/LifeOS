@@ -27,6 +27,7 @@ import json
 import logging
 import secrets
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -49,11 +50,22 @@ REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 3600
 PENDING_CONSENT_TTL_SECONDS = 600
 # Unauthenticated DCR must neither grow the store without bound nor lock out a
 # real app. An unapproved registration older than UNAPPROVED_CLIENT_TTL_SECONDS
-# with no consent pending is deleted on every registration and authorization
-# request, and registration is refused only while MAX_PENDING_CLIENTS
-# unapproved registrations exist.
+# is deleted on every registration and authorization request. At
+# MAX_PENDING_CLIENTS unapproved registrations, a new one evicts the oldest;
+# a registration with a live consent or an unexpired code is never deleted
+# by either path.
 UNAPPROVED_CLIENT_TTL_SECONDS = 15 * 60
 MAX_PENDING_CLIENTS = 5000
+# Hosts an https redirect URI may name; loopback hosts are always allowed.
+DEFAULT_ALLOWED_REDIRECT_HOSTS = frozenset({"claude.ai", "claude.com", "chatgpt.com"})
+# SQL predicate: this unapproved client is not protected by a live consent or
+# an unexpired, unused code. Takes the current time as its only parameter.
+_UNPROTECTED_CLIENT_SQL = (
+    "NOT EXISTS (SELECT 1 FROM pending_consents p WHERE p.client_id = clients.client_id "
+    "AND p.expires_at > :now) "
+    "AND NOT EXISTS (SELECT 1 FROM auth_codes a WHERE a.client_id = clients.client_id "
+    "AND a.used_at IS NULL AND a.expires_at > :now)"
+)
 MAX_REDIRECT_URIS = 10
 MAX_URI_LENGTH = 2048
 MAX_CLIENT_NAME_LENGTH = 100
@@ -98,8 +110,8 @@ def is_pkce_value(value: str) -> bool:
     return all(ch in allowed for ch in value)
 
 
-def validate_redirect_uri(uri: object) -> str:
-    """Return `uri` if it is an absolute https URI or an http loopback URI."""
+def validate_redirect_uri(uri: object, allowed_hosts: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_HOSTS) -> str:
+    """Return `uri` if it is an https URI on an allowed host, or a loopback URI on any port."""
     if not isinstance(uri, str) or not uri or len(uri) > MAX_URI_LENGTH:
         raise OAuthError("invalid_redirect_uri", "redirect_uris must be non-empty strings")
     parts = urlsplit(uri)
@@ -108,13 +120,13 @@ def validate_redirect_uri(uri: object) -> str:
     if any(ord(ch) < 0x21 for ch in uri):
         raise OAuthError("invalid_redirect_uri", "redirect URI contains whitespace or control characters")
     host = (parts.hostname or "").lower()
-    if parts.scheme == "https" and host:
+    if parts.scheme in ("http", "https") and host in LOOPBACK_HOSTS:
         return uri
-    if parts.scheme == "http" and host in LOOPBACK_HOSTS:
+    if parts.scheme == "https" and host and host in allowed_hosts:
         return uri
     raise OAuthError(
         "invalid_redirect_uri",
-        "redirect URIs must use https, or http on a loopback host",
+        "redirect URIs must use https on an allowed host, or a loopback host",
     )
 
 
@@ -143,6 +155,7 @@ class OAuthConfig:
     operator_logins: frozenset[str]
     store: "OAuthStore"
     authorize_url: str = ""
+    allowed_redirect_hosts: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_HOSTS
 
     def __post_init__(self):
         object.__setattr__(self, "issuer", self.issuer.rstrip("/"))
@@ -153,6 +166,11 @@ class OAuthConfig:
         )
         if not self.authorize_url:
             object.__setattr__(self, "authorize_url", f"{self.issuer}/oauth/authorize")
+        object.__setattr__(
+            self,
+            "allowed_redirect_hosts",
+            frozenset(h.strip().lower() for h in self.allowed_redirect_hosts if h.strip()),
+        )
 
     @property
     def resource(self) -> str:
@@ -282,7 +300,12 @@ class OAuthStore:
 
     # ── Clients ────────────────────────────────────────────────────────
 
-    def register_client(self, metadata: dict) -> dict:
+    def register_client(
+        self,
+        metadata: dict,
+        *,
+        allowed_redirect_hosts: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_HOSTS,
+    ) -> dict:
         """RFC 7591 registration. Returns the client information response."""
         if not isinstance(metadata, dict):
             raise OAuthError("invalid_client_metadata", "registration body must be a JSON object")
@@ -292,7 +315,7 @@ class OAuthStore:
                 "invalid_redirect_uri",
                 f"redirect_uris must list 1..{MAX_REDIRECT_URIS} URIs",
             )
-        redirect_uris = [validate_redirect_uri(u) for u in uris]
+        redirect_uris = [validate_redirect_uri(u, allowed_redirect_hosts) for u in uris]
 
         method = metadata.get("token_endpoint_auth_method") or "none"
         if method not in AUTH_METHODS:
@@ -315,17 +338,24 @@ class OAuthStore:
         now = self.now()
         client_id = "lfo_client_" + secrets.token_urlsafe(16)
         client_secret = _new_secret(_SECRET_PREFIX) if method != "none" else None
-        self.prune()
-        with self._connect() as conn:
+        with self._transaction() as conn:
+            self._prune(conn, now)
             (unapproved,) = conn.execute(
                 "SELECT COUNT(*) FROM clients WHERE approved_at IS NULL"
             ).fetchone()
             if unapproved >= MAX_PENDING_CLIENTS:
-                raise OAuthError(
-                    "temporarily_unavailable",
-                    "too many pending registrations; try again later",
-                    status=429,
-                )
+                evicted = conn.execute(
+                    "DELETE FROM clients WHERE client_id IN (SELECT client_id FROM clients "
+                    f"WHERE approved_at IS NULL AND {_UNPROTECTED_CLIENT_SQL} "
+                    "ORDER BY created_at LIMIT :n)",
+                    {"now": now, "n": unapproved - MAX_PENDING_CLIENTS + 1},
+                ).rowcount
+                if unapproved - evicted >= MAX_PENDING_CLIENTS:
+                    raise OAuthError(
+                        "temporarily_unavailable",
+                        "too many registrations awaiting approval; try again later",
+                        status=429,
+                    )
             conn.execute(
                 "INSERT INTO clients (client_id, client_name, redirect_uris, "
                 "token_endpoint_auth_method, client_secret_hash, created_at) "
@@ -354,18 +384,31 @@ class OAuthStore:
             response["client_secret_expires_at"] = 0
         return response
 
+    @contextmanager
+    def _transaction(self):
+        """One `BEGIN IMMEDIATE` write transaction: committed on success, rolled back on error."""
+        with connect_closing(self.db_path, timeout=10, isolation_level=None) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+
+    @staticmethod
+    def _prune(conn, now: float) -> int:
+        conn.execute("DELETE FROM pending_consents WHERE expires_at <= ?", (now,))
+        return conn.execute(
+            "DELETE FROM clients WHERE approved_at IS NULL AND created_at < :cutoff "
+            f"AND {_UNPROTECTED_CLIENT_SQL}",
+            {"cutoff": now - UNAPPROVED_CLIENT_TTL_SECONDS, "now": now},
+        ).rowcount
+
     def prune(self) -> int:
         """Delete expired unapproved registrations and expired pending consents. Returns clients deleted."""
-        now = self.now()
-        with self._connect() as conn:
-            conn.execute("DELETE FROM pending_consents WHERE expires_at <= ?", (now,))
-            deleted = conn.execute(
-                "DELETE FROM clients WHERE approved_at IS NULL AND created_at < ? "
-                "AND NOT EXISTS (SELECT 1 FROM pending_consents p "
-                "WHERE p.client_id = clients.client_id)",
-                (now - UNAPPROVED_CLIENT_TTL_SECONDS,),
-            ).rowcount
-        return deleted
+        with self._transaction() as conn:
+            return self._prune(conn, self.now())
 
     def get_client(self, client_id: str) -> dict | None:
         if not isinstance(client_id, str) or not client_id:
@@ -484,13 +527,22 @@ class OAuthStore:
         code_challenge: str,
         state: str | None,
         resource: str,
-    ) -> tuple[str, str]:
-        """Record an authorization request awaiting the operator. Returns (request_id, csrf_token)."""
+    ) -> tuple[str, str] | None:
+        """Record an authorization request awaiting the operator.
+
+        Returns (request_id, csrf_token), or None when the client is missing
+        or revoked — the check and the insert share one transaction, so a
+        concurrent prune cannot delete the client in between.
+        """
         now = self.now()
         request_id = secrets.token_urlsafe(16)
         csrf = secrets.token_urlsafe(32)
-        with self._connect() as conn:
+        with self._transaction() as conn:
             conn.execute("DELETE FROM pending_consents WHERE expires_at <= ?", (now,))
+            if conn.execute(
+                "SELECT 1 FROM clients WHERE client_id = ? AND revoked_at IS NULL", (client_id,)
+            ).fetchone() is None:
+                return None
             conn.execute(
                 "INSERT INTO pending_consents (request_id, csrf_hash, operator_login_hash, "
                 "client_id, redirect_uri, code_challenge, state, resource, expires_at) "
@@ -509,12 +561,31 @@ class OAuthStore:
             )
         return request_id, csrf
 
-    def take_pending_consent(self, request_id: str, csrf: str, operator_login: str) -> dict | None:
-        """Consume a pending consent if the CSRF token and operator match. Single use."""
+    # Test seam: called inside the decision transaction after the consent row
+    # is consumed and before the client is checked.
+    _after_consent_consumed = staticmethod(lambda: None)
+
+    def decide_consent(
+        self,
+        *,
+        request_id: str,
+        csrf: str,
+        operator_login: str,
+        approve: bool,
+        tier: str = TIER_READ_SAFE_WRITES,
+    ) -> tuple[dict, str | None] | None:
+        """Consume a pending consent and, on approval, issue its code — atomically.
+
+        Consuming the consent, checking the client and issuing the code happen
+        in one `BEGIN IMMEDIATE` transaction, so a concurrent prune can never
+        delete the client between them. Returns (pending, code) — `code` is
+        None for a denial — or None when the request is unknown, expired,
+        forged, for another operator, or its client is gone.
+        """
         if not request_id or not csrf:
             return None
         now = self.now()
-        with self._connect() as conn:
+        with self._transaction() as conn:
             row = conn.execute(
                 "SELECT csrf_hash, operator_login_hash, client_id, redirect_uri, "
                 "code_challenge, state, resource, expires_at "
@@ -527,21 +598,24 @@ class OAuthStore:
                 return None
             if not hmac.compare_digest(hash_secret(operator_login.strip().lower()), row[1]):
                 return None
-            cur = conn.execute("DELETE FROM pending_consents WHERE request_id = ?", (request_id,))
-            if cur.rowcount != 1 or row[7] <= now:
+            conn.execute("DELETE FROM pending_consents WHERE request_id = ?", (request_id,))
+            if row[7] <= now:
                 return None
-        return {
-            "client_id": row[2],
-            "redirect_uri": row[3],
-            "code_challenge": row[4],
-            "state": row[5],
-            "resource": row[6],
-        }
-
-    def issue_code(self, pending: dict, tier: str = TIER_READ_SAFE_WRITES) -> str:
-        now = self.now()
-        code = _new_secret(_CODE_PREFIX)
-        with self._connect() as conn:
+            self._after_consent_consumed()
+            if conn.execute(
+                "SELECT 1 FROM clients WHERE client_id = ? AND revoked_at IS NULL", (row[2],)
+            ).fetchone() is None:
+                return None
+            pending = {
+                "client_id": row[2],
+                "redirect_uri": row[3],
+                "code_challenge": row[4],
+                "state": row[5],
+                "resource": row[6],
+            }
+            if not approve:
+                return pending, None
+            code = _new_secret(_CODE_PREFIX)
             conn.execute(
                 "INSERT INTO auth_codes (code_hash, client_id, redirect_uri, code_challenge, "
                 "resource, tier, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -560,7 +634,7 @@ class OAuthStore:
                 (now, pending["client_id"]),
             )
         logger.info("mcp oauth: operator approved client %s", pending["client_id"])
-        return code
+        return pending, code
 
     # ── Tokens ─────────────────────────────────────────────────────────
 

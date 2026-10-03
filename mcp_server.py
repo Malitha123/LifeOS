@@ -1690,7 +1690,7 @@ class LifeOSMCPServer:
             return set()
         return {
             p.stem for p in files
-            if p.is_file() and not p.is_symlink() and CONTEXT_RE.match(p.stem)
+            if p.is_file() and not p.is_symlink() and CONTEXT_RE.fullmatch(p.stem)
             and p.stem != "Dashboard"
         }
 
@@ -3033,6 +3033,9 @@ def _oauth_config_from_settings():
         operator_logins=logins,
         store=store,
         authorize_url=(_settings.oauth_authorize_url or "").strip(),
+        allowed_redirect_hosts=frozenset(
+            (_settings.oauth_allowed_redirect_hosts or "").split(",")
+        ),
     )
 
 

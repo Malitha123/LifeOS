@@ -184,7 +184,7 @@ lock. A plain `Lock` would self-deadlock on the very first retry.
 
 **Context names.** A context names its file, `<tasks_dir>/<context>.md`, so
 `create` and `update` accept only a plain name
-(`^[A-Za-z0-9][A-Za-z0-9 _&'-]{0,63}$`, `task_manager.CONTEXT_RE`), and the
+(the whole string matches `[A-Za-z0-9][A-Za-z0-9 _&'-]{0,63}`, `task_manager.CONTEXT_RE`), and the
 file, with symlinks resolved, must sit directly inside the resolved tasks
 directory. Either violation raises `ValueError` (HTTP 422).
 

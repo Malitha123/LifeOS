@@ -2598,7 +2598,7 @@ class TestContextConfinement:
 
     @pytest.mark.parametrize("context", [
         "/tmp/synthetic-outside", "../escape", "Work/../../escape", "Sub/Dir", ".hidden", "", "x" * 65,
-        "Bad\nName",
+        "Bad\nName", "Work\n", "Work\r", "Work\r\n",
     ])
     def test_create_refuses_a_non_plain_context(self, task_manager, tmp_path, context):
         with pytest.raises(ValueError):

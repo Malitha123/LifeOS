@@ -218,7 +218,7 @@ def install_oauth_routes(app: FastAPI, config: OAuthConfig, *, bearer_token: str
         except Exception:
             return _oauth_error_json(OAuthError("invalid_client_metadata", "body must be JSON"))
         try:
-            info = store.register_client(metadata)
+            info = store.register_client(metadata, allowed_redirect_hosts=config.allowed_redirect_hosts)
         except OAuthError as err:
             return _oauth_error_json(err)
         return JSONResponse(info, status_code=201, headers=_NO_STORE)
@@ -260,7 +260,7 @@ def install_oauth_routes(app: FastAPI, config: OAuthConfig, *, bearer_token: str
         if resource is not None and not config.resource_matches(resource):
             return _redirect_error(redirect_uri, state, "invalid_target", "resource does not name this server")
 
-        request_id, csrf = store.create_pending_consent(
+        created = store.create_pending_consent(
             operator_login=login,
             client_id=client["client_id"],
             redirect_uri=redirect_uri,
@@ -268,6 +268,9 @@ def install_oauth_routes(app: FastAPI, config: OAuthConfig, *, bearer_token: str
             state=state,
             resource=config.resource,
         )
+        if created is None:
+            return _refusal_page(400, "Unknown or revoked client.")
+        request_id, csrf = created
         host = urlsplit(redirect_uri).hostname or ""
         loopback_warning = ""
         if host.lower() in {"127.0.0.1", "localhost", "::1"}:
@@ -303,16 +306,17 @@ def install_oauth_routes(app: FastAPI, config: OAuthConfig, *, bearer_token: str
             form = await _form(request)
         except OAuthError:
             return _refusal_page(400, "Malformed approval request.")
-        pending = store.take_pending_consent(
-            form.get("request_id", ""), form.get("csrf_token", ""), login,
+        decided = store.decide_consent(
+            request_id=form.get("request_id", ""),
+            csrf=form.get("csrf_token", ""),
+            operator_login=login,
+            approve=form.get("decision") == "approve",
         )
-        if pending is None:
+        if decided is None:
             return _refusal_page(400, "This approval request is invalid or has expired. Start again from the app.")
-        if store.active_client(pending["client_id"]) is None:
-            return _refusal_page(400, "Unknown or revoked client.")
-        if form.get("decision") != "approve":
+        pending, code = decided
+        if code is None:
             return _redirect_error(pending["redirect_uri"], pending["state"], "access_denied", "the operator denied access")
-        code = store.issue_code(pending)
         target = _with_params(pending["redirect_uri"], {
             "code": code,
             "state": pending["state"],
