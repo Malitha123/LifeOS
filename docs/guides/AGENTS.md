@@ -25,6 +25,7 @@ This directory contains operational guides — how to set up, configure, and run
 - `human-queue.md` — Human queue: fire-and-forget cards agents file for the operator, `done_when` auto-resolve
 - `home-eero.md` — Home — eero: pause/resume household internet access, login, target config, Private Wi-Fi Address, failure alerts
 - `agent-worker-setup.md` — External agent worker prerequisites (Gemma swap, MCP HTTP transport, Cloudflare Tunnel, bearer token)
+- `mcp-connected-apps.md` — Connect the Claude and ChatGPT apps to LifeOS over OAuth: host setup, approval, revocation
 - `agents-go-to.md` — /agents "Go To" wezterm pane setup (SessionStart hook + FD probe)
 
 ## Key Principles

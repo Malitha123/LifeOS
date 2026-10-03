@@ -70,6 +70,26 @@ ts_load_routes() {
             ROUTES+=("${r_port}|${r_path}|${r_target}|${r_funnel}")
         fi
     done < "$routes_file"
+
+    # Funnel is port-wide, so one funnel=on line publishes every route on its
+    # port. A port declaring both is ambiguous: none of its routes are kept.
+    local port_on=" " port_off=" " route mixed kept=()
+    for route in "${ROUTES[@]}"; do
+        IFS='|' read -r r_port _ _ r_funnel <<< "$route"
+        if [[ "$r_funnel" == "on" ]]; then port_on+="$r_port "; else port_off+="$r_port "; fi
+    done
+    for route in "${ROUTES[@]}"; do
+        IFS='|' read -r r_port _ <<< "$route"
+        mixed=0
+        [[ "$port_on" == *" $r_port "* && "$port_off" == *" $r_port "* ]] && mixed=1
+        if [[ $mixed -eq 1 ]]; then
+            echo "$routes_file: https=$r_port mixes funnel=on and private routes; Funnel is port-wide, so no route on that port is applied" >&2
+            rc=1
+        else
+            kept+=("$route")
+        fi
+    done
+    ROUTES=("${kept[@]}")
     return $rc
 }
 

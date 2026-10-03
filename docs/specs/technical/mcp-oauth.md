@@ -85,6 +85,7 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 
 ## Related Documents
 
+- [Connected Apps](../../guides/mcp-connected-apps.md) -- Publishing the transport and connecting Claude and ChatGPT
 - [Client Surfaces](client-surfaces.md) -- The MCP transport among LifeOS's other client surfaces
 - [Configuration](../../guides/configuration.md#mcp-http-transport) -- `LIFEOS_OAUTH_*` and `LIFEOS_MCP_*` settings
 - [Security & Privacy](security-privacy.md) -- Broader security posture this tier fits into

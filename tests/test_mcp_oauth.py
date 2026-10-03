@@ -1193,3 +1193,49 @@ def test_allowed_tools_are_reads_or_the_named_safe_writes():
     for name in OAUTH_ALLOWED_TOOLS - SAFE_WRITES - set(mcp_server.CHATGPT_TOOL_NAMES):
         assert methods[name] == "GET" or name in POST_READS, name
     assert not any(n.startswith("lifeos_agent_") for n in OAUTH_ALLOWED_TOOLS)
+
+
+def test_served_transport_sees_the_proxy_peer_not_x_forwarded_for(server, config, monkeypatch):
+    """Through uvicorn as run_http configures it, a Serve-proxied request
+    carrying the tailnet client's X-Forwarded-For still reaches consent as a
+    loopback peer, so the operator's identity header is honoured."""
+    import socket
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+
+    import uvicorn
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: captured.update(app=app, kw=kw))
+    mcp_server.run_http(server, "127.0.0.1", 0, BEARER, oauth=config)
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    kw = {**captured["kw"], "host": "127.0.0.1", "port": port, "log_level": "warning"}
+    srv = uvicorn.Server(uvicorn.Config(captured["app"], **kw))
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not srv.started and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert srv.started
+
+        def status(headers: dict[str, str]) -> int:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/oauth/authorize", headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.status
+            except urllib.error.HTTPError as err:
+                return err.code
+
+        forwarded = {"X-Forwarded-For": "100.64.0.7", **OPERATOR_HEADERS}
+        # Past the identity check: refused only for the missing client (400).
+        assert status(forwarded) == 400
+        assert status({"X-Forwarded-For": "100.64.0.7", "Tailscale-User-Login": "guest@example.com"}) == 403
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=10)

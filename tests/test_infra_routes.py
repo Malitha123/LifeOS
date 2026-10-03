@@ -557,3 +557,40 @@ def test_trailing_space_after_the_port_is_the_canonical_port(box):
     assert r.returncode != 0
     assert "never allowed on the LifeOS port" in r.stderr
     assert set(box.table()) == {"443|/"}
+
+
+MCP_PUBLIC_LINES = (
+    "https=10000 path=/mcp target=http://127.0.0.1:8765/mcp funnel=on\n"
+    "https=10000 path=/oauth/token target=http://127.0.0.1:8765/oauth/token funnel=on\n"
+)
+
+
+def test_port_mixing_public_and_private_routes_applies_none_of_them(box):
+    box.routes.write_text(
+        MCP_PUBLIC_LINES
+        + "https=10000 path=/private target=http://127.0.0.1:9000/private\n"
+        + PEBBLE_LINE
+    )
+    r = box.setup({"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "true"})
+    assert r.returncode != 0
+    assert "https=10000 mixes funnel=on and private routes" in r.stderr
+    table = box.table()
+    assert not any(k.startswith("10000|") or k == "funnel|10000" for k in table)
+    assert table["8443|/webhooks/pebble"] == "http://127.0.0.1:9790/webhooks/pebble"
+
+
+def test_watchdog_never_publishes_a_port_with_mixed_routes(box):
+    box.routes.write_text(MCP_PUBLIC_LINES + "https=10000 path=/private target=http://127.0.0.1:9000/private\n")
+    box.watch({"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "true"})
+    assert not any(a.startswith("tailscale funnel") for a in box.log())
+    assert "funnel|10000" not in box.table()
+
+
+def test_public_port_with_only_funnel_routes_is_published(box):
+    box.routes.write_text(MCP_PUBLIC_LINES + PEBBLE_LINE)
+    r = box.setup({"LIFEOS_TAILSCALE_ALLOW_FUNNEL": "true"})
+    assert r.returncode == 0, r.stderr
+    table = box.table()
+    assert table["funnel|10000"] is True
+    assert table["10000|/mcp"] == "http://127.0.0.1:8765/mcp"
+    assert "funnel|8443" not in table

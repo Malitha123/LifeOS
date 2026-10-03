@@ -2958,7 +2958,11 @@ def run_http(
     import uvicorn  # local import — only needed for HTTP mode
 
     app = build_http_app(server, bearer_token=bearer_token, oauth=oauth)
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # proxy_headers=False keeps request.client the real TCP peer. The consent
+    # and connected-apps endpoints trust identity only from a loopback peer
+    # (Tailscale Serve); uvicorn's default would replace that peer with the
+    # proxy's X-Forwarded-For address.
+    uvicorn.run(app, host=host, port=port, log_level="info", proxy_headers=False)
 
 
 def main():
