@@ -60,12 +60,20 @@ def vault(tmp_path):
     (root / "Work" / "Planning Notes.md").write_text("# Planning\nSynthetic roadmap body.\n")
     (root / "Private.md").write_text("never surfaced by search\n")
     (tmp_path / "outside.md").write_text("outside the vault\n")
+    tasks = root / "LifeOS" / "Tasks"
+    tasks.mkdir(parents=True)
+    for context in ("Inbox", "Personal", "Dashboard"):
+        (tasks / f"{context}.md").write_text(f"# {context} Tasks\n")
+    (tasks / "Linked.md").symlink_to(tmp_path / "outside.md")
     return root
 
 
 @pytest.fixture
 def calls() -> list[tuple[str, dict]]:
     return []
+
+
+_ORIGINAL_CALL_API = mcp_server.LifeOSMCPServer._call_api
 
 
 @pytest.fixture
@@ -265,19 +273,60 @@ def test_registration_rejects_unsupported_metadata(client):
         assert client.post("/oauth/register", json=body).status_code == 400
 
 
-def test_unapproved_registrations_are_capped(client, monkeypatch):
-    monkeypatch.setattr(mcp_oauth, "MAX_UNAPPROVED_CLIENTS", 2)
+def test_registration_spam_does_not_lock_out_a_real_app(client, store):
+    spam = [
+        client.post("/oauth/register", json={"redirect_uris": ["https://spam.example.com/cb"]})
+        for _ in range(60)
+    ]
+    assert all(r.status_code == 201 for r in spam)
+    real = _register(client)
+    _, challenge = _pkce()
+    page = client.get("/oauth/authorize", params=_authorize_params(real["client_id"], challenge),
+                      headers=OPERATOR_HEADERS)
+    assert page.status_code == 200
+    assert "spam.example.com" not in page.text
+
+
+def test_storage_ceiling_rejects_only_beyond_it(client, monkeypatch):
+    monkeypatch.setattr(mcp_oauth, "MAX_PENDING_CLIENTS", 2)
     _register(client)
     _register(client)
     resp = client.post("/oauth/register", json={"redirect_uris": [CLAUDE_REDIRECT]})
     assert resp.status_code == 429
 
 
-def test_unapproved_registrations_are_pruned_after_a_day(client, clock, monkeypatch):
-    monkeypatch.setattr(mcp_oauth, "MAX_UNAPPROVED_CLIENTS", 1)
-    _register(client)
-    clock.now += mcp_oauth.UNAPPROVED_CLIENT_TTL_SECONDS + 1
-    _register(client)
+def test_unapproved_registrations_expire_after_fifteen_minutes(client, clock, store):
+    stale = _register(client)["client_id"]
+    clock.now += 15 * 60 + 1
+    fresh = _register(client)["client_id"]
+    assert store.get_client(stale) is None
+    assert store.get_client(fresh) is not None
+    clock.now += 15 * 60 + 1
+    _, challenge = _pkce()
+    resp = client.get("/oauth/authorize", params=_authorize_params(fresh, challenge), headers=OPERATOR_HEADERS)
+    assert resp.status_code == 400  # pruned on the authorize request itself
+    assert store.get_client(fresh) is None
+
+
+def test_a_pending_consent_keeps_its_registration(client, clock, store):
+    client_id = _register(client)["client_id"]
+    clock.now += 14 * 60
+    verifier, challenge = _pkce()
+    form = _consent_form(client.get("/oauth/authorize", params=_authorize_params(client_id, challenge),
+                                    headers=OPERATOR_HEADERS))
+    clock.now += 2 * 60
+    store.prune()
+    resp = _post_form(client, "/oauth/authorize", {**form, "decision": "approve"}, OPERATOR_HEADERS)
+    assert resp.status_code == 303
+
+
+def test_revoking_an_unapproved_client_deletes_it(client, store):
+    client_id = _register(client)["client_id"]
+    assert store.revoke_client(client_id) is True
+    assert store.get_client(client_id) is None
+    approved_id, _, _ = _connect(client)
+    assert store.revoke_client(approved_id) is True
+    assert store.get_client(approved_id)["revoked_at"] is not None
 
 
 # ── happy path and tier ──────────────────────────────────────────────────
@@ -382,6 +431,91 @@ def test_plain_task_create_is_allowed(client, calls):
 
 
 @pytest.mark.parametrize("arguments", [
+    {"description": "Synthetic task", "tags": ["ordinary #codex"]},
+    {"description": "Synthetic task", "tags": ["a,#claude"]},
+    {"description": "Synthetic task", "tags": ["\uff03claude"]},
+    {"description": "Synthetic task", "tags": ["ok\n#claude"]},
+    {"description": "Synthetic task", "tags": ["ok #errand"]},
+    {"description": "Synthetic task \uff03claude"},
+    {"description": "Synthetic task #\uff43laude"},
+    {"description": "Synthetic task\n- [ ] TODO #claude"},
+    {"description": "Synthetic task", "notes": "line one\n- [ ] TODO #hermes"},
+    {"description": "Synthetic task", "priority": "#cloud"},
+    {"description": "Synthetic task", "operation_key": "k #agent"},
+], ids=["embedded-tag", "comma-tag", "fullwidth-hash-tag", "newline-tag", "spaced-tag",
+        "fullwidth-hash-description", "fullwidth-letters-description", "newline-description",
+        "notes-checkbox", "priority-tag", "operation-key-tag"])
+def test_task_create_refuses_smuggled_tags(client, calls, arguments):
+    _, tokens, _ = _connect(client)
+    result = _rpc(client, tokens["access_token"], "tools/call",
+                  {"name": "lifeos_task_create", "arguments": arguments}).json()["result"]
+    assert result["isError"] is True
+    assert calls == []
+
+
+@pytest.mark.parametrize("context", [
+    "/tmp/synthetic-outside", "../outside", "Linked", "Dashboard", "Brand New", "Inbox/../../x",
+])
+def test_task_create_context_must_already_exist(client, calls, context):
+    _, tokens, _ = _connect(client)
+    result = _rpc(client, tokens["access_token"], "tools/call", {
+        "name": "lifeos_task_create",
+        "arguments": {"description": "Synthetic task", "context": context},
+    }).json()["result"]
+    assert result["isError"] is True
+    assert calls == []
+
+
+def test_task_create_default_context_requires_an_existing_inbox(client, calls, vault):
+    _, tokens, _ = _connect(client)
+    args = {"description": "Synthetic task"}
+    ok = _rpc(client, tokens["access_token"], "tools/call",
+              {"name": "lifeos_task_create", "arguments": args}).json()["result"]
+    assert "isError" not in ok
+    (vault / "LifeOS" / "Tasks" / "Inbox.md").unlink()
+    refused = _rpc(client, tokens["access_token"], "tools/call",
+                   {"name": "lifeos_task_create", "arguments": args}).json()["result"]
+    assert refused["isError"] is True
+    assert calls == [("lifeos_task_create", args)]
+
+
+def test_oauth_task_create_end_to_end_never_yields_an_engine_tag(client, server, vault, tmp_path):
+    """Drive the real task route and TaskManager behind the MCP server."""
+    from fastapi import FastAPI
+
+    from api.routes import tasks as task_routes
+    from api.services.task_manager import TaskManager
+
+    manager = TaskManager(vault_path=vault, index_path=tmp_path / "index.json",
+                          live_session_checker=lambda *a: False, live_coordinator_checker=lambda *a: False)
+    backend = FastAPI()
+    backend.include_router(task_routes.router)
+    _, tokens, _ = _connect(client)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(task_routes, "get_task_manager", lambda: manager)
+        mp.setattr(mcp_server.LifeOSMCPServer, "_call_api", _ORIGINAL_CALL_API)
+        mp.setattr(mcp_server, "API_BASE", "http://testserver")
+        server.client = TestClient(backend)
+        for arguments in (
+            {"description": "Synthetic execution request", "tags": ["ordinary #codex"]},
+            {"description": "Synthetic task #codex"},
+            {"description": "Synthetic task", "context": str(tmp_path / "outside")},
+        ):
+            result = _rpc(client, tokens["access_token"], "tools/call",
+                          {"name": "lifeos_task_create", "arguments": arguments}).json()["result"]
+            assert result["isError"] is True, arguments
+        ok = _rpc(client, tokens["access_token"], "tools/call", {
+            "name": "lifeos_task_create",
+            "arguments": {"description": "Synthetic errand", "tags": ["errand"], "context": "Personal"},
+        }).json()["result"]
+        assert "isError" not in ok, ok
+    manager.rebuild_index()
+    reparsed = [set(t.tags) for t in manager._tasks.values()]
+    assert reparsed == [{"errand"}]
+    assert (tmp_path / "outside.md").read_text() == "outside the vault\n"
+
+
+@pytest.mark.parametrize("arguments", [
     {"message_type": "prompt", "message_content": "summarize", "schedule_type": "once"},
     {"message_type": "endpoint", "endpoint_config": {"endpoint": "/api/gmail/send"}},
     {"message_type": "static", "endpoint_config": {"endpoint": "/api/x"}},
@@ -434,6 +568,20 @@ def test_fetch_serves_only_documents_search_returned(client, doc_id):
     _rpc(client, access, "tools/call", {"name": "search", "arguments": {"query": "roadmap"}})
     result = _rpc(client, access, "tools/call", {"name": "fetch", "arguments": {"id": doc_id}}).json()["result"]
     assert result["isError"] is True
+
+
+def test_fetch_is_bound_to_the_client_that_searched(client):
+    _, first, _ = _connect(client)
+    _, second, _ = _connect(client)
+    found = _rpc(client, first["access_token"], "tools/call",
+                 {"name": "search", "arguments": {"query": "roadmap"}}).json()["result"]["structuredContent"]
+    doc_id = found["results"][0]["id"]
+    other = _rpc(client, second["access_token"], "tools/call",
+                 {"name": "fetch", "arguments": {"id": doc_id}}).json()["result"]
+    assert other["isError"] is True
+    own = _rpc(client, first["access_token"], "tools/call",
+               {"name": "fetch", "arguments": {"id": doc_id}}).json()["result"]
+    assert "isError" not in own
 
 
 def test_search_and_fetch_are_not_on_the_bearer_path(client, calls):
@@ -766,6 +914,18 @@ def test_cli_lists_and_revokes(client, store, capsys):
     assert cli.main(["--db", store.db_path, "revoke", client_id]) == 0
     _assert_401_challenge(_rpc(client, tokens["access_token"], "tools/list"))
     assert cli.main(["--db", store.db_path, "revoke", "lfo_client_nope"]) == 1
+
+
+def test_cli_prune_deletes_expired_registrations(client, store, clock, capsys):
+    from scripts import mcp_oauth as cli
+
+    import time
+
+    clock.now = time.time() - (15 * 60 + 1)  # the CLI's store runs on the real clock
+    stale = _register(client)["client_id"]
+    assert cli.main(["--db", store.db_path, "prune"]) == 0
+    assert "Deleted 1" in capsys.readouterr().out
+    assert store.get_client(stale) is None
 
 
 # ── disabled, storage and logging ────────────────────────────────────────

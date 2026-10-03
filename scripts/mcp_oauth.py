@@ -3,6 +3,7 @@
 
     python scripts/mcp_oauth.py list
     python scripts/mcp_oauth.py revoke <client_id>
+    python scripts/mcp_oauth.py prune
 
 Reads the OAuth store (`mcp_oauth.db` in the data directory) directly, so it
 works whether or not the MCP HTTP service is running. Revoking a client
@@ -53,6 +54,11 @@ def cmd_revoke(store: OAuthStore, client_id: str) -> int:
     return 0
 
 
+def cmd_prune(store: OAuthStore) -> int:
+    print(f"Deleted {store.prune()} expired unapproved registration(s).")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", type=Path, default=None, help="OAuth store path (default: data dir mcp_oauth.db)")
@@ -60,11 +66,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list", help="List registered apps")
     revoke = sub.add_parser("revoke", help="Revoke an app and all its tokens")
     revoke.add_argument("client_id")
+    sub.add_parser("prune", help="Delete expired unapproved registrations")
     args = parser.parse_args(argv)
 
     store = OAuthStore(args.db or default_db_path())
     if args.command == "list":
         return cmd_list(store)
+    if args.command == "prune":
+        return cmd_prune(store)
     return cmd_revoke(store, args.client_id)
 
 

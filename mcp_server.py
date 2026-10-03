@@ -627,9 +627,10 @@ class LifeOSMCPServer:
         self._trusted_attempt_id = os.environ.get("LIFEOS_AGENT_ATTEMPT_ID", "").strip()
         self._trusted_turn_id = os.environ.get("LIFEOS_AGENT_TURN_ID", "").strip()
         self._mcp_transport_secret = ""
-        # Vault-relative id -> resolved path for documents `chatgpt_search`
-        # returned; `chatgpt_fetch` serves only these.
-        self._chatgpt_fetchable: OrderedDict[str, Path] = OrderedDict()
+        # (principal, vault-relative id) -> resolved path for documents
+        # `chatgpt_search` returned to that principal; `chatgpt_fetch` serves
+        # only these, and only to the same principal.
+        self._chatgpt_fetchable: OrderedDict[tuple[str, str], Path] = OrderedDict()
         # Per-session tool-result cache. Bypassed when the caller
         # doesn't supply a session id (which is the common case for local-CLI
         # tool calls; cache hits matter most on managed-agent HTTP calls).
@@ -1678,7 +1679,22 @@ class LifeOSMCPServer:
             f"&file={quote(rel, safe='')}"
         )
 
-    def chatgpt_search(self, arguments: dict) -> dict:
+    def task_contexts(self) -> set[str]:
+        """Task contexts that already have a regular (non-symlink) file in the tasks folder."""
+        from api.services.task_manager import CONTEXT_RE, TaskManager
+
+        tasks_dir = self._vault_root() / TaskManager.TASKS_FOLDER
+        try:
+            files = list(tasks_dir.glob("*.md"))
+        except OSError:
+            return set()
+        return {
+            p.stem for p in files
+            if p.is_file() and not p.is_symlink() and CONTEXT_RE.match(p.stem)
+            and p.stem != "Dashboard"
+        }
+
+    def chatgpt_search(self, arguments: dict, *, principal: str) -> dict:
         """ChatGPT `search`: vault search grouped to one result per document."""
         query = arguments.get("query")
         if not isinstance(query, str) or not query.strip():
@@ -1694,8 +1710,8 @@ class LifeOSMCPServer:
                 continue
             rel, resolved = doc
             seen.add(rel)
-            self._chatgpt_fetchable[rel] = resolved
-            self._chatgpt_fetchable.move_to_end(rel)
+            self._chatgpt_fetchable[(principal, rel)] = resolved
+            self._chatgpt_fetchable.move_to_end((principal, rel))
             while len(self._chatgpt_fetchable) > _CHATGPT_FETCHABLE_MAX:
                 self._chatgpt_fetchable.popitem(last=False)
             results.append({
@@ -1706,13 +1722,13 @@ class LifeOSMCPServer:
             })
         return {"results": results}
 
-    def chatgpt_fetch(self, arguments: dict) -> dict:
-        """ChatGPT `fetch`: the full text of a document an earlier search returned."""
+    def chatgpt_fetch(self, arguments: dict, *, principal: str) -> dict:
+        """ChatGPT `fetch`: the full text of a document this principal's search returned."""
         doc_id = arguments.get("id")
-        fetchable = self._chatgpt_fetchable
-        if not isinstance(doc_id, str) or doc_id not in fetchable:
+        key = (principal, doc_id)
+        if not isinstance(doc_id, str) or key not in self._chatgpt_fetchable:
             return {"error": "unknown document id; call search first"}
-        doc = self._vault_document(str(fetchable[doc_id]))
+        doc = self._vault_document(str(self._chatgpt_fetchable[key]))
         if doc is None or doc[0] != doc_id:
             return {"error": "document is no longer available"}
         rel, resolved = doc
@@ -2693,10 +2709,12 @@ class OAuthToolAccess:
     unknown tool.
     """
 
-    def __init__(self, server: "LifeOSMCPServer"):
+    def __init__(self, server: "LifeOSMCPServer", principal: str):
         from api.services.mcp_tool_tier import OAUTH_ALLOWED_TOOLS, tool_annotations
 
         self.server = server
+        # The OAuth client id; `fetch` serves only ids this principal searched.
+        self.principal = principal
         self.allowed = OAUTH_ALLOWED_TOOLS
         self._annotations = tool_annotations
 
@@ -2717,14 +2735,16 @@ class OAuthToolAccess:
 
         if not isinstance(arguments, dict):
             return _tool_error("arguments must be an object")
-        refusal = check_oauth_arguments(name, arguments)
+        refusal = check_oauth_arguments(
+            name, arguments, existing_contexts=self.server.task_contexts,
+        )
         if refusal:
             return _tool_error(refusal)
         if name in CHATGPT_TOOL_NAMES:
             if name == "search":
-                payload = self.server.chatgpt_search(arguments)
+                payload = self.server.chatgpt_search(arguments, principal=self.principal)
             else:
-                payload = self.server.chatgpt_fetch(arguments)
+                payload = self.server.chatgpt_fetch(arguments, principal=self.principal)
             if "error" in payload:
                 return _tool_error(payload["error"])
             return {
@@ -2861,13 +2881,11 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str, oauth=None):
 
     app = FastAPI(title="LifeOS MCP", docs_url=None, redoc_url=None, openapi_url=None)
 
-    oauth_access = None
     if oauth is not None:
         from api.services.mcp_oauth import TIER_READ_SAFE_WRITES
         from api.services.mcp_oauth_http import install_oauth_routes
 
         install_oauth_routes(app, oauth, bearer_token=bearer_token)
-        oauth_access = OAuthToolAccess(server)
 
     def _unauthorized(detail: str, *, invalid_token: bool) -> HTTPException:
         headers = None
@@ -2890,7 +2908,7 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str, oauth=None):
         if oauth is not None:
             grant = oauth.store.validate_access_token(token, resource=oauth.resource)
             if grant is not None and grant.tier == TIER_READ_SAFE_WRITES:
-                return oauth_access
+                return OAuthToolAccess(server, principal=grant.client_id)
         raise _unauthorized("invalid bearer token", invalid_token=True)
 
     def _parse_error_response() -> JSONResponse:

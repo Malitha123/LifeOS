@@ -15,7 +15,9 @@ fires.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
+from typing import Callable
 
 from api.services.agent_board import AGENT_PICKUP_TAGS, HUMAN_TAG, PROTECTED_TAGS
 
@@ -163,7 +165,10 @@ _FORBIDDEN_TASK_TAGS = frozenset(
 _TASK_CREATE_KEYS = frozenset(
     {"description", "context", "status", "priority", "due_date", "tags", "notes", "operation_key"}
 )
-_INLINE_TAG_RE = re.compile(r"#([\w-]+)")
+# One canonical tag per list entry: no `#`, whitespace, punctuation or markup.
+_CANONICAL_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,63}$")
+_SINGLE_LINE_KEYS = ("description", "context", "status", "priority", "due_date", "operation_key")
+_TAG_REFUSAL = "engine, execution and #human tags cannot be set by connected apps"
 
 
 def _forbidden_tag(tag: str) -> bool:
@@ -171,7 +176,40 @@ def _forbidden_tag(tag: str) -> bool:
     return normalized in _FORBIDDEN_TASK_TAGS or normalized.startswith("agent")
 
 
-def _check_task_create(arguments: dict) -> str | None:
+def _rendered_tags(arguments: dict) -> set[str]:
+    """Every tag the task store would read back from this task once written.
+
+    Renders the would-be task block with the task store's own formatter,
+    re-parses the task line with its own parser, and also scans every
+    rendered line, raw and NFKC-normalized, with the store's tag pattern —
+    so a tag smuggled inside another tag, a text field or a notes line is
+    seen exactly as the store and the worker will see it.
+    """
+    from api.services import task_manager as tm
+
+    task = tm.Task(
+        id="00000000",
+        description=arguments.get("description") or "",
+        status=arguments.get("status") or "todo",
+        context=arguments.get("context") or "Inbox",
+        priority=arguments.get("priority") or "",
+        due_date=arguments.get("due_date"),
+        tags=list(arguments.get("tags") or []),
+        notes=arguments.get("notes"),
+    )
+    lines = tm._format_task_block(task)
+    found: set[str] = set()
+    parsed = tm._parse_task_line(lines[0], "Inbox.md", 1)
+    if parsed is not None:
+        found.update(parsed.tags)
+    extra_text = [arguments.get("context") or "", arguments.get("operation_key") or ""]
+    for line in [*lines, *extra_text]:
+        for variant in (line, unicodedata.normalize("NFKC", line)):
+            found.update(tm._TAG_RE.findall(variant))
+    return found
+
+
+def _check_task_create(arguments: dict, existing_contexts: Callable[[], set[str]]) -> str | None:
     extra = sorted(set(arguments) - _TASK_CREATE_KEYS)
     if extra:
         return f"arguments not available to connected apps: {', '.join(extra)}"
@@ -179,16 +217,22 @@ def _check_task_create(arguments: dict) -> str | None:
     if tags is not None:
         if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
             return "tags must be a list of strings"
+        if not all(_CANONICAL_TAG_RE.match(t) for t in tags):
+            return "each tag must be one plain tag (letters, digits, _ / -), without '#'"
         if any(_forbidden_tag(t) for t in tags):
-            return "engine, execution and #human tags cannot be set by connected apps"
-    for key in ("description", "context", "notes", "status", "priority", "due_date", "operation_key"):
+            return _TAG_REFUSAL
+    for key in (*_SINGLE_LINE_KEYS, "notes"):
         value = arguments.get(key)
         if value is None:
             continue
         if not isinstance(value, str):
             return f"{key} must be a string"
-        if any(_forbidden_tag(t) for t in _INLINE_TAG_RE.findall(value)):
-            return "engine, execution and #human tags cannot be set by connected apps"
+        if key != "notes" and any(not ch.isprintable() for ch in value):
+            return f"{key} must be a single line without control characters"
+    if any(_forbidden_tag(t) for t in _rendered_tags(arguments)):
+        return _TAG_REFUSAL
+    if (arguments.get("context") or "Inbox") not in existing_contexts():
+        return "context must name an existing task context"
     return None
 
 
@@ -200,13 +244,20 @@ def _check_reminder_create(arguments: dict) -> str | None:
     return None
 
 
-_ARGUMENT_GUARDS = {
-    "lifeos_task_create": _check_task_create,
-    "lifeos_reminder_create": _check_reminder_create,
-}
+def check_oauth_arguments(
+    name: str,
+    arguments: dict,
+    *,
+    existing_contexts: Callable[[], set[str]] = lambda: set(),
+) -> str | None:
+    """Return a refusal message when an allowed tool's arguments leave the tier.
 
-
-def check_oauth_arguments(name: str, arguments: dict) -> str | None:
-    """Return a refusal message when an allowed tool's arguments leave the tier."""
-    guard = _ARGUMENT_GUARDS.get(name)
-    return guard(arguments) if guard else None
+    `existing_contexts` returns the task contexts that already have a file;
+    a connected app may file a task only into one of those (an omitted
+    context means `Inbox`), so it never creates a file.
+    """
+    if name == "lifeos_task_create":
+        return _check_task_create(arguments, existing_contexts)
+    if name == "lifeos_reminder_create":
+        return _check_reminder_create(arguments)
+    return None

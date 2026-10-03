@@ -72,6 +72,18 @@ _KNOWN_FIELD_KEYS = {"due", "priority", "created", "done", "cancelled", "updated
 # `_validate_text_fields`.
 _RESERVED_FIELD_KEYS = _KNOWN_FIELD_KEYS | {"id"}
 _FIELD_KEY_RE = re.compile(r"^\w+$")
+# A context names its file, `<tasks_dir>/<context>.md`, so it is a single
+# plain file-name stem: no path separators, dots or leading punctuation.
+CONTEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _&'-]{0,63}$")
+
+
+def validate_context(context: object) -> None:
+    """Raise `ValueError` unless `context` is a plain context name (`CONTEXT_RE`)."""
+    if not isinstance(context, str) or not CONTEXT_RE.match(context):
+        raise ValueError(
+            "context must be 1-64 letters, digits, spaces or _&'- characters, "
+            "starting with a letter or digit"
+        )
 
 # Retries after an initial write attempt that loses a compare-and-swap race
 # against a concurrent external edit (see TaskManager._cas_rewrite).
@@ -415,6 +427,7 @@ class TaskManager:
                 f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}"
             )
         _validate_text_fields(description=description, notes=notes, fields=fields)
+        validate_context(context)
         with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
             task = Task(
                 id=uuid.uuid4().hex[:8],
@@ -656,6 +669,8 @@ class TaskManager:
         _validate_text_fields(
             description=kwargs.get("description"), notes=kwargs.get("notes"), fields=fields_patch
         )
+        if kwargs.get("context") is not None:
+            validate_context(kwargs["context"])
         with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
             current = self._tasks.get(task_id)
             if not current:
@@ -1924,8 +1939,16 @@ class TaskManager:
     # ------------------------------------------------------------------
 
     def _get_context_file(self, context: str) -> Path:
-        """Return path to context file, creating with template if missing."""
+        """Return path to context file, creating with template if missing.
+
+        Raises `ValueError` for a context that is not a plain name, or whose
+        file (symlinks resolved) would land anywhere but directly inside the
+        resolved tasks directory.
+        """
+        validate_context(context)
         file_path = self.tasks_dir / f"{context}.md"
+        if file_path.resolve().parent != self.tasks_dir.resolve():
+            raise ValueError("context file must stay inside the tasks directory")
         if not file_path.exists():
             template = (
                 f"---\ntype: tasks\ncontext: {context.lower()}\n---\n"

@@ -27,14 +27,14 @@ OAuth is off unless `LIFEOS_OAUTH_OPERATOR_LOGINS` is non-empty and `LIFEOS_OAUT
 
 An MCP request with no token, or an unknown, expired or revoked one, gets `401` with `WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource/mcp"` (plus `error="invalid_token"` when a token was presented).
 
-`scripts/mcp_oauth.py list|revoke <client_id>` reads and revokes from the store directly.
+`scripts/mcp_oauth.py list|revoke <client_id>|prune` reads, revokes and prunes the store directly.
 
 ## Registration
 
 - Redirect URIs must be `https`, or `http` on a loopback host (`127.0.0.1`, `localhost`, `::1`), with no fragment. They are pinned at registration; an `http` loopback URI matches on any port (RFC 8252 §7.3), every other URI matches exactly.
 - `token_endpoint_auth_method` is `none` (public client, the default when omitted), `client_secret_post` or `client_secret_basic`.
 - Client ID Metadata Documents are not supported, and the metadata does not advertise them, so Claude and ChatGPT fall back to registration.
-- Registration is unauthenticated, so at most 50 not-yet-approved clients exist at once and each is pruned after 24 hours.
+- Registration is unauthenticated. An unapproved registration with no consent pending is deleted 15 minutes after it was made (pruned on every registration and authorization request, and by `prune`); revoking an unapproved client deletes it. Registration is refused (`429`) only while 5,000 unapproved registrations exist, and the consent page names only the client of its own authorization request, so registration spam neither locks out nor confuses a real app.
 
 ## Consent
 
@@ -65,10 +65,17 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 `OAUTH_TOOL_TIER` in `api/services/mcp_tool_tier.py` classifies every tool the server can build as allowed or denied, with a reason; a tool absent from it is denied, and `tests/test_mcp_oauth.py` fails until a new tool is classified. For an OAuth request, `tools/list` returns only allowed tools, each with `annotations` (`readOnlyHint`, `destructiveHint: false`), and `tools/call` on any other name returns the same `Unknown tool` error (`-32602`) as a nonexistent tool.
 
 - **Allowed reads:** every read-only curated tool, plus `search` and `fetch`.
-- **Allowed writes:** `lifeos_task_create`, `lifeos_reminder_create`, `lifeos_memories_create`, `lifeos_gmail_draft`, with argument guards: a task may not carry an engine, consent, protected-lifecycle or `#human` tag (in `tags` or inline in any text field), nor the `fields` map or `dry_run`; a reminder must be `message_type: "static"` with no `endpoint_config`.
+- **Allowed writes:** `lifeos_task_create`, `lifeos_reminder_create`, `lifeos_memories_create`, `lifeos_gmail_draft`, with argument guards. A task:
+  - takes each `tags` entry as one plain tag (`^[A-Za-z0-9][A-Za-z0-9_/-]{0,63}$`, no `#`);
+  - keeps every text field except `notes` on one line without control characters;
+  - is rendered with the task store's own formatter and re-parsed with its own parser (each rendered line also NFKC-normalized), and is refused if any resulting tag is an engine, consent, protected-lifecycle or `#human` tag;
+  - may name only a context whose file already exists (an omitted context means `Inbox`; `Dashboard` and symlinked files do not count), so a connected app never creates a file;
+  - may not set the `fields` map or `dry_run`.
+
+  A reminder must be `message_type: "static"` with no `endpoint_config`. Independently of OAuth, the task store accepts only a plain context name (`^[A-Za-z0-9][A-Za-z0-9 _&'-]{0,63}$`) whose file resolves directly inside the tasks directory.
 - **Denied:** sending (email, Telegram), deletes, person and fact edits, vault writes, task edits and lifecycle actions, projects, schedules, sync, calendar writes (they email attendees), home-network control, Human-queue writes, workout logging, and the `lifeos_agent_*` family.
 
-`search` and `fetch` exist only for OAuth requests. `search` (`{query}`) runs vault search and returns `{results: [{id, title, url, text}]}`, one per vault document, where `id` is the vault-relative path and `url` an `obsidian://` link. `fetch` (`{id}`) returns `{id, title, text, url, metadata}` for a document an earlier search in the same process returned, re-checked to resolve inside the vault. Both results carry the JSON as text content and as `structuredContent`.
+`search` and `fetch` exist only for OAuth requests. `search` (`{query}`) runs vault search and returns `{results: [{id, title, url, text}]}`, one per vault document, where `id` is the vault-relative path and `url` an `obsidian://` link. `fetch` (`{id}`) returns `{id, title, text, url, metadata}` for a document an earlier search by the same OAuth client returned in the same process, re-checked to resolve inside the vault. Both results carry the JSON as text content and as `structuredContent`.
 
 ## Related Documents
 

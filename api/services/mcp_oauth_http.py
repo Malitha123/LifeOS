@@ -240,6 +240,7 @@ def install_oauth_routes(app: FastAPI, config: OAuthConfig, *, bearer_token: str
                 403,
                 "Approval is available only to the LifeOS operator, from the tailnet.",
             )
+        store.prune()
         q = request.query_params
         client = store.active_client(q.get("client_id", ""))
         if client is None:

@@ -47,11 +47,13 @@ AUTH_CODE_TTL_SECONDS = 60
 ACCESS_TOKEN_TTL_SECONDS = 3600
 REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 3600
 PENDING_CONSENT_TTL_SECONDS = 600
-# An unapproved registration is pruned once older than this TTL, and at most
-# MAX_UNAPPROVED_CLIENTS of them exist at once, so unauthenticated DCR cannot
-# grow the store without bound.
-UNAPPROVED_CLIENT_TTL_SECONDS = 24 * 3600
-MAX_UNAPPROVED_CLIENTS = 50
+# Unauthenticated DCR must neither grow the store without bound nor lock out a
+# real app. An unapproved registration older than UNAPPROVED_CLIENT_TTL_SECONDS
+# with no consent pending is deleted on every registration and authorization
+# request, and registration is refused only while MAX_PENDING_CLIENTS
+# unapproved registrations exist.
+UNAPPROVED_CLIENT_TTL_SECONDS = 15 * 60
+MAX_PENDING_CLIENTS = 5000
 MAX_REDIRECT_URIS = 10
 MAX_URI_LENGTH = 2048
 MAX_CLIENT_NAME_LENGTH = 100
@@ -313,15 +315,12 @@ class OAuthStore:
         now = self.now()
         client_id = "lfo_client_" + secrets.token_urlsafe(16)
         client_secret = _new_secret(_SECRET_PREFIX) if method != "none" else None
+        self.prune()
         with self._connect() as conn:
-            conn.execute(
-                "DELETE FROM clients WHERE approved_at IS NULL AND created_at < ?",
-                (now - UNAPPROVED_CLIENT_TTL_SECONDS,),
-            )
             (unapproved,) = conn.execute(
                 "SELECT COUNT(*) FROM clients WHERE approved_at IS NULL"
             ).fetchone()
-            if unapproved >= MAX_UNAPPROVED_CLIENTS:
+            if unapproved >= MAX_PENDING_CLIENTS:
                 raise OAuthError(
                     "temporarily_unavailable",
                     "too many pending registrations; try again later",
@@ -354,6 +353,19 @@ class OAuthStore:
             response["client_secret"] = client_secret
             response["client_secret_expires_at"] = 0
         return response
+
+    def prune(self) -> int:
+        """Delete expired unapproved registrations and expired pending consents. Returns clients deleted."""
+        now = self.now()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM pending_consents WHERE expires_at <= ?", (now,))
+            deleted = conn.execute(
+                "DELETE FROM clients WHERE approved_at IS NULL AND created_at < ? "
+                "AND NOT EXISTS (SELECT 1 FROM pending_consents p "
+                "WHERE p.client_id = clients.client_id)",
+                (now - UNAPPROVED_CLIENT_TTL_SECONDS,),
+            ).rowcount
+        return deleted
 
     def get_client(self, client_id: str) -> dict | None:
         if not isinstance(client_id, str) or not client_id:
@@ -426,9 +438,18 @@ class OAuthStore:
         ]
 
     def revoke_client(self, client_id: str) -> bool:
-        """Revoke a client and every grant it holds. Returns False for an unknown client."""
+        """Revoke a client and every grant it holds. Returns False for an unknown client.
+
+        A client that was never approved holds no grants and is deleted outright.
+        """
         now = self.now()
         with self._connect() as conn:
+            conn.execute("DELETE FROM pending_consents WHERE client_id = ?", (client_id,))
+            if conn.execute(
+                "DELETE FROM clients WHERE client_id = ? AND approved_at IS NULL", (client_id,)
+            ).rowcount:
+                logger.info("mcp oauth: deleted unapproved client %s", client_id)
+                return True
             cur = conn.execute(
                 "UPDATE clients SET revoked_at = COALESCE(revoked_at, ?) WHERE client_id = ?",
                 (now, client_id),

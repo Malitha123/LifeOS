@@ -2591,3 +2591,39 @@ class TestFormatTaskBlock:
         assert block[0] == _format_task_line(task)
         assert block[1] == "    > line one"
         assert block[2] == "    > line two"
+
+
+class TestContextConfinement:
+    """A context names one file directly inside the tasks directory, for every caller."""
+
+    @pytest.mark.parametrize("context", [
+        "/tmp/synthetic-outside", "../escape", "Work/../../escape", "Sub/Dir", ".hidden", "", "x" * 65,
+        "Bad\nName",
+    ])
+    def test_create_refuses_a_non_plain_context(self, task_manager, tmp_path, context):
+        with pytest.raises(ValueError):
+            task_manager.create(description="Synthetic task", context=context)
+        assert not list(tmp_path.rglob("synthetic-outside*"))
+        assert not list(tmp_path.rglob("escape*"))
+
+    def test_update_refuses_moving_to_a_non_plain_context(self, task_manager):
+        task = task_manager.create(description="Synthetic task", context="Work")
+        with pytest.raises(ValueError):
+            task_manager.update(task.id, context="../escape")
+        assert task_manager.get(task.id).context == "Work"
+
+    def test_symlinked_context_file_pointing_outside_is_refused(self, task_manager, tmp_path):
+        outside = tmp_path / "outside.md"
+        outside.write_text("# Synthetic protected document\n")
+        (task_manager.tasks_dir / "Linked.md").symlink_to(outside)
+        with pytest.raises(ValueError):
+            task_manager.create(description="Injected synthetic task", context="Linked")
+        assert outside.read_text() == "# Synthetic protected document\n"
+
+    @pytest.mark.parametrize(
+        "context", ["Inbox", "Work", "Consulting", "Hermes", "Home & Family", "Kid's Stuff"],
+    )
+    def test_plain_contexts_still_work(self, task_manager, context):
+        task = task_manager.create(description="Synthetic task", context=context)
+        assert task.context == context
+        assert (task_manager.tasks_dir / f"{context}.md").exists()
