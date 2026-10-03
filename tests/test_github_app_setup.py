@@ -16,6 +16,7 @@ import json
 import socket
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from types import SimpleNamespace
@@ -142,10 +143,18 @@ def test_await_callback_code_survives_an_invalid_request_then_succeeds():
     thread.start()
 
     def _get(path: str) -> int:
-        try:
-            return urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5).status
-        except urllib.error.HTTPError as exc:
-            return exc.code
+        # The server binds inside its thread; a refused connection means it is
+        # not listening yet, so retry until it is.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                return urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5).status
+            except urllib.error.HTTPError as exc:
+                return exc.code
+            except urllib.error.URLError as exc:
+                if not isinstance(exc.reason, ConnectionRefusedError) or time.monotonic() > deadline:
+                    raise
+                time.sleep(0.02)
 
     # A bad request first — must not stop the server.
     assert _get("/favicon.ico") == 400
