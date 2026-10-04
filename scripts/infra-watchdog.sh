@@ -182,15 +182,12 @@ check_obsidian() {
     fi
 }
 
-# The public MCP node (LIFEOS_MCP_FUNNEL_NODE=true): its unit must be running
-# and every public path published. A logged-out node needs the operator.
+# The public MCP node (LIFEOS_MCP_FUNNEL_NODE=true): its container must be
+# running and publish exactly the public socket. A logged-out node needs the
+# operator.
 check_mcp_funnel_node() {
     local rc
     [ "${LIFEOS_MCP_FUNNEL_NODE:-false}" = "true" ] || return 0
-    if ! systemctl --user is-active --quiet lifeos-mcp-funnel.service; then
-        systemctl --user start lifeos-mcp-funnel.service > /dev/null 2>&1
-        log "mcp-funnel: unit was not active; start requested"
-    fi
     "$NODE_SCRIPT" check > /dev/null 2>&1
     rc=$?
     if [ $rc -eq 0 ]; then
@@ -198,19 +195,19 @@ check_mcp_funnel_node() {
         return 0
     fi
     if [ $rc -ne 3 ]; then
-        "$NODE_SCRIPT" apply > /dev/null 2>&1
+        "$NODE_SCRIPT" up > /dev/null 2>&1
         rc=$?
         if [ $rc -eq 0 ]; then
-            log "mcp-funnel: public paths were missing; re-applied"
+            log "mcp-funnel: node was down or not publishing exactly; restored"
             return 0
         fi
     fi
     if [ $rc -eq 3 ]; then
         log "mcp-funnel: node logged out"
-        alert mcp-funnel "LifeOS host: the public MCP node is logged out of Tailscale, so connected apps (Claude, ChatGPT) cannot reach LifeOS. Log it in again (docs/guides/mcp-connected-apps.md)."
+        alert mcp-funnel-login "LifeOS host: the public MCP node is logged out of Tailscale, so connected apps (Claude, ChatGPT) cannot reach LifeOS. Run scripts/mcp-funnel-node.sh login (docs/guides/mcp-connected-apps.md)."
     else
-        log "mcp-funnel: public paths missing and could not be restored"
-        alert mcp-funnel "LifeOS host: the public MCP node is not publishing its paths and could not be restored, so connected apps cannot reach LifeOS."
+        log "mcp-funnel: node down or not publishing exactly, and could not be restored"
+        alert mcp-funnel "LifeOS host: the public MCP node is down or not publishing exactly its socket, and could not be restored, so connected apps cannot reach LifeOS."
     fi
 }
 

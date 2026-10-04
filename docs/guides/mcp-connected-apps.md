@@ -4,7 +4,7 @@
 **Last Updated:** 2026-10-04
 **Audience:** Operator
 
-The Claude and ChatGPT apps can use LifeOS as a custom connector. Their servers reach the MCP HTTP transport through a small, separate Tailscale node whose port 443 is public (Funnel). Each app is approved once, on a consent page that only the operator's own tailnet devices can open. A connected app gets the restricted "read + safe writes" tool tier, never the full catalog.
+The Claude and ChatGPT apps can use LifeOS as a custom connector. Their servers reach the MCP HTTP transport through a small, separate Tailscale node, running in its own container, whose port 443 is public (Funnel). Each app is approved once, on a consent page that only the operator's own tailnet devices can open. A connected app gets the restricted "read + safe writes" tool tier, never the full catalog.
 
 What the tier allows, the token rules and the residual risks are in [MCP OAuth](../specs/technical/mcp-oauth.md).
 
@@ -18,13 +18,13 @@ What the tier allows, the token rules and the residual risks are in [MCP OAuth](
 | `https://<host>.<tailnet>.ts.net:8443` | tailnet only | `/oauth/authorize` | The consent page |
 | `https://<mcp-node>.<tailnet>.ts.net` | public (Funnel) | `/mcp`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `/oauth/register`, `/oauth/token`, `/oauth/revoke` | What the app's servers call |
 
-Connector platforms connect out only on port 443, and Funnel exposure is port-wide. LifeOS's own 443 must stay private, so the public paths live on a second node: an unprivileged `tailscaled` in userspace-networking mode with its own hostname, run by the user unit `lifeos-mcp-funnel.service`. It answers only on the paths it publishes.
+Connector platforms connect out only on port 443, and Funnel exposure is port-wide. LifeOS's own 443 must stay private, so the public paths live on a second node with its own hostname. It runs in a Docker container (`tailscale/tailscale`), so its network namespace holds no host service: a tailnet device connecting to it reaches nothing but what it publishes. Its only way into LifeOS is the transport's public unix-socket listener (`LIFEOS_MCP_HTTP_UDS`), mounted read-only. That listener serves only the paths in the table above, and a request through it never counts as a loopback peer, so it can never reach the consent page or the connected-apps list.
 
 The app's servers discover the authorization server on the public node, register themselves, and send your browser to the consent page. That page loads only on a device that is on your tailnet and signed in as an operator login. After approval the app talks only to the public node, with a short-lived access token that it refreshes on its own.
 
 ## Set up the host
 
-The MCP HTTP transport must already run: `LIFEOS_MCP_BEARER_TOKEN` set and the `lifeos-mcp-http` unit enabled, as in [Agent Worker Setup](agent-worker-setup.md#step-3--enable-the-mcp-http-systemd-unit). Without the bearer token the transport does not start. The tailnet must allow Funnel for your devices (the `funnel` node attribute in the Tailscale admin console).
+The MCP HTTP transport must already run: `LIFEOS_MCP_BEARER_TOKEN` set and the `lifeos-mcp-http` unit enabled, as in [Agent Worker Setup](agent-worker-setup.md#step-3--enable-the-mcp-http-systemd-unit). Without the bearer token the transport does not start. Docker must be installed with your user in the `docker` group, and the tailnet must allow Funnel for your devices (the `funnel` node attribute in the Tailscale admin console).
 
 1. Add to `.env`, with your hostnames and your Tailscale login (`tailscale status --json` shows it under `User`; list only your own — anyone listed can approve an app):
 
@@ -32,6 +32,7 @@ The MCP HTTP transport must already run: `LIFEOS_MCP_BEARER_TOKEN` set and the `
    LIFEOS_OAUTH_OPERATOR_LOGINS=operator@example.com
    LIFEOS_OAUTH_ISSUER_URL=https://lifeos-mcp.<tailnet>.ts.net
    LIFEOS_OAUTH_AUTHORIZE_URL=https://<host>.<tailnet>.ts.net:8443/oauth/authorize
+   LIFEOS_MCP_HTTP_UDS=/home/<user>/.local/state/lifeos-mcp/mcp.sock
    LIFEOS_MCP_FUNNEL_NODE=true
    ```
 
@@ -41,24 +42,24 @@ The MCP HTTP transport must already run: `LIFEOS_MCP_BEARER_TOKEN` set and the `
    https=8443 path=/oauth/authorize target=http://127.0.0.1:8765/oauth/authorize
    ```
 
-3. Install and start the units, then apply the routes:
+3. Restart the transport so it opens the socket, then apply the routes:
 
    ```bash
-   cd ~/Code/LifeOS && sudo ./scripts/setup-systemd.sh
    sudo systemctl restart lifeos-mcp-http
    ./scripts/setup-tailscale.sh
    ```
 
-4. Log the public node in once, as yourself. It prints a login URL; open it and approve the node:
+4. Start the node and log it in once, as yourself. `login` prints a URL; open it and approve the node, then publish:
 
    ```bash
-   tailscale --socket="$XDG_RUNTIME_DIR/lifeos-mcp-ts.sock" up --hostname=lifeos-mcp
+   ./scripts/mcp-funnel-node.sh up       # exits 3 until the node is logged in
+   ./scripts/mcp-funnel-node.sh login
    ./scripts/mcp-funnel-node.sh apply
    ```
 
-5. Check: `./scripts/mcp-funnel-node.sh check` exits 0, and `tailscale --socket="$XDG_RUNTIME_DIR/lifeos-mcp-ts.sock" funnel status` lists the six paths under `Funnel on`.
+5. Check: `./scripts/mcp-funnel-node.sh check` exits 0, and `docker exec lifeos-mcp-funnel tailscale funnel status` shows `/` proxying to `unix:/sock/mcp.sock` under `Funnel on`.
 
-The node keeps its login and published paths in `~/.local/share/lifeos-mcp-ts`, so it comes back by itself after a reboot. A newly published node can take several minutes before public connections succeed.
+The container restarts with Docker, and its login lives in `LIFEOS_MCP_FUNNEL_STATE_DIR`, so the node comes back by itself after a reboot; the infra watchdog repairs anything else. A newly published node can take several minutes before public connections succeed.
 
 ## Connect an app
 
@@ -82,18 +83,18 @@ Revoking deletes the app's registration and tokens at once; to reconnect, the ap
 
 ## Turn it off
 
-- **Close public access:** set `LIFEOS_MCP_FUNNEL_NODE=false`, then `systemctl --user disable --now lifeos-mcp-funnel.service`. The node goes offline, so nothing is public. `tailscale --socket=… logout` before stopping also removes it from the tailnet.
+- **Close public access:** set `LIFEOS_MCP_FUNNEL_NODE=false`, then `docker rm -f lifeos-mcp-funnel`. The node goes offline, so nothing is public. Running `docker exec lifeos-mcp-funnel tailscale logout` first also removes it from the tailnet.
 - **Disable OAuth entirely:** empty `LIFEOS_OAUTH_OPERATOR_LOGINS` and restart `lifeos-mcp-http`. Every OAuth endpoint then returns `404`, and issued tokens stop working.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 |---|---|
-| The app says no server responds at the URL | The URL is not on port 443 of the public node, or the node is down; `./scripts/mcp-funnel-node.sh check` and `systemctl --user status lifeos-mcp-funnel` tell which. |
+| The app says no server responds at the URL | The URL is not on port 443 of the public node, or the node is down; `./scripts/mcp-funnel-node.sh check` and `docker ps -a --filter name=lifeos-mcp-funnel` tell which. |
 | A public request from the LifeOS host itself fails the TLS handshake | A machine cannot reach its own Funnel address. Test from a device off the tailnet. |
 | Consent page returns `403` | The device is off the tailnet, signed in as another login, or reached the page through a public address. |
 | The app says the server needs authentication but never shows the consent page | `LIFEOS_OAUTH_ISSUER_URL` or `LIFEOS_OAUTH_AUTHORIZE_URL` names the wrong host or port; check `/.well-known/oauth-authorization-server`. |
-| Telegram alert: the public MCP node is logged out | Rerun the login in step 4. `logs/infra-watchdog.log` shows each check. |
+| Telegram alert: the public MCP node is logged out | Run `./scripts/mcp-funnel-node.sh login`, approve, then `apply`. `logs/infra-watchdog.log` shows each check. |
 
 ## Related Documents
 

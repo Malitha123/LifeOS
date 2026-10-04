@@ -60,7 +60,6 @@ LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false")
 MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
 AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false")
 AUTODEPLOY_ENABLED=$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false")
-MCP_FUNNEL_NODE=$(_read_env "LIFEOS_MCP_FUNNEL_NODE" "false")
 
 # Normalize boolean
 case "$(echo "$LLM_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
@@ -203,15 +202,6 @@ if [ -d "$USER_UNIT_SRC" ]; then
                 "$SCRIPT_DIR/enable-user-timer.sh" lifeos-infra-watchdog.timer; then
             INFRA_TIMER_FAILED=1
         fi
-    fi
-    # The public MCP node runs only when opted in; its first login is manual
-    # (see docs/guides/mcp-connected-apps.md).
-    if [ "$MCP_FUNNEL_NODE" = "true" ] && [ "${INFRA_TIMER_FAILED:-0}" != "1" ]; then
-        runuser -u "$REAL_USER" -- env "XDG_RUNTIME_DIR=/run/user/$REAL_UID" \
-            "$SCRIPT_DIR/enable-user-timer.sh" lifeos-mcp-funnel.service \
-            || echo "  lifeos-mcp-funnel.service: NOT enabled" >&2
-    else
-        echo "  lifeos-mcp-funnel.service: disabled (set LIFEOS_MCP_FUNNEL_NODE=true to enable)"
     fi
 fi
 

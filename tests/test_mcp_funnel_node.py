@@ -1,8 +1,9 @@
 """The public MCP node script and its infra-watchdog check.
 
-Both run under bash with a fake `tailscale` first on PATH. The fake keeps one
-serve table per `--socket` (the main node has none), so tests can tell the
-public MCP node's routes apart from the host's own.
+Both run under bash with fake `docker` and `tailscale` binaries first on PATH.
+The fake docker keeps the container's state in a JSON file and runs
+`docker exec <name> tailscale ...` against a serve table of its own, so tests
+can tell the public node's configuration apart from the host's.
 """
 from __future__ import annotations
 
@@ -20,60 +21,61 @@ pytestmark = pytest.mark.unit
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NODE = REPO_ROOT / "scripts" / "mcp-funnel-node.sh"
 WATCHDOG = REPO_ROOT / "scripts" / "infra-watchdog.sh"
-UNIT = REPO_ROOT / "config" / "systemd" / "user" / "lifeos-mcp-funnel.service"
+HOST = "lifeos-mcp.example.ts.net"
+TARGET = "unix:/sock/mcp.sock"
 
-PUBLIC_PATHS = [
-    "/mcp",
-    "/.well-known/oauth-protected-resource",
-    "/.well-known/oauth-authorization-server",
-    "/oauth/register",
-    "/oauth/token",
-    "/oauth/revoke",
-]
-
-TAILSCALE_FAKE = '''#!/usr/bin/env python3
+DOCKER_FAKE = '''#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
-node = "main"
-if args and args[0].startswith("--socket="):
-    node = "mcp"
-    args = args[1:]
 with open(os.environ["FAKE_ACTIONS"], "a") as f:
-    f.write(node + " tailscale " + " ".join(args) + "\\n")
-path = os.path.join(os.environ["FAKE_TS_DIR"], node + ".json")
+    f.write("docker " + " ".join(args) + "\\n")
+path = os.environ["FAKE_NODE"]
 try:
-    state = json.load(open(path))
+    node = json.load(open(path))
 except OSError:
-    state = {}
-host = "lifeos-mcp.example.ts.net" if node == "mcp" else "example-host.example.ts.net"
-if args[:2] == ["status", "--json"]:
-    backend = os.environ.get("FAKE_MCP_BACKEND", "Running") if node == "mcp" else "Running"
-    print(json.dumps({"BackendState": backend}))
-    sys.exit(0)
-if args[:2] == ["serve", "status"]:
-    web, funnel = {}, {}
-    for key, target in state.items():
-        port, p = key.split("|", 1)
-        if port == "funnel":
-            funnel[host + ":" + p] = True
-            continue
-        web.setdefault(host + ":" + port, {"Handlers": {}})["Handlers"][p] = {"Proxy": target}
-    print(json.dumps({"Web": web, "AllowFunnel": funnel}))
-    sys.exit(0)
-if args[0] in ("serve", "funnel") and "--set-path" in args:
-    if node == "mcp" and os.environ.get("FAKE_APPLY_BROKEN"):
+    node = {"container": "missing", "backend": "Running", "serve": {}}
+def save():
+    json.dump(node, open(path, "w"))
+if args[0] == "inspect":
+    if node["container"] == "missing":
         sys.exit(1)
-    port = next(a.split("=", 1)[1] for a in args if a.startswith("--https="))
-    state[port + "|" + args[args.index("--set-path") + 1]] = args[-1]
-    if args[0] == "funnel":
-        state["funnel|" + port] = True
-json.dump(state, open(path, "w"))
+    print("true" if node["container"] == "running" else "false")
+    sys.exit(0)
+if args[0] == "run":
+    node["container"] = "running"; save(); sys.exit(0)
+if args[0] == "start":
+    node["container"] = "running"; save(); sys.exit(0)
+if args[0] != "exec" or node["container"] != "running":
+    sys.exit(1)
+ts = args[2:]
+assert ts[0] == "tailscale"
+ts = ts[1:]
+if ts[:2] == ["status", "--json"]:
+    print(json.dumps({"BackendState": node["backend"]})); sys.exit(0)
+if ts[:2] == ["serve", "status"]:
+    print(json.dumps(node["serve"])); sys.exit(0)
+if ts[:2] == ["serve", "reset"]:
+    node["serve"] = {}; save(); sys.exit(0)
+if ts[0] == "funnel" and "--bg" in ts:
+    if os.environ.get("FAKE_APPLY_BROKEN"):
+        sys.exit(1)
+    port = next(a.split("=", 1)[1] for a in ts if a.startswith("--https="))
+    hp = os.environ["FAKE_HOST"] + ":" + port
+    serve = node["serve"]
+    serve.setdefault("TCP", {})[port] = {"HTTPS": True}
+    serve.setdefault("Web", {}).setdefault(hp, {"Handlers": {}})["Handlers"]["/"] = {"Proxy": ts[-1]}
+    serve.setdefault("AllowFunnel", {})[hp] = True
+    save(); sys.exit(0)
+if ts[0] == "login":
+    print("To authenticate, visit:\\n\\n\\thttps://login.tailscale.com/a/synthetic123\\n"); sys.exit(0)
+sys.exit(1)
 '''
 
-SYSTEMCTL_FAKE = '''#!/usr/bin/env bash
-echo "systemctl $*" >> "$FAKE_ACTIONS"
+# The host's own tailscale: the watchdog's route checks run against it.
+HOST_TAILSCALE_FAKE = '''#!/usr/bin/env bash
+echo "host-tailscale $*" >> "$FAKE_ACTIONS"
 case "$*" in
-  *is-active*) [ "${FAKE_UNIT_ACTIVE:-1}" = "1" ] && exit 0 || exit 3 ;;
+  "serve status --json") echo '{"Web": {"h:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8000"}}}}}' ;;
 esac
 exit 0
 '''
@@ -84,18 +86,17 @@ def env(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for name, body in (
-        ("tailscale", TAILSCALE_FAKE),
-        ("systemctl", SYSTEMCTL_FAKE),
+        ("docker", DOCKER_FAKE),
+        ("tailscale", HOST_TAILSCALE_FAKE),
         ("curl", CURL_FAKE),
         ("pgrep", PGREP_FAKE),
     ):
         p = bin_dir / name
         p.write_text(body)
         p.chmod(0o755)
-    ts_dir = tmp_path / "ts"
-    ts_dir.mkdir()
     env_file = tmp_path / ".env"
     env_file.write_text("TELEGRAM_BOT_TOKEN=xtoken\nTELEGRAM_CHAT_ID=123\n")
+    node_file = tmp_path / "node.json"
     actions = tmp_path / "actions.log"
 
     class Env:
@@ -105,8 +106,10 @@ def env(tmp_path):
     e.base = {
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_ACTIONS": str(actions),
-        "FAKE_TS_DIR": str(ts_dir),
-        "LIFEOS_MCP_FUNNEL_SOCKET": str(tmp_path / "mcp.sock"),
+        "FAKE_NODE": str(node_file),
+        "FAKE_HOST": HOST,
+        "LIFEOS_MCP_HTTP_UDS": str(tmp_path / "sock" / "mcp.sock"),
+        "LIFEOS_MCP_FUNNEL_STATE_DIR": str(tmp_path / "ts-state"),
         "LIFEOS_MCP_FUNNEL_WAIT_SECONDS": "0",
         "LIFEOS_TAILSCALE_ROUTES_FILE": str(tmp_path / "routes.local"),
         "LIFEOS_INFRA_STATE_DIR": str(tmp_path / "state"),
@@ -121,104 +124,154 @@ def env(tmp_path):
             capture_output=True, text=True, timeout=30,
         )
 
-    e.node = lambda *a, extra=None: run(NODE, *a, extra=extra)
+    def set_node(**fields):
+        node = e.node_state()
+        node.update(fields)
+        node_file.write_text(json.dumps(node))
+
+    e.run_node = lambda *a, extra=None: run(NODE, *a, extra=extra)
     e.watch = lambda extra=None: run(WATCHDOG, extra={"LIFEOS_MCP_FUNNEL_NODE": "true", **(extra or {})})
-    e.table = lambda node="mcp": json.loads((ts_dir / f"{node}.json").read_text()) if (ts_dir / f"{node}.json").exists() else {}
+    e.node_state = lambda: json.loads(node_file.read_text()) if node_file.exists() else {
+        "container": "missing", "backend": "Running", "serve": {}}
+    e.set_node = set_node
     e.log = lambda: actions.read_text().splitlines() if actions.exists() else []
     e.telegrams = lambda: [a for a in e.log() if "api.telegram.org" in a]
     e.watchdog_log = lambda: (tmp_path / "state" / "infra-watchdog.log").read_text()
     return e
 
 
-def _published(table: dict) -> bool:
-    return table.get("funnel|443") is True and all(
-        table.get(f"443|{p}") == f"http://127.0.0.1:8765{p}" for p in PUBLIC_PATHS
-    )
+def _exact(serve: dict) -> bool:
+    hp = f"{HOST}:443"
+    return serve == {
+        "TCP": {"443": {"HTTPS": True}},
+        "Web": {hp: {"Handlers": {"/": {"Proxy": TARGET}}}},
+        "AllowFunnel": {hp: True},
+    }
 
 
-def test_apply_publishes_every_public_path_on_443_of_the_mcp_node_only(env):
-    r = env.node("apply")
+def test_up_creates_an_isolated_container_and_publishes_only_the_socket(env):
+    r = env.run_node("up")
     assert r.returncode == 0, r.stderr
-    assert _published(env.table())
-    assert set(env.table()) == {"funnel|443", *(f"443|{p}" for p in PUBLIC_PATHS)}
-    assert env.table("main") == {}
-    assert env.node("check").returncode == 0
+    run = next(a for a in env.log() if a.startswith("docker run"))
+    assert "--network bridge" in run
+    assert "--network host" not in run
+    assert ":/sock:ro" in run
+    assert "TS_USERSPACE=true" in run
+    assert _exact(env.node_state()["serve"])
+    assert env.run_node("check").returncode == 0
 
 
-def test_apply_honours_the_mcp_http_port(env):
-    assert env.node("apply", extra={"LIFEOS_MCP_HTTP_PORT": "9123"}).returncode == 0
-    assert env.table()["443|/mcp"] == "http://127.0.0.1:9123/mcp"
+def test_up_starts_a_stopped_container_instead_of_creating_one(env):
+    env.set_node(container="stopped")
+    assert env.run_node("up").returncode == 0
+    assert any(a.startswith("docker start") for a in env.log())
+    assert not any(a.startswith("docker run") for a in env.log())
 
 
-def test_check_fails_when_a_path_is_missing_or_not_public(env):
-    env.node("apply")
-    table = env.table()
-    table.pop("443|/oauth/token")
-    (Path(env.base["FAKE_TS_DIR"]) / "mcp.json").write_text(json.dumps(table))
-    assert env.node("check").returncode == 1
-    env.node("apply")
-    table = env.table()
-    table.pop("funnel|443")
-    (Path(env.base["FAKE_TS_DIR"]) / "mcp.json").write_text(json.dumps(table))
-    assert env.node("check").returncode == 1
+def test_up_refuses_without_the_public_socket_setting(env):
+    r = env.run_node("up", extra={"LIFEOS_MCP_HTTP_UDS": ""})
+    assert r.returncode == 1
+    assert "LIFEOS_MCP_HTTP_UDS" in r.stderr
+    assert not any(a.startswith("docker run") for a in env.log())
+
+
+@pytest.mark.parametrize("extra_handler", ["/oauth/authorize", "/oauth/clients", "/admin"])
+def test_check_rejects_an_extra_handler_and_apply_removes_it(env, extra_handler):
+    env.run_node("up")
+    node = env.node_state()
+    node["serve"]["Web"][f"{HOST}:443"]["Handlers"][extra_handler] = {"Proxy": "http://127.0.0.1:8765"}
+    env.set_node(serve=node["serve"])
+    assert env.run_node("check").returncode == 1
+    assert env.run_node("apply").returncode == 0
+    assert _exact(env.node_state()["serve"])
+
+
+def test_check_rejects_a_second_served_port_or_missing_funnel(env):
+    env.run_node("up")
+    serve = env.node_state()["serve"]
+    serve["TCP"]["8443"] = {"HTTPS": True}
+    serve["Web"][f"{HOST}:8443"] = {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8000"}}}
+    env.set_node(serve=serve)
+    assert env.run_node("check").returncode == 1
+    env.run_node("apply")
+    serve = env.node_state()["serve"]
+    serve["AllowFunnel"] = {}
+    env.set_node(serve=serve)
+    assert env.run_node("check").returncode == 1
+
+
+@pytest.mark.parametrize("backend", ["Stopped", "Starting", ""])
+def test_check_requires_a_running_backend(env, backend):
+    env.run_node("up")
+    env.set_node(backend=backend)
+    assert env.run_node("check").returncode == 1
+
+
+def test_check_fails_when_the_container_is_not_running(env):
+    env.run_node("up")
+    env.set_node(container="stopped")
+    assert env.run_node("check").returncode == 1
 
 
 def test_logged_out_node_reports_3_and_publishes_nothing(env):
-    extra = {"FAKE_MCP_BACKEND": "NeedsLogin"}
-    r = env.node("apply", extra=extra)
+    env.set_node(container="running", backend="NeedsLogin")
+    r = env.run_node("apply")
     assert r.returncode == 3
-    assert "logged out" in r.stderr
-    assert env.table() == {}
-    assert env.node("check", extra=extra).returncode == 3
+    assert env.node_state()["serve"] == {}
+    assert env.run_node("check").returncode == 3
+
+
+def test_login_prints_the_login_url(env):
+    env.set_node(container="running", backend="NeedsLogin")
+    r = env.run_node("login")
+    assert r.stdout.strip() == "https://login.tailscale.com/a/synthetic123"
 
 
 def test_apply_that_does_not_take_effect_fails(env):
-    r = env.node("apply", extra={"FAKE_APPLY_BROKEN": "1"})
+    env.set_node(container="running")
+    r = env.run_node("apply", extra={"FAKE_APPLY_BROKEN": "1"})
     assert r.returncode == 1
-    assert "not all published" in r.stderr
+    assert "not published exactly" in r.stderr
 
 
-def test_watchdog_republishes_missing_paths_without_alerting(env):
+def test_watchdog_brings_up_a_missing_node_without_alerting(env):
     env.watch()
-    assert _published(env.table())
-    assert "mcp-funnel: public paths were missing; re-applied" in env.watchdog_log()
+    assert _exact(env.node_state()["serve"])
+    assert "mcp-funnel: node was down or not publishing exactly; restored" in env.watchdog_log()
     assert env.telegrams() == []
 
 
 def test_watchdog_leaves_a_published_node_alone(env):
-    env.node("apply")
+    env.run_node("up")
     before = len(env.log())
     env.watch()
-    assert not any(a.startswith("mcp tailscale funnel") for a in env.log()[before:])
+    assert not any(a.startswith(("docker run", "docker start")) or " funnel " in a or "serve reset" in a
+                   for a in env.log()[before:])
     assert "mcp-funnel: published" in env.watchdog_log()
 
 
 def test_watchdog_alerts_when_the_node_is_logged_out(env):
-    env.watch({"FAKE_MCP_BACKEND": "NeedsLogin"})
+    env.set_node(container="running", backend="NeedsLogin")
+    env.watch()
     assert len(env.telegrams()) == 1
     assert "mcp-funnel: node logged out" in env.watchdog_log()
 
 
-def test_watchdog_alerts_when_paths_cannot_be_restored(env):
+def test_watchdog_alerts_when_the_node_cannot_be_restored(env):
+    env.set_node(container="running")
     env.watch({"FAKE_APPLY_BROKEN": "1"})
     assert len(env.telegrams()) == 1
     assert "could not be restored" in env.watchdog_log()
 
 
-def test_watchdog_starts_an_inactive_unit(env):
-    env.watch({"FAKE_UNIT_ACTIVE": "0"})
-    assert "systemctl --user start lifeos-mcp-funnel.service" in env.log()
+def test_login_and_restore_alerts_have_separate_cooldowns(env):
+    env.set_node(container="running", backend="NeedsLogin")
+    env.watch()
+    env.set_node(backend="Running")
+    env.watch({"FAKE_APPLY_BROKEN": "1"})
+    assert len(env.telegrams()) == 2
 
 
 def test_watchdog_skips_the_node_unless_opted_in(env):
     env.watch({"LIFEOS_MCP_FUNNEL_NODE": "false"})
-    assert not any(a.startswith("mcp tailscale") for a in env.log())
-    assert not any("lifeos-mcp-funnel" in a for a in env.log())
-
-
-def test_unit_runs_an_unprivileged_userspace_node_on_the_scripts_socket():
-    text = UNIT.read_text()
-    assert "--tun=userspace-networking" in text
-    assert "--socket=%t/lifeos-mcp-ts.sock" in text
-    assert "ExecStartPost=-__LIFEOS_DIR__/scripts/mcp-funnel-node.sh apply" in text
-    assert "lifeos-mcp-ts.sock" in NODE.read_text()
+    assert not any(a.startswith("docker") for a in env.log())

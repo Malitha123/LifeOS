@@ -122,7 +122,7 @@ https=8443 path=/webhooks/example target=http://127.0.0.1:9000/webhooks/example
 - Declared routes: re-applies any that are missing and alerts on Telegram if one is still missing.
 - `LIFEOS_PEBBLE_HEALTH_URL` (unset skips the check): alerts after 3 consecutive failed health checks.
 - `LIFEOS_EXPECT_OBSIDIAN_SYNC=true`: if no Obsidian process is running, relaunches it in the user session (`LIFEOS_OBSIDIAN_LAUNCH_CMD`, default `systemd-run --user --collect --unit=obsidian-session-<epoch> snap run obsidian`) and alerts only if it is still absent on the next run.
-- `LIFEOS_MCP_FUNNEL_NODE=true`: starts `lifeos-mcp-funnel.service` if it is inactive, re-publishes any missing public MCP path, and alerts if the node is logged out or cannot be restored. See [Connected Apps](mcp-connected-apps.md).
+- `LIFEOS_MCP_FUNNEL_NODE=true`: brings the public MCP node's container up if it is missing or stopped, makes it publish exactly the public socket, and alerts if the node is logged out or cannot be restored. See [Connected Apps](mcp-connected-apps.md).
 
 Each alert kind has its own cooldown (`LIFEOS_INFRA_ALERT_COOLDOWN_MIN`, default 360); stamps and counters live under `logs/`. The watchdog is a user unit because re-applying routes and relaunching Obsidian need the login user's session manager; `setup-systemd.sh` installs it into `~/.config/systemd/user/` and enables it through that user's manager.
 

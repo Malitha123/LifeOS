@@ -1269,3 +1269,66 @@ def test_initialize_returns_server_instructions(client):
     instructions = resp.json()["result"]["instructions"]
     assert instructions == mcp_server.SERVER_INSTRUCTIONS
     assert "lifeos_ask" in instructions and "lifeos_search" in instructions
+
+
+def _socket_status(uds: str, path: str, method: str = "GET", headers: dict | None = None) -> int:
+    import http.client
+    import socket as socket_mod
+
+    class UnixConnection(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            self.sock.connect(uds)
+
+    conn = UnixConnection("lifeos-mcp.example.ts.net")
+    conn.request(method, path, body=b"{}" if method == "POST" else None,
+                 headers={"Content-Type": "application/json", **(headers or {})})
+    status = conn.getresponse().status
+    conn.close()
+    return status
+
+
+def test_public_socket_listener_serves_only_public_paths_and_never_trusts_identity(
+    server, config, monkeypatch, tmp_path,
+):
+    """run_http's unix-socket listener: the public paths answer, while consent,
+    connected apps and anything else are 404 there, even with an operator
+    identity header and no Funnel marker."""
+    import threading
+    import time
+
+    import uvicorn
+
+    captured: list = []
+
+    class Recorder:
+        def __init__(self, config):
+            captured.append(config)
+            self.config, self.should_exit = config, False
+
+        async def serve(self):
+            return None
+
+    monkeypatch.setattr(uvicorn, "Server", Recorder)
+    uds = str(tmp_path / "mcp.sock")
+    mcp_server.run_http(server, "127.0.0.1", 0, BEARER, oauth=config, uds=uds)
+    tcp_config, sock_config = captured
+    assert tcp_config.proxy_headers is False and sock_config.uds == uds
+    monkeypatch.undo()
+
+    srv = uvicorn.Server(sock_config)
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not srv.started and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert srv.started
+        assert _socket_status(uds, "/.well-known/oauth-authorization-server") == 200
+        assert _socket_status(uds, "/.well-known/oauth-protected-resource/mcp") == 200
+        assert _socket_status(uds, "/mcp", "POST") == 401
+        for path in ("/oauth/authorize", "/oauth/clients", "/", "/oauth/authorize/", "/%6Fauth/authorize"):
+            assert _socket_status(uds, path, headers=OPERATOR_HEADERS) == 404, path
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=10)
