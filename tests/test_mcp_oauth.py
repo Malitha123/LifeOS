@@ -1304,7 +1304,7 @@ def test_public_socket_listener_serves_only_public_paths_and_never_trusts_identi
     class Recorder:
         def __init__(self, config):
             captured.append(config)
-            self.config, self.should_exit = config, False
+            self.config, self.should_exit, self.started = config, False, True
 
         async def serve(self):
             return None
@@ -1332,3 +1332,35 @@ def test_public_socket_listener_serves_only_public_paths_and_never_trusts_identi
     finally:
         srv.should_exit = True
         thread.join(timeout=10)
+
+
+@pytest.mark.parametrize("failing", ["tcp", "socket"])
+def test_a_listener_that_fails_to_start_stops_the_other_and_exits_nonzero(
+    server, config, monkeypatch, tmp_path, failing,
+):
+    import asyncio
+
+    import uvicorn
+
+    servers: list = []
+
+    class FakeServer:
+        def __init__(self, config):
+            self.config, self.should_exit, self.started = config, False, False
+            self.is_socket = config.uds is not None
+            servers.append(self)
+
+        async def serve(self):
+            if (failing == "socket") == self.is_socket:
+                return None  # bind failed: returns without starting
+            self.started = True
+            while not self.should_exit:
+                await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    uds = tmp_path / "missing-dir" / "mcp.sock"
+    with pytest.raises(SystemExit) as exited:
+        mcp_server.run_http(server, "127.0.0.1", 0, BEARER, oauth=config, uds=str(uds))
+    assert exited.value.code == 3
+    assert all(s.should_exit for s in servers)
+    assert uds.parent.is_dir() and (uds.parent.stat().st_mode & 0o777) == 0o700

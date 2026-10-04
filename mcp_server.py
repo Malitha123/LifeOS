@@ -3018,6 +3018,7 @@ def run_http(
         uvicorn.run(app, host=host, port=port, log_level="info", proxy_headers=False)
         return
 
+    os.makedirs(os.path.dirname(uds) or ".", mode=0o700, exist_ok=True)
     if os.path.exists(uds):
         os.remove(uds)
     tcp = uvicorn.Server(uvicorn.Config(
@@ -3031,12 +3032,18 @@ def run_http(
     async def serve_both() -> None:
         # Each server installs its own signal capture, so a shutdown signal may
         # reach only one; when either stops, stop the other.
-        tasks = {asyncio.ensure_future(tcp.serve()), asyncio.ensure_future(sock.serve())}
-        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        tasks = [asyncio.ensure_future(tcp.serve()), asyncio.ensure_future(sock.serve())]
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         tcp.should_exit = sock.should_exit = True
-        await asyncio.gather(*pending)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            task.result()
 
     asyncio.run(serve_both())
+    # A listener that never started (bind failure) is a startup failure, so the
+    # service manager restarts the process.
+    if not (tcp.started and sock.started):
+        sys.exit(3)
 
 
 def main():
