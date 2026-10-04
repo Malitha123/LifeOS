@@ -2944,6 +2944,14 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str, oauth=None):
     async def mcp_endpoint(request: Request) -> Response:
         return await _handle(request)
 
+    @app.get("/mcp")
+    async def mcp_stream(request: Request) -> Response:
+        # No server-initiated stream. An unauthenticated GET still gets the
+        # 401 challenge, since connector clients may probe with GET first to
+        # discover the authorization server.
+        _check_auth(request)
+        return Response(status_code=405, headers={"Allow": "POST"})
+
     @app.post("/")
     async def mcp_root(request: Request) -> Response:
         return await _handle(request)

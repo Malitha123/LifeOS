@@ -1028,6 +1028,16 @@ def test_missing_token_gets_401_with_challenge(client):
     assert "error=" not in resp.headers["www-authenticate"]
 
 
+def test_get_on_the_mcp_endpoint_challenges_then_refuses_the_stream(client):
+    resp = client.get("/mcp", headers={"Accept": "text/event-stream"})
+    _assert_401_challenge(resp)
+    _, tokens, _ = _connect(client)
+    authed = client.get("/mcp", headers={"Authorization": f"Bearer {tokens['access_token']}"})
+    assert authed.status_code == 405
+    assert authed.headers["allow"] == "POST"
+    assert client.get("/mcp", headers={"Authorization": f"Bearer {BEARER}"}).status_code == 405
+
+
 def test_token_for_another_resource_is_rejected(client, store):
     _, tokens, _ = _connect(client)
     assert store.validate_access_token(tokens["access_token"], resource="https://other.example.com/mcp") is None
