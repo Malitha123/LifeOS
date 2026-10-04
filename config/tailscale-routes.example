@@ -13,12 +13,6 @@
 #
 # https=8443 path=/webhooks/example target=http://127.0.0.1:9000/webhooks/example
 #
-# Connected apps (docs/guides/mcp-connected-apps.md): MCP + OAuth on a public
-# port, the consent page on a private one.
-# https=10000 path=/mcp target=http://127.0.0.1:8765/mcp funnel=on
-# https=10000 path=/.well-known/oauth-protected-resource target=http://127.0.0.1:8765/.well-known/oauth-protected-resource funnel=on
-# https=10000 path=/.well-known/oauth-authorization-server target=http://127.0.0.1:8765/.well-known/oauth-authorization-server funnel=on
-# https=10000 path=/oauth/register target=http://127.0.0.1:8765/oauth/register funnel=on
-# https=10000 path=/oauth/token target=http://127.0.0.1:8765/oauth/token funnel=on
-# https=10000 path=/oauth/revoke target=http://127.0.0.1:8765/oauth/revoke funnel=on
+# Connected apps (docs/guides/mcp-connected-apps.md): the consent page, tailnet
+# only. The public MCP paths live on a separate node, not in this file.
 # https=8443 path=/oauth/authorize target=http://127.0.0.1:8765/oauth/authorize

@@ -163,6 +163,8 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_OAUTH_ISSUER_URL` | str | — | Public `https://` base URL of the MCP HTTP transport. Advertised as the OAuth issuer; the protected resource is `<issuer>/mcp`. OAuth stays disabled unless this is an `https` URL. |
 | `LIFEOS_OAUTH_ALLOWED_REDIRECT_HOSTS` | str (comma-separated) | `claude.ai,claude.com,chatgpt.com` | Hosts an `https` redirect URI may name at OAuth dynamic client registration (exact host match). Loopback redirects (`localhost`, `127.0.0.1`, `[::1]`, any port) are always allowed, and are the only `http` redirects accepted. Add a host to connect another OAuth app. |
 | `LIFEOS_OAUTH_AUTHORIZE_URL` | str | `<issuer>/oauth/authorize` | Consent-page URL advertised as the authorization endpoint. Set it when the consent page is served on a tailnet-only origin different from the public issuer. |
+| `LIFEOS_MCP_FUNNEL_NODE` | bool | `false` | Run the public MCP node: a second, unprivileged `tailscaled` (`lifeos-mcp-funnel.service`, a user unit) whose port 443 is published with Funnel to this transport. `setup-systemd.sh` enables the unit and the infra watchdog keeps it published. See [Connected Apps](mcp-connected-apps.md). |
+| `LIFEOS_MCP_FUNNEL_SOCKET` | str | `$XDG_RUNTIME_DIR/lifeos-mcp-ts.sock` | Control socket of the public MCP node, used by `scripts/mcp-funnel-node.sh`. |
 
 ## Agent Worker — Defaults and Budgets
 

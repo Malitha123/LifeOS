@@ -1261,3 +1261,11 @@ def test_served_transport_sees_the_proxy_peer_not_x_forwarded_for(server, config
     finally:
         srv.should_exit = True
         thread.join(timeout=10)
+
+
+def test_initialize_returns_server_instructions(client):
+    resp = client.post("/mcp", headers={"Authorization": f"Bearer {BEARER}"},
+                       json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    instructions = resp.json()["result"]["instructions"]
+    assert instructions == mcp_server.SERVER_INSTRUCTIONS
+    assert "lifeos_ask" in instructions and "lifeos_search" in instructions

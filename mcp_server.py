@@ -164,6 +164,17 @@ _SEARCH_FACET_PROPERTIES = {
     "project": {"type": "array", "items": {"type": "string"}, "description": "Only notes tagged with these projects."},
 }
 
+# Sent in the initialize result; clients such as Claude show it to the model so
+# it knows when to reach for these tools.
+SERVER_INSTRUCTIONS = (
+    "LifeOS is the user's personal knowledge base and assistant: their notes vault, "
+    "tasks, reminders, calendar, email, messages, people and relationships, meetings, "
+    "and finances, indexed and searchable. Prefer these tools over general knowledge "
+    "or memory for anything about the user's own life, work, people, plans, or past "
+    "conversations. Start with lifeos_ask for a synthesized answer or lifeos_search for "
+    "source passages; use the people tools for anyone the user names."
+)
+
 # Curated list of endpoints to expose as tools (path -> tool config)
 # This allows us to control which endpoints are exposed and how they're described
 CURATED_ENDPOINTS = {
@@ -2786,6 +2797,7 @@ def dispatch(
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "lifeos", "version": "1.0.0"},
+                "instructions": SERVER_INSTRUCTIONS,
             }
             return None if is_notification else _ok(request_id, result)
 
