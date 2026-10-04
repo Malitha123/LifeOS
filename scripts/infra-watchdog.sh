@@ -26,6 +26,7 @@ ROUTES_FILE="${LIFEOS_TAILSCALE_ROUTES_FILE:-$PROJECT_DIR/config/tailscale-route
 COOLDOWN_MIN="${LIFEOS_INFRA_ALERT_COOLDOWN_MIN:-360}"
 PEBBLE_STRIKES="${LIFEOS_INFRA_PEBBLE_STRIKES:-3}"
 OBSIDIAN_LAUNCH_CMD="${LIFEOS_OBSIDIAN_LAUNCH_CMD:-systemd-run --user --collect --unit=obsidian-session-\$(date +%s) snap run obsidian}"
+NODE_SCRIPT="$SCRIPT_DIR/mcp-funnel-node.sh"
 
 mkdir -p "$STATE_DIR"
 
@@ -181,7 +182,37 @@ check_obsidian() {
     fi
 }
 
+# The public MCP node (LIFEOS_MCP_FUNNEL_NODE=true): its container must be
+# running and publish exactly the public socket. A logged-out node needs the
+# operator.
+check_mcp_funnel_node() {
+    local rc
+    [ "${LIFEOS_MCP_FUNNEL_NODE:-false}" = "true" ] || return 0
+    "$NODE_SCRIPT" check > /dev/null 2>&1
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        log "mcp-funnel: published"
+        return 0
+    fi
+    if [ $rc -ne 3 ]; then
+        "$NODE_SCRIPT" up > /dev/null 2>&1
+        rc=$?
+        if [ $rc -eq 0 ]; then
+            log "mcp-funnel: node was down or not publishing exactly; restored"
+            return 0
+        fi
+    fi
+    if [ $rc -eq 3 ]; then
+        log "mcp-funnel: node logged out"
+        alert mcp-funnel-login "LifeOS host: the public MCP node is logged out of Tailscale, so connected apps (Claude, ChatGPT) cannot reach LifeOS. Run scripts/mcp-funnel-node.sh login (docs/guides/mcp-connected-apps.md)."
+    else
+        log "mcp-funnel: node down or not publishing exactly, and could not be restored"
+        alert mcp-funnel "LifeOS host: the public MCP node is down or not publishing exactly its socket, and could not be restored, so connected apps cannot reach LifeOS."
+    fi
+}
+
 check_routes
 check_pebble
 check_obsidian
+check_mcp_funnel_node
 exit 0

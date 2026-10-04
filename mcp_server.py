@@ -164,6 +164,17 @@ _SEARCH_FACET_PROPERTIES = {
     "project": {"type": "array", "items": {"type": "string"}, "description": "Only notes tagged with these projects."},
 }
 
+# Sent in the initialize result; clients such as Claude show it to the model so
+# it knows when to reach for these tools.
+SERVER_INSTRUCTIONS = (
+    "LifeOS is the user's personal knowledge base and assistant: their notes vault, "
+    "tasks, reminders, calendar, email, messages, people and relationships, meetings, "
+    "and finances, indexed and searchable. Prefer these tools over general knowledge "
+    "or memory for anything about the user's own life, work, people, plans, or past "
+    "conversations. Start with lifeos_ask for a synthesized answer or lifeos_search for "
+    "source passages; use the people tools for anyone the user names."
+)
+
 # Curated list of endpoints to expose as tools (path -> tool config)
 # This allows us to control which endpoints are exposed and how they're described
 CURATED_ENDPOINTS = {
@@ -2786,6 +2797,7 @@ def dispatch(
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "lifeos", "version": "1.0.0"},
+                "instructions": SERVER_INSTRUCTIONS,
             }
             return None if is_notification else _ok(request_id, result)
 
@@ -2959,10 +2971,42 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str, oauth=None):
     return app
 
 
+# Paths the public unix-socket listener serves; everything else is 404 there.
+PUBLIC_SOCKET_PATHS = frozenset({
+    "/mcp",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/mcp",
+    "/.well-known/oauth-authorization-server",
+    "/oauth/register",
+    "/oauth/token",
+    "/oauth/revoke",
+})
+
+
+def public_socket_app(app):
+    """ASGI wrapper for the public listener: only `PUBLIC_SOCKET_PATHS` reach `app`.
+
+    A unix-socket request has no client address, so it never counts as a
+    loopback peer; the allowlist keeps the consent and connected-apps endpoints
+    off this listener as well.
+    """
+    async def wrapped(scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") not in PUBLIC_SOCKET_PATHS:
+            await send({"type": "http.response.start", "status": 404,
+                        "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b"Not Found"})
+            return
+        await app(scope, receive, send)
+    return wrapped
+
+
 def run_http(
     server: "LifeOSMCPServer", host: str, port: int, bearer_token: str, oauth=None,
+    uds: str | None = None,
 ) -> None:
-    """Run the HTTP transport via uvicorn."""
+    """Run the HTTP transport via uvicorn, plus the public unix-socket listener when `uds` is set."""
+    import asyncio
+
     import uvicorn  # local import — only needed for HTTP mode
 
     app = build_http_app(server, bearer_token=bearer_token, oauth=oauth)
@@ -2970,7 +3014,36 @@ def run_http(
     # and connected-apps endpoints trust identity only from a loopback peer
     # (Tailscale Serve); uvicorn's default would replace that peer with the
     # proxy's X-Forwarded-For address.
-    uvicorn.run(app, host=host, port=port, log_level="info", proxy_headers=False)
+    if not uds:
+        uvicorn.run(app, host=host, port=port, log_level="info", proxy_headers=False)
+        return
+
+    os.makedirs(os.path.dirname(uds) or ".", mode=0o700, exist_ok=True)
+    if os.path.exists(uds):
+        os.remove(uds)
+    tcp = uvicorn.Server(uvicorn.Config(
+        app, host=host, port=port, log_level="info", proxy_headers=False,
+    ))
+    sock = uvicorn.Server(uvicorn.Config(
+        public_socket_app(app), uds=uds, log_level="info", proxy_headers=False,
+        lifespan="off",
+    ))
+
+    async def serve_both() -> None:
+        # Each server installs its own signal capture, so a shutdown signal may
+        # reach only one; when either stops, stop the other.
+        tasks = [asyncio.ensure_future(tcp.serve()), asyncio.ensure_future(sock.serve())]
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        tcp.should_exit = sock.should_exit = True
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            task.result()
+
+    asyncio.run(serve_both())
+    # A listener that never started (bind failure) is a startup failure, so the
+    # service manager restarts the process.
+    if not (tcp.started and sock.started):
+        sys.exit(3)
 
 
 def main():
@@ -3011,10 +3084,13 @@ def main():
         )
         sys.exit(2)
 
+    uds = os.environ.get("LIFEOS_MCP_HTTP_UDS", "").strip() or None
     logger.info(f"LifeOS MCP HTTP transport listening on {args.host}:{args.port}")
+    if uds:
+        logger.info(f"LifeOS MCP public listener on unix socket {uds}")
     run_http(
         server, host=args.host, port=args.port, bearer_token=bearer_token,
-        oauth=_oauth_config_from_settings(),
+        oauth=_oauth_config_from_settings(), uds=uds,
     )
 
 
