@@ -1879,13 +1879,25 @@ class LifeOSMCPServer:
             if resolved_agent_session:
                 headers[AGENT_SESSION_HEADER] = resolved_agent_session
 
-        # Handle path parameters
+        # Handle path parameters. Every route's path params are a single URL
+        # segment, so a value is rejected outright — before any request —
+        # if it's "", ".", ".." or contains "/": a percent-encoded "/"
+        # (%2F) is decoded back into a literal separator before routing, so
+        # encoding it doesn't stop a value from reaching a
+        # route the tool doesn't map to under the same prefix (e.g.
+        # person_id="x/timeline" on "/api/crm/people/{person_id}" reaching
+        # the .../timeline route). Surviving values are percent-encoded,
+        # preserving ":" so ids like "sync:gmail" reach the API unchanged.
         if "{" in endpoint_path:
             import re
+            import urllib.parse
             path_params = re.findall(r"\{(\w+)\}", endpoint_path)
             for param in path_params:
                 if param in arguments:
-                    url = url.replace(f"{{{param}}}", str(arguments.pop(param)))
+                    value = str(arguments.pop(param))
+                    if value in ("", ".", "..") or "/" in value:
+                        return {"error": f"Invalid {param}: {value!r}"}
+                    url = url.replace(f"{{{param}}}", urllib.parse.quote(value, safe=":"))
 
         try:
             if method == "GET":

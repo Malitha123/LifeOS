@@ -1492,3 +1492,83 @@ class TestScheduleBudgetToolSchemas:
         schema = server._get_fallback_schema("lifeos_schedule_update")
         assert schema["properties"]["budget_dollars"]["type"] == "number"
         assert schema["properties"]["wall_seconds"]["type"] == "integer"
+
+
+# ---------------------------------------------------------------------------
+# Path-param traversal (_call_api). A caller-supplied path-param value must
+# not be able to change which upstream route gets requested — a tool
+# must always reach the one endpoint it maps to.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_path_param_containing_slash_is_rejected_before_any_request():
+    """A value containing '/' — including a '../' traversal attempt — is
+    rejected outright before any request, rather than percent-encoded: a
+    percent-encoded '/' (%2F) is decoded back into a literal separator
+    before routing, so encoding it doesn't stop the value from reaching a
+    different route under the same prefix."""
+    module = _load_mcp_module_fresh()
+    server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
+
+    called = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(str(request.url))
+        return httpx.Response(200, json={"ok": True})
+
+    server.client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    result = server._call_api(
+        "lifeos_person_profile", {"person_id": "../../monarch/accounts"}
+    )
+
+    assert called == [], f"upstream request was made: {called}"
+    assert "error" in result
+
+
+@pytest.mark.unit
+def test_path_param_sibling_route_via_slash_is_rejected_before_any_request():
+    """A same-prefix sibling-route value (no '..', just an extra '/'
+    segment) must be rejected before any request — otherwise a tool
+    mapped to one endpoint (e.g. lifeos_person_profile) could
+    reach a sibling endpoint's route (e.g. the
+    lifeos_person_timeline tool's .../timeline) via a percent-encoded '/'
+    that the server decodes back into a literal separator before routing."""
+    module = _load_mcp_module_fresh()
+    server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
+
+    called = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(str(request.url))
+        return httpx.Response(200, json={"ok": True})
+
+    server.client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    result = server._call_api("lifeos_person_profile", {"person_id": "x/timeline"})
+
+    assert called == [], f"upstream request was made: {called}"
+    assert "error" in result
+
+
+@pytest.mark.unit
+def test_path_param_exact_dotdot_is_rejected_before_any_request():
+    """An exact '..' value is rejected outright rather than percent-encoded:
+    quoting leaves the literal dot-segment untouched, and substituting it
+    between the endpoint's own '/' characters (e.g.
+    /api/crm/people/../facts) would still normalize to a different route."""
+    module = _load_mcp_module_fresh()
+    server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
+
+    called = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(str(request.url))
+        return httpx.Response(200, json={"ok": True})
+
+    server.client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    result = server._call_api("lifeos_person_profile", {"person_id": ".."})
+
+    assert called == [], f"upstream request was made: {called}"
+    assert "error" in result
