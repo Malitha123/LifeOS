@@ -9,9 +9,14 @@ from disk — stale-but-present when a refresh is missed (check synced_at).
 - GET /api/investments/summary            compact household picture
 - GET /api/investments/portfolio          full detail (no price series)
 - GET /api/investments/portfolio?section= one top-level section only
-- GET /api/investments/movers             scheduler digest: big day movers
+- GET /api/investments/movers?threshold=  scheduler digest: the investments
+                                          repo's movers.py (big day movers)
 - GET /api/investments/today              scheduler digest: the investments
                                           repo's day_digest.py (day so far vs IVV)
+
+The two digests run scripts in the investments checkout
+(settings.investments_dir), which computes them from live Schwab data; LifeOS
+only runs and schedules them.
 """
 import asyncio
 import json
@@ -96,116 +101,64 @@ def check_investments_freshness() -> Optional[str]:
     return None
 
 
-# --- Big-mover alert -------------------------------------------------------
+# --- Scheduler digests from the investments repo ---------------------------
+#
+# The investments repo owns these computations (live Schwab positions and
+# quotes); LifeOS only runs its scripts with that repo's venv and schedules
+# the output.
+
+INVESTMENTS_SCRIPT_TIMEOUT_S = 120
 
 # Default day-change threshold: a held ticker up or down more than this many
 # percent on the day is a "mover" worth a nudge.
 MOVER_THRESHOLD_PCT = 5.0
 
 
-def _held_tickers() -> list[str]:
-    """Quotable tickers held as of the latest snapshot (non-external only).
-
-    External accounts (Guideline 401(k), TSP) are excluded by policy — their
-    fund-level balances have no actionable intraday day-move — regardless of
-    whether the snapshot carries a symbol for them. Returns [] when the snapshot
-    isn't synced or is malformed.
-    """
-    path = os.path.join(SYNC_DIR, "summary.json")
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for p in data.get("positions", []):
-        if not isinstance(p, dict):
-            continue
-        sym = (p.get("symbol") or "").strip().upper()
-        if sym and not p.get("external") and sym not in seen:
-            seen.add(sym)
-            out.append(sym)
-    return out
+def _run_investments_script(script: str, *args: str) -> str:
+    """Run ``script`` from the investments checkout with its own venv and
+    return its stdout. Raises on a missing checkout, timeout or non-zero exit."""
+    repo = os.path.expanduser(settings.investments_dir)
+    result = subprocess.run(
+        [os.path.join(repo, "venv", "bin", "python"), script, *args],
+        cwd=repo, capture_output=True, text=True, timeout=INVESTMENTS_SCRIPT_TIMEOUT_S,
+    )
+    if result.returncode:
+        raise RuntimeError(f"{script} exited {result.returncode}: {result.stderr[-500:]}")
+    return result.stdout.strip()
 
 
-def _day_changes(symbols: list[str]) -> dict[str, float]:
-    """Map each symbol to its day-change percent (current price vs. prior close)
-    via yfinance. Best-effort: a symbol whose quote can't be resolved is omitted,
-    so a partial or failed fetch degrades to fewer movers rather than an error.
-    """
-    if not symbols:
-        return {}
-    import yfinance as yf
-
-    out: dict[str, float] = {}
-    for sym in symbols:
-        try:
-            fi = yf.Ticker(sym).fast_info
-            last = getattr(fi, "last_price", None)
-            prev = getattr(fi, "previous_close", None)
-            if last and prev and prev > 0:
-                out[sym] = (last - prev) / prev * 100.0
-        except Exception:
-            continue
-    return out
+async def _movers(threshold: float) -> dict:
+    """Run movers.py; raises when it couldn't check (e.g. Schwab unreachable)."""
+    msg = await asyncio.to_thread(_run_investments_script, "movers.py", "--threshold", f"{threshold:g}")
+    count = sum(1 for line in msg.splitlines() if line.startswith("- "))
+    return {"scheduler_message": msg, "count": count}
 
 
 @router.get("/movers")
 async def investments_movers(threshold: float = MOVER_THRESHOLD_PCT):
-    """Held positions whose absolute day change is more than ``threshold`` percent.
+    """Held positions whose absolute day change is more than ``threshold``
+    percent, from the investments repo's movers.py.
 
     Returns ``{"scheduler_message": <digest or "">, "count": N}``. The digest is
-    tickers and percentages only (no dollar amounts); it is empty when nothing
-    moved that much — or on any failure (missing snapshot / quote-fetch error) —
-    so a scheduled ``endpoint`` action stays silent on a quiet day. The blocking
-    yfinance fetch runs in a worker thread so it never stalls the event loop.
+    tickers and percentages only (no dollar amounts); it is empty on a quiet or
+    non-trading day — or on any failure — so a scheduled ``endpoint`` action
+    stays silent.
     """
     try:
-        changes = await asyncio.to_thread(_day_changes, _held_tickers())
-        movers = sorted(
-            ((s, pct) for s, pct in changes.items() if abs(pct) > threshold),
-            key=lambda sp: -abs(sp[1]),
-        )
-        if not movers:
-            return {"scheduler_message": "", "count": 0}
-        lines = [f"Positions moving more than {threshold:g}% today:"]
-        for sym, pct in movers:
-            lines.append(f"- {sym}: {'▲' if pct >= 0 else '▼'} {pct:+.1f}%")
-        return {"scheduler_message": "\n".join(lines), "count": len(movers)}
+        return await _movers(threshold)
     except Exception as e:
         logger.warning(f"investments movers check failed: {e}")
         return {"scheduler_message": "", "count": 0}
 
 
-# --- Day-so-far digest -------------------------------------------------------
-
-DAY_DIGEST_TIMEOUT_S = 120
-
-
-def _run_day_digest() -> str:
-    """Run the investments repo's day_digest.py with its own venv; it owns the
-    computation (live Schwab positions and quotes) and prints the message, or
-    nothing on a non-trading day."""
-    repo = os.path.expanduser(settings.investments_dir)
-    result = subprocess.run(
-        [os.path.join(repo, "venv", "bin", "python"), "day_digest.py"],
-        cwd=repo, capture_output=True, text=True, timeout=DAY_DIGEST_TIMEOUT_S,
-    )
-    if result.returncode:
-        raise RuntimeError(f"day_digest.py exited {result.returncode}: {result.stderr[-500:]}")
-    return result.stdout.strip()
-
-
 @router.get("/today")
 async def investments_today():
     """The invested portfolio's move so far today vs IVV with its top three
-    gainers and losers, for a weekday 15:00 ``endpoint`` schedule. Empty — and
-    the scheduler silent — on a non-trading day or any failure."""
+    gainers and losers (the investments repo's day_digest.py), for a weekday
+    15:00 ``endpoint`` schedule. Empty — and the scheduler silent — on a
+    non-trading day or any failure."""
     try:
-        return {"scheduler_message": await asyncio.to_thread(_run_day_digest)}
+        return {"scheduler_message": await asyncio.to_thread(_run_investments_script, "day_digest.py")}
     except Exception as e:
         logger.warning(f"investments day digest failed: {e}")
         return {"scheduler_message": ""}

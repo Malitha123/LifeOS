@@ -1633,8 +1633,8 @@ class Settings(BaseSettings):
         default="~/Code/investments",
         alias="LIFEOS_INVESTMENTS_DIR",
         description="Checkout of nbramia/investments on this host; "
-                    "/api/investments/today runs its day_digest.py with its "
-                    "venv. Expanduser'd at read time."
+                    "/api/investments/today and /movers run its day_digest.py "
+                    "and movers.py with its venv. Expanduser'd at read time."
     )
 
     # Backup directory

@@ -803,8 +803,8 @@ TOOL_DEFINITIONS = [
             "'investments' (the user's full portfolio: Schwab + Guideline 401k + TSP — totals, tax "
             "buckets, per-position holdings with cost basis, savings by year, wealth trend, taxable "
             "unrealized gains; aggregated nightly by the investments pipeline). "
-            "'movers' (which held positions moved most today — live day-change % for the snapshot's "
-            "tickers, past an optional 'threshold' percent, default 5). "
+            "'movers' (which held positions moved most today — live day-change % for held "
+            "Schwab positions, past an optional 'threshold' percent, default 5). "
             "For historical monthly summaries, use search_vault with 'finance' or 'spending'."
         ),
         "input_schema": {
@@ -4093,18 +4093,19 @@ async def _tool_search_finances(inp: dict) -> str:
         return "\n".join(lines)
 
     if action == "movers":
-        # On-demand "which of my positions moved most today?" — reuses the noon
-        # big-mover check (live day-change via yfinance for the snapshot's tickers).
-        from api.routes.investments import MOVER_THRESHOLD_PCT, _held_tickers, investments_movers
+        # On-demand "which of my positions moved most today?" — runs the same
+        # investments-repo movers.py as the noon schedule.
+        from api.routes import investments as inv_routes
         threshold = inp.get("threshold")
         if not isinstance(threshold, (int, float)) or threshold <= 0:
-            threshold = MOVER_THRESHOLD_PCT
-        if not _held_tickers():
+            threshold = inv_routes.MOVER_THRESHOLD_PCT
+        try:
+            result = await inv_routes._movers(threshold)
+        except Exception as e:
             # Distinguish "couldn't check" from a genuinely quiet day — on an
-            # on-demand ask, an empty count from a missing snapshot shouldn't read
-            # as "the market was flat."
-            return "Couldn't check movers right now — the investments snapshot isn't available."
-        result = await investments_movers(threshold=threshold)
+            # on-demand ask, a failed check shouldn't read as "the market was flat."
+            logger.warning(f"on-demand movers check failed: {e}")
+            return "Couldn't check movers right now — the investments movers check failed."
         if result.get("count"):
             return result["scheduler_message"]
         return f"No held position moved more than {threshold:g}% today."
