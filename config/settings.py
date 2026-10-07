@@ -1629,6 +1629,13 @@ class Settings(BaseSettings):
                     "the investments API route and the search_finances "
                     "'investments' chat tool action. Expanduser'd at read time."
     )
+    investments_dir: str = Field(
+        default="~/Code/investments",
+        alias="LIFEOS_INVESTMENTS_DIR",
+        description="Checkout of nbramia/investments on this host; "
+                    "/api/investments/today runs its day_digest.py with its "
+                    "venv. Expanduser'd at read time."
+    )
 
     # Backup directory
     backup_path: str = Field(
