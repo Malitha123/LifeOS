@@ -293,3 +293,23 @@ async def test_search_finances_movers_snapshot_not_synced(monkeypatch):
     monkeypatch.setattr(inv, "_held_tickers", lambda: [])
     out = await _tool_search_finances({"action": "movers"})
     assert "couldn't check" in out.lower() or "isn't available" in out.lower()
+
+
+def test_today_returns_day_digest_output(tmp_path, monkeypatch):
+    (tmp_path / "venv" / "bin").mkdir(parents=True)
+    py = tmp_path / "venv" / "bin" / "python"
+    py.symlink_to(__import__("sys").executable)
+    (tmp_path / "day_digest.py").write_text("print('Portfolio through 3:00pm: +0.10%')\n")
+    monkeypatch.setattr(inv.settings, "investments_dir", str(tmp_path))
+    out = await_sync(inv.investments_today())
+    assert out == {"scheduler_message": "Portfolio through 3:00pm: +0.10%"}
+
+
+def test_today_silent_on_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(inv.settings, "investments_dir", str(tmp_path))  # no checkout
+    assert await_sync(inv.investments_today()) == {"scheduler_message": ""}
+
+
+def await_sync(coro):
+    import asyncio
+    return asyncio.run(coro)

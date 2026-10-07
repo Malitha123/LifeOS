@@ -1,19 +1,23 @@
 """Investments snapshot — the operator's Schwab pipeline, served from Syncthing.
 
-The macbook's nightly refresh (~/Code/Personal/investments, private repo
-nbramia/investments) aggregates 5 Schwab accounts + Guideline 401(k) + TSP
-and writes summary.json / portfolio.json into ~/Code/Sync/investments;
-Syncthing lands them here within seconds. These endpoints serve the files
-from disk — stale-but-present when the mac is asleep (check synced_at).
+The publisher's weekday refresh (nathan-linux ~/Code/investments, private
+repo nbramia/investments) aggregates the Schwab accounts + Guideline 401(k) +
+TSP and writes summary.json / portfolio.json into ~/Code/Sync/investments;
+Syncthing carries them to the LifeOS host. These endpoints serve the files
+from disk — stale-but-present when a refresh is missed (check synced_at).
 
 - GET /api/investments/summary            compact household picture
 - GET /api/investments/portfolio          full detail (no price series)
 - GET /api/investments/portfolio?section= one top-level section only
+- GET /api/investments/movers             scheduler digest: big day movers
+- GET /api/investments/today              scheduler digest: the investments
+                                          repo's day_digest.py (day so far vs IVV)
 """
 import asyncio
 import json
 import logging
 import os
+import subprocess
 from datetime import datetime
 from typing import Optional
 
@@ -27,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 SYNC_DIR = os.path.expanduser(settings.investments_sync_dir)
 
-# Freshness alerting: the macbook pipeline refreshes on weekdays (~18:30)
+# Freshness alerting: the publisher refreshes on weekdays (~18:30)
 # and Syncthing delivers here. A weekend plus the weekday cadence can leave the
 # file ~3 days old legitimately, so warn only past this threshold — enough to
 # catch a genuinely stuck pipeline / Syncthing without false-alarming on Mondays.
@@ -38,7 +42,7 @@ def _load(name: str):
     path = os.path.join(SYNC_DIR, name)
     if not os.path.exists(path):
         raise HTTPException(status_code=404,
-                            detail=f"{name} not synced yet — run the macbook refresh")
+                            detail=f"{name} not synced yet — run the publisher refresh")
     with open(path) as f:
         data = json.load(f)
     synced = datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds")
@@ -174,3 +178,34 @@ async def investments_movers(threshold: float = MOVER_THRESHOLD_PCT):
     except Exception as e:
         logger.warning(f"investments movers check failed: {e}")
         return {"scheduler_message": "", "count": 0}
+
+
+# --- Day-so-far digest -------------------------------------------------------
+
+DAY_DIGEST_TIMEOUT_S = 120
+
+
+def _run_day_digest() -> str:
+    """Run the investments repo's day_digest.py with its own venv; it owns the
+    computation (live Schwab positions and quotes) and prints the message, or
+    nothing on a non-trading day."""
+    repo = os.path.expanduser(settings.investments_dir)
+    result = subprocess.run(
+        [os.path.join(repo, "venv", "bin", "python"), "day_digest.py"],
+        cwd=repo, capture_output=True, text=True, timeout=DAY_DIGEST_TIMEOUT_S,
+    )
+    if result.returncode:
+        raise RuntimeError(f"day_digest.py exited {result.returncode}: {result.stderr[-500:]}")
+    return result.stdout.strip()
+
+
+@router.get("/today")
+async def investments_today():
+    """The invested portfolio's move so far today vs IVV with its top three
+    gainers and losers, for a weekday 15:00 ``endpoint`` schedule. Empty — and
+    the scheduler silent — on a non-trading day or any failure."""
+    try:
+        return {"scheduler_message": await asyncio.to_thread(_run_day_digest)}
+    except Exception as e:
+        logger.warning(f"investments day digest failed: {e}")
+        return {"scheduler_message": ""}
