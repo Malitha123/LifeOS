@@ -167,65 +167,54 @@ def test_freshness_just_over_threshold_warns(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Big-mover alert
+# Scheduler digests: scripts in the investments checkout
 # ---------------------------------------------------------------------------
 
-async def test_movers_reports_positions_past_threshold(monkeypatch):
+def _checkout(tmp_path, monkeypatch, **scripts):
+    """A fake investments checkout whose venv python is this interpreter."""
+    (tmp_path / "venv" / "bin").mkdir(parents=True)
+    (tmp_path / "venv" / "bin" / "python").symlink_to(__import__("sys").executable)
+    for name, body in scripts.items():
+        (tmp_path / f"{name}.py").write_text(body)
+    monkeypatch.setattr(inv.settings, "investments_dir", str(tmp_path))
+
+
+MOVERS_ECHO = (
+    "import sys\n"
+    "assert sys.argv[1:2] == ['--threshold']\n"
+    "t = sys.argv[2]\n"
+    "print(f'Positions moving more than {t}% today:')\n"
+    "print('- AMD: ▼ -7.2%')\n"
+    "print('- NVDA: ▲ +6.5%')\n"
+)
+
+
+async def test_movers_runs_investments_script_with_threshold(tmp_path, monkeypatch):
     import re
-    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD", "VTI", "NVDA"])
-    monkeypatch.setattr(inv, "_day_changes", lambda syms: {"AMD": -7.2, "VTI": 1.1, "NVDA": 6.5})
+    _checkout(tmp_path, monkeypatch, movers=MOVERS_ECHO)
     out = await inv.investments_movers(threshold=5)
     assert out["count"] == 2
     msg = out["scheduler_message"]
-    assert "AMD" in msg and "NVDA" in msg
-    assert "VTI" not in msg            # under threshold
-    assert "-7.2%" in msg
+    assert msg.splitlines()[0] == "Positions moving more than 5% today:"
     # Privacy: every mover line is exactly "- TICKER: ▲/▼ ±N.N%" — no dollar
-    # amount, share count, or weight can structurally appear in the digest.
+    # amount, share count, or weight.
     for line in msg.splitlines()[1:]:
         assert re.match(r"^- [A-Z.]+: [▲▼] [+-]\d+\.\d%$", line), line
+    assert (await inv.investments_movers(threshold=2.5))["scheduler_message"].startswith(
+        "Positions moving more than 2.5% today:")
 
 
-async def test_movers_strict_threshold_excludes_exactly_5(monkeypatch):
-    """'More than 5%' is strict: a position at exactly the threshold is not a mover."""
-    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
-    monkeypatch.setattr(inv, "_day_changes", lambda syms: {"AMD": 5.0})
-    out = await inv.investments_movers(threshold=5)
-    assert out == {"scheduler_message": "", "count": 0}
-
-
-async def test_movers_silent_when_nothing_moves(monkeypatch):
-    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD", "VTI"])
-    monkeypatch.setattr(inv, "_day_changes", lambda syms: {"AMD": 1.0, "VTI": -2.4})
+async def test_movers_silent_when_nothing_moves(tmp_path, monkeypatch):
+    _checkout(tmp_path, monkeypatch, movers="")
     out = await inv.investments_movers(threshold=5)
     assert out == {"scheduler_message": "", "count": 0}   # empty => scheduler stays silent
 
 
-async def test_movers_non_fatal_on_fetch_failure(monkeypatch):
-    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
-
-    def boom(syms):
-        raise RuntimeError("yahoo down")
-
-    monkeypatch.setattr(inv, "_day_changes", boom)
-    out = await inv.investments_movers(threshold=5)
-    assert out == {"scheduler_message": "", "count": 0}   # degrades to no-alert, not a 500
-
-
-def test_held_tickers_excludes_external_and_blanks(tmp_path, monkeypatch):
-    monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))
-    (tmp_path / "summary.json").write_text(
-        '{"positions": [{"symbol": "VTI", "external": false}, '
-        '{"symbol": "GFND", "external": true}, {"symbol": "", "external": false}]}'
-    )
-    assert inv._held_tickers() == ["VTI"]
-
-
-def test_held_tickers_empty_when_not_synced_or_malformed(tmp_path, monkeypatch):
-    monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))
-    assert inv._held_tickers() == []                      # empty dir, no file
-    (tmp_path / "summary.json").write_text("[1, 2, 3]")   # non-dict top-level
-    assert inv._held_tickers() == []
+async def test_movers_non_fatal_on_failure(tmp_path, monkeypatch):
+    _checkout(tmp_path, monkeypatch, movers="import sys; sys.exit(1)")
+    assert await inv.investments_movers(threshold=5) == {"scheduler_message": "", "count": 0}
+    monkeypatch.setattr(inv.settings, "investments_dir", str(tmp_path / "missing"))
+    assert await inv.investments_movers(threshold=5) == {"scheduler_message": "", "count": 0}
 
 
 def test_scheduler_endpoint_prefers_scheduler_message_field():
@@ -249,8 +238,7 @@ async def test_search_finances_movers_action(monkeypatch):
     reusing investments_movers — tickers + % only, no dollar amounts."""
     from unittest.mock import AsyncMock
     from api.services.agent_tools import _tool_search_finances
-    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
-    monkeypatch.setattr(inv, "investments_movers", AsyncMock(return_value={
+    monkeypatch.setattr(inv, "_movers", AsyncMock(return_value={
         "scheduler_message": "Positions moving more than 5% today:\n- AMD: ▲ +5.8%", "count": 1}))
     out = await _tool_search_finances({"action": "movers"})
     assert "AMD" in out and "5.8%" in out
@@ -262,8 +250,7 @@ async def test_search_finances_movers_none_today(monkeypatch):
     rather than returning an empty string."""
     from unittest.mock import AsyncMock
     from api.services.agent_tools import _tool_search_finances
-    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
-    monkeypatch.setattr(inv, "investments_movers", AsyncMock(return_value={
+    monkeypatch.setattr(inv, "_movers", AsyncMock(return_value={
         "scheduler_message": "", "count": 0}))
     out = await _tool_search_finances({"action": "movers", "threshold": 3})
     assert "No held position moved more than 3% today" in out
@@ -273,34 +260,30 @@ async def test_search_finances_movers_threshold_zero_uses_default(monkeypatch):
     """An explicit threshold of 0 (or non-positive/non-numeric) falls back to the
     5% default rather than listing every position that moved at all."""
     from api.services.agent_tools import _tool_search_finances
-    monkeypatch.setattr(inv, "_held_tickers", lambda: ["AMD"])
     captured = {}
 
     async def fake(threshold):
         captured["threshold"] = threshold
         return {"scheduler_message": "", "count": 0}
 
-    monkeypatch.setattr(inv, "investments_movers", fake)
+    monkeypatch.setattr(inv, "_movers", fake)
     out = await _tool_search_finances({"action": "movers", "threshold": 0})
     assert captured["threshold"] == inv.MOVER_THRESHOLD_PCT
     assert "more than 5% today" in out
 
 
-async def test_search_finances_movers_snapshot_not_synced(monkeypatch):
-    """On-demand: a missing snapshot says 'couldn't check' — distinct from a
-    genuinely quiet day, so the user isn't misled that the market was flat."""
+async def test_search_finances_movers_check_failed(tmp_path, monkeypatch):
+    """On-demand: a failed check (movers.py exits non-zero when Schwab can't be
+    reached) says 'couldn't check' — distinct from a genuinely quiet day, so the
+    user isn't misled that the market was flat."""
     from api.services.agent_tools import _tool_search_finances
-    monkeypatch.setattr(inv, "_held_tickers", lambda: [])
+    _checkout(tmp_path, monkeypatch, movers="import sys; sys.exit(1)")
     out = await _tool_search_finances({"action": "movers"})
     assert "couldn't check" in out.lower() or "isn't available" in out.lower()
 
 
 def test_today_returns_day_digest_output(tmp_path, monkeypatch):
-    (tmp_path / "venv" / "bin").mkdir(parents=True)
-    py = tmp_path / "venv" / "bin" / "python"
-    py.symlink_to(__import__("sys").executable)
-    (tmp_path / "day_digest.py").write_text("print('Portfolio through 3:00pm: +0.10%')\n")
-    monkeypatch.setattr(inv.settings, "investments_dir", str(tmp_path))
+    _checkout(tmp_path, monkeypatch, day_digest="print('Portfolio through 3:00pm: +0.10%')\n")
     out = await_sync(inv.investments_today())
     assert out == {"scheduler_message": "Portfolio through 3:00pm: +0.10%"}
 
