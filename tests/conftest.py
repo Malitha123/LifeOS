@@ -1325,6 +1325,31 @@ def _isolate_transcript_store_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_claude_model_resolution(tmp_path, monkeypatch):
+    """Keep Claude family-name resolution off the network and off the real
+    models cache.
+
+    Any code path that reaches the Anthropic client boundary resolves a
+    family name (`haiku`/`sonnet`/`opus`) through
+    `claude_models.resolve_claude_model`, which would otherwise call
+    Anthropic's models list whenever an API key is configured and read or
+    write `data/claude_models.json`. Every test gets an unreachable list
+    (families resolve from `LATEST_KNOWN`) and a per-test cache path; a
+    resolver test replaces `_fetch_model_ids` with its own fake.
+    """
+    from api.services import claude_models
+
+    def _no_models_list():
+        return None
+
+    monkeypatch.setattr(claude_models, "_fetch_model_ids", _no_models_list)
+    monkeypatch.setattr(claude_models, "CACHE_PATH", tmp_path / "claude_models.json")
+    claude_models.reset_cache()
+    yield
+    claude_models.reset_cache()
+
+
+@pytest.fixture(autouse=True)
 def _reset_turn_registry():
     """Reset the chat-turn registry (`api/services/chat_turns.py`)
     before and after every test.

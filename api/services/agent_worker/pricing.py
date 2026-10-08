@@ -19,7 +19,13 @@ enforcement, but they don't contribute to the dollar budget or the daily cap.
 """
 from __future__ import annotations
 
-import re
+from typing import Optional
+
+from api.services.claude_models import (
+    _DATED_SNAPSHOT_SUFFIX,
+    _parse_claude_family_version,
+    family_of,
+)
 
 
 # Anthropic Managed Agents charge a flat per-session-hour overhead on top of
@@ -39,6 +45,8 @@ PRICING: dict[str, dict[str, float]] = {
     # prices correctly instead of falling through to fallback_rates().
     "claude-fable-5":    {"input": 10.0e-6, "output": 50.0e-6},
     "claude-mythos-5":   {"input": 10.0e-6, "output": 50.0e-6},
+    # $4/$20 per Mtok.
+    "claude-opus-5-5":   {"input":  4.0e-6, "output": 20.0e-6},
     # Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 all share the same $5/$25-per-Mtok rate.
     "claude-opus-5":     {"input":  5.0e-6, "output": 25.0e-6},
     "claude-opus-4-8":   {"input":  5.0e-6, "output": 25.0e-6},
@@ -49,6 +57,7 @@ PRICING: dict[str, dict[str, float]] = {
     # the permanent rate (Anthropic cancelled the scheduled 2026-09-01
     # increase to $3/$15).
     "claude-sonnet-5":   {"input":  2.0e-6, "output": 10.0e-6},
+    "claude-sonnet-5-5": {"input":  2.0e-6, "output": 10.0e-6},
     "claude-sonnet-4-6": {"input":  3.0e-6, "output": 15.0e-6},
     "claude-sonnet-4-5": {"input":  3.0e-6, "output": 15.0e-6},
     # Retired but still referenced by historical usage rows — same
@@ -56,6 +65,9 @@ PRICING: dict[str, dict[str, float]] = {
     "claude-sonnet-4":   {"input":  3.0e-6, "output": 15.0e-6},
     # $1.00/$5.00 per Mtok (Haiku 4.5's actual published rate).
     "claude-haiku-4-5":  {"input":  1.0e-6, "output":  5.0e-6},
+    # $0.10/$0.50 per Mtok for a request of up to 100K input tokens; a
+    # longer request is billed at its LONG_PROMPT_TIERS rate instead.
+    "claude-haiku-5-5":  {"input":  0.1e-6, "output":  0.5e-6},
     # Retired tiers, still served on Bedrock/Vertex and still named by
     # historical usage rows. Without them here, a row referencing one
     # would resolve to fallback_rates() and *understate* the Opus pair
@@ -84,12 +96,11 @@ RETIRED_MODELS: frozenset[str] = frozenset({
     "claude-haiku-3-5",
 })
 
-# Matches a trailing dated-snapshot suffix on an Anthropic model id, e.g.
-# "claude-sonnet-4-5-20250929" -> "claude-sonnet-4-5". Real usage rows
-# (Claude Code sessions in particular) record the exact snapshot id the API
-# echoed back rather than the bare tier id above, so a lookup needs both
-# forms to keep historical rows priced.
-_DATED_SNAPSHOT_SUFFIX = re.compile(r"-\d{8}$")
+# Long-prompt tiers: a single request whose input (uncached + cache writes +
+# cache reads) exceeds the threshold is billed entirely at these rates.
+LONG_PROMPT_TIERS: dict[str, tuple[int, dict[str, float]]] = {
+    "claude-haiku-5-5": (100_000, {"input": 0.5e-6, "output": 2.5e-6}),
+}
 
 
 # Anthropic prompt-cache rate multipliers, relative to the model's base input
@@ -99,11 +110,49 @@ _DATED_SNAPSHOT_SUFFIX = re.compile(r"-\d{8}$")
 # tokens that come from the cache instead of being processed fresh.
 CACHE_CREATION_RATE_MULTIPLIER: float = 1.25
 CACHE_READ_RATE_MULTIPLIER: float = 0.10
+# Models whose cache reads are billed at a different multiple of input.
+CACHE_READ_RATE_OVERRIDES: dict[str, float] = {
+    "claude-opus-5-5": 0.05,
+    "claude-sonnet-5-5": 0.05,
+}
+
+
+def _pricing_key(model: str) -> Optional[str]:
+    """The PRICING key that prices `model`: the id itself; its bare tier
+    with a dated snapshot suffix stripped (real usage rows, Claude Code
+    sessions in particular, record the exact snapshot id the API echoed
+    back); or, for a bare family name or an unlisted id in the haiku,
+    sonnet or opus family, that family's newest priced model. None when
+    nothing matches."""
+    if model in PRICING:
+        return model
+    bare = _DATED_SNAPSHOT_SUFFIX.sub("", model or "")
+    if bare in PRICING:
+        return bare
+    family = family_of(model)
+    if family is None:
+        return None
+    best_key, best_version = None, None
+    for name in PRICING:
+        if name in RETIRED_MODELS:
+            continue
+        parsed = _parse_claude_family_version(name)
+        if parsed and parsed[0] == family and (best_version is None or parsed[1] > best_version):
+            best_key, best_version = name, parsed[1]
+    return best_key
+
+
+def rates_for(model: str) -> dict[str, float]:
+    """Standard per-token rates for `model` (see `_pricing_key`), or
+    `fallback_rates()` for a model nothing in PRICING covers."""
+    key = _pricing_key(model)
+    return PRICING[key] if key else fallback_rates()
 
 
 def is_known_model(model: str) -> bool:
-    """True when `model` (or its bare tier, stripping a dated snapshot
-    suffix) has a rate in PRICING.
+    """True when `model` has a rate in PRICING: the id itself, its bare
+    tier (dated snapshot suffix stripped), or its haiku/sonnet/opus
+    family's newest rate (see `_pricing_key`).
 
     Exists for a caller that must distinguish "this model is genuinely
     free" from "this model's rate is unknown" — `cost_for` collapses
@@ -114,7 +163,7 @@ def is_known_model(model: str) -> bool:
     unrecognized model at Opus rates would misrepresent the actual (unknown)
     cost just as much as recording it as free.
     """
-    return model in PRICING or _DATED_SNAPSHOT_SUFFIX.sub("", model) in PRICING
+    return _pricing_key(model) is not None
 
 
 def fallback_rates() -> dict[str, float]:
@@ -139,8 +188,10 @@ def cost_for(
     tokens_out: int,
     cache_creation_tokens: int = 0,
     cache_read_tokens: int = 0,
+    *,
+    single_request: bool = False,
 ) -> float:
-    """Return the dollar cost of a single LLM call.
+    """Return the dollar cost of an LLM call's tokens.
 
     Anthropic charges four token buckets:
     - `tokens_in` — uncached input tokens, at the model's input rate.
@@ -148,23 +199,31 @@ def cost_for(
     - `cache_creation_tokens` — tokens written into the prompt cache on a
       cache-cold turn, at 1.25× the input rate.
     - `cache_read_tokens` — tokens served from the prompt cache on a cache-
-      warm turn, at 0.10× the input rate.
+      warm turn, at 0.10× the input rate (CACHE_READ_RATE_OVERRIDES lists
+      the models billed at a different multiple).
 
     Cache buckets default to zero so existing two-arg call sites keep
-    working. A dated snapshot id (e.g. "claude-sonnet-4-5-20250929") that
-    isn't itself a key resolves to its bare tier if that tier is priced.
-    Anything still unresolved falls through to the priciest known tier's
-    rate so a typo can't accidentally suppress budget enforcement.
+    working. The rate comes from `_pricing_key`: the id, its bare tier, or
+    its family's newest priced model. Anything still unresolved falls
+    through to the priciest known tier's rate so a typo can't accidentally
+    suppress budget enforcement.
+
+    `single_request=True` declares that the counts belong to one API
+    request, so a model's LONG_PROMPT_TIERS rate applies when that
+    request's input exceeds the tier threshold. Totals summed across
+    several requests can't be attributed to a tier and are priced at the
+    standard rate.
     """
-    rates = PRICING.get(model)
-    if rates is None:
-        rates = PRICING.get(_DATED_SNAPSHOT_SUFFIX.sub("", model))
-    if rates is None:
-        rates = fallback_rates()
+    key = _pricing_key(model)
+    rates = PRICING[key] if key else fallback_rates()
+    tier = LONG_PROMPT_TIERS.get(key) if (single_request and key) else None
+    if tier and tokens_in + cache_creation_tokens + cache_read_tokens > tier[0]:
+        rates = tier[1]
     input_rate = rates["input"]
+    cache_read_multiplier = CACHE_READ_RATE_OVERRIDES.get(key, CACHE_READ_RATE_MULTIPLIER)
     return (
         tokens_in * input_rate
         + tokens_out * rates["output"]
         + cache_creation_tokens * input_rate * CACHE_CREATION_RATE_MULTIPLIER
-        + cache_read_tokens * input_rate * CACHE_READ_RATE_MULTIPLIER
+        + cache_read_tokens * input_rate * cache_read_multiplier
     )

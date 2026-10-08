@@ -80,8 +80,8 @@ def test_parser_normalizes_nested_values_without_mutating_input():
     ("#claude", "claude_code", None), ("#codex", "codex", None),
     ("#local", "local", None), ("#hermes", "hermes", None),
     ("#cloud", "remote", None), ("remote", "remote", None),
-    ("#cloud-haiku", "claude", "claude-haiku-4-5"),
-    ("#cloud-sonnet", "claude", "claude-sonnet-5"),
+    ("#cloud-haiku", "claude", "claude-haiku-5-5"),
+    ("#cloud-sonnet", "claude", "claude-sonnet-5-5"),
 ])
 def test_legacy_aliases_remain_distinct(alias, executor, model):
     result = parse_legacy_route_alias(alias)

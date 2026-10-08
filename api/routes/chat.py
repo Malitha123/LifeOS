@@ -31,6 +31,7 @@ from api.services.time_parser import (
     extract_time_from_query,
 )
 from config.settings import settings
+from api.services.claude_models import resolve_claude_model
 from api.services.google_auth import GoogleAccount
 from api.services.perf_trace import start_trace, trace_span, finish_trace, _current_trace
 from api.services.agent_system_prompt import build_turn_context
@@ -690,7 +691,7 @@ async def ask_stream(request: AskStreamRequest):
             native_model = (
                 settings.local_llm_model if backend == "local"
                 else settings.remote_llm_model if backend == "remote"
-                else settings.anthropic_model
+                else resolve_claude_model(settings.anthropic_model)
             )
             resolution = resolve_execution(
                 parsed.request,
@@ -1136,11 +1137,12 @@ async def ask_stream(request: AskStreamRequest):
                                 print(f"Expanded query (context): '{request.question}' -> '{effective_question}'")
 
             # The agent loop uses the orchestrator model configured by
-            # LIFEOS_ANTHROPIC_MODEL (or the local backend if LIFEOS_LLM_BACKEND=local).
+            # LIFEOS_ANTHROPIC_MODEL (or the local backend if LIFEOS_LLM_BACKEND=local),
+            # a family name resolved to the newest model in that family.
             # The perf-trace field is still named `model_tier` because the column
             # in perf_traces.db is `model_tier` — but the value is a model id
-            # (e.g. "claude-haiku-4-5"), not a tier label ("haiku"/"sonnet"/"opus").
-            orchestrator_model = getattr(settings, "anthropic_model", "claude-haiku-4-5")
+            # (e.g. "claude-haiku-5-5"), not a tier label ("haiku"/"sonnet"/"opus").
+            orchestrator_model = resolve_claude_model(getattr(settings, "anthropic_model", "haiku"))
             # Escalation: pick a stronger model for this turn either because the
             # user explicitly asked ("escalate to opus") or because the
             # prior turn refused and this message pushes back. Anthropic
@@ -1178,7 +1180,7 @@ async def ask_stream(request: AskStreamRequest):
                     orchestrator_model = picked
                     escalated = True  # build a dedicated per-turn client for the pick
             elif _backend_is_anthropic:
-                escalation_model = getattr(settings, "agent_escalation_model", "") or ""
+                escalation_model = resolve_claude_model(getattr(settings, "agent_escalation_model", "") or "")
                 orchestrator_model, escalated = resolve_orchestrator_model(
                     conversation_history, request.question, orchestrator_model, escalation_model
                 )

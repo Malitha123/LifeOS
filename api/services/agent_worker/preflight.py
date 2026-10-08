@@ -7,7 +7,7 @@ A single, cheap Claude Haiku call returns structured JSON describing:
 - the expected output shape (for phrasing the completion notification)
 - a sanity flag (garbage / destructive titles get parked rather than run)
 
-The model is pinned to `claude-haiku-4-5` by default via
+The model defaults to `haiku` — the newest Haiku — via
 `LIFEOS_AGENT_PREFLIGHT_MODEL`. The function takes a callable
 `call_llm(prompt) -> str` so tests can inject a stub instead of mocking the
 SDK; production wiring lives in `_default_llm_caller`.
@@ -82,9 +82,11 @@ OUTPUT_KINDS = ("text", "file", "external_action", "structured")
 # defaults to Sonnet for general work; Haiku is selected by tag override (or
 # in future by smart routing — see §2 rubric). "local" maps to the
 # local Gemma backend. None means "no override, use settings.agent_managed_model".
+# The Claude identifiers are family names, resolved to the newest model in the
+# family where a request is made or a cost is priced.
 MODEL_LOCAL = "local"
-MODEL_HAIKU = "claude-haiku-4-5"
-MODEL_SONNET = "claude-sonnet-5"
+MODEL_HAIKU = "haiku"
+MODEL_SONNET = "sonnet"
 ALLOWED_MODELS = (MODEL_LOCAL, MODEL_HAIKU, MODEL_SONNET)
 
 
@@ -904,8 +906,8 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
       `#hermes` → routing=hermes (Hermes conversation,; model is
                          whatever Hermes reports per turn — nothing for
                          preflight to select among ALLOWED_MODELS)
-      `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5   (Anthropic API, explicit)
-      `#cloud-sonnet` → routing=claude, model=claude-sonnet-5    (Anthropic API, explicit)
+      `#cloud-haiku`  → routing=claude, model=haiku  (newest Haiku; Anthropic API, explicit)
+      `#cloud-sonnet` → routing=claude, model=sonnet (newest Sonnet; Anthropic API, explicit)
       `#cloud` → routing=remote, model="" (the configured remote
                          OpenAI-compatible provider, e.g. DeepSeek via
                          Fireworks — NEVER the Anthropic API. If the remote
@@ -1364,13 +1366,12 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
     from api.services.agent_worker.pricing import (
         CACHE_CREATION_RATE_MULTIPLIER,
         MANAGED_SESSION_HOUR_OVERHEAD,
-        PRICING,
-        fallback_rates,
+        rates_for,
     )
     from api.services.agent_worker.tool_filter import estimated_cache_creation_tokens
 
     model = result.model or MODEL_SONNET
-    rates = PRICING.get(model) or fallback_rates()
+    rates = rates_for(model)
     cache_tokens = estimated_cache_creation_tokens(result.preset_class)
     cache_cold_dollars = cache_tokens * rates["input"] * CACHE_CREATION_RATE_MULTIPLIER
     # Add session-hour overhead as a small floor so estimates align with

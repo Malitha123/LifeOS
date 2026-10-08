@@ -58,6 +58,7 @@ import httpx
 
 from api.services.agent_worker.binary_resolver import resolve_binary
 from api.services.agent_worker.pricing import PRICING, _DATED_SNAPSHOT_SUFFIX
+from api.services.claude_models import _parse_claude_family_version, _parse_version
 from config.settings import settings
 
 
@@ -88,32 +89,6 @@ def _entry(model_id: str, label: str | None = None) -> dict:
         "label": label or model_id,
         "pricing": _pricing_for(model_id),
     }
-
-
-def _parse_version(segments: list[str]) -> tuple[int, ...] | None:
-    """Flatten dash/dot-separated numeric segments into a version tuple,
-    or None if any segment isn't a plain integer (e.g. a non-numeric id
-    that doesn't fit the family/version convention at all)."""
-    version: list[int] = []
-    for segment in segments:
-        for piece in segment.split("."):
-            if not piece.isdigit():
-                return None
-            version.append(int(piece))
-    return tuple(version)
-
-
-def _parse_claude_family_version(model_id: str) -> tuple[str, tuple[int, ...]] | None:
-    """`claude-<family>-<version...>`, dated snapshot suffix stripped first
-    (`claude-opus-4-5-20251101` -> family "opus", version (4, 5))."""
-    stripped = _DATED_SNAPSHOT_SUFFIX.sub("", model_id)
-    parts = stripped.split("-")
-    if len(parts) < 3 or parts[0] != "claude":
-        return None
-    version = _parse_version(parts[2:])
-    if version is None:
-        return None
-    return parts[1], version
 
 
 def _parse_codex_family_version(model_id: str) -> tuple[str, tuple[int, ...]] | None:

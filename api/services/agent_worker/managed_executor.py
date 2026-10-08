@@ -36,6 +36,7 @@ from api.services.agent_worker.session_store import (
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.claude_models import resolve_claude_model
 from api.services.agent_worker.usage_ledger import (
     MEASURED,
     UsageLedger,
@@ -239,7 +240,7 @@ class ManagedExecutor:
         agent_id: str,
         environment_id: str,
         vault_ids: list[str] | None = None,
-        model: str = "claude-sonnet-5",
+        model: str = "sonnet",
     ):
         self.session_store = session_store
         self.transcript_store = transcript_store
@@ -248,8 +249,9 @@ class ManagedExecutor:
         self.environment_id = environment_id
         self.vault_ids = list(vault_ids) if vault_ids else []
         # `model` is informational only — the actual model is whatever the
-        # agent preset says. Kept for token-cost accounting (pricing.cost_for).
-        self.model = model
+        # agent preset says. Kept for token-cost accounting (pricing.cost_for),
+        # with a family name resolved to the newest model in that family.
+        self.model = resolve_claude_model(model)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -543,7 +545,7 @@ class ManagedExecutor:
                         cache_read_tokens=relative_totals["cache_read_tokens"],
                     ),
                     cost_kind=MEASURED, billing_class="metered",
-                    requested_engine="claude", requested_model=getattr(session, "model", None) or self.model,
+                    requested_engine="claude", requested_model=resolve_claude_model(getattr(session, "model", None) or self.model),
                     # The configured Managed model is a request, not
                     # authoritative evidence of what the provider served.
                     # Keep served identity unknown unless the provider emits
