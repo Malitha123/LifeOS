@@ -122,6 +122,7 @@ https=8443 path=/webhooks/example target=http://127.0.0.1:9000/webhooks/example
 - Declared routes: re-applies any that are missing and alerts on Telegram if one is still missing.
 - `LIFEOS_PEBBLE_HEALTH_URL` (unset skips the check): alerts after 3 consecutive failed health checks.
 - `LIFEOS_EXPECT_OBSIDIAN_SYNC=true`: if no Obsidian process is running, relaunches it in the user session (`LIFEOS_OBSIDIAN_LAUNCH_CMD`, default `systemd-run --user --collect --unit=obsidian-session-<epoch> snap run obsidian`) and alerts only if it is still absent on the next run.
+- Remote-provider model ids, hourly (`LIFEOS_MODEL_PROBE_INTERVAL_MIN`): see [Remote model availability](#remote-model-availability).
 - `LIFEOS_MCP_FUNNEL_NODE=true`: brings the public MCP node's container up if it is missing or stopped, makes it publish exactly the public socket, and alerts if the node is logged out or cannot be restored. See [Connected Apps](mcp-connected-apps.md).
 
 Each alert kind has its own cooldown (`LIFEOS_INFRA_ALERT_COOLDOWN_MIN`, default 360); stamps and counters live under `logs/`. The watchdog is a user unit because re-applying routes and relaunching Obsidian need the login user's session manager; `setup-systemd.sh` installs it into `~/.config/systemd/user/` and enables it through that user's manager.
@@ -131,6 +132,21 @@ Each alert kind has its own cooldown (`LIFEOS_INFRA_ALERT_COOLDOWN_MIN`, default
 **Exposure is verified too.** Besides the proxy target, the check compares Funnel exposure with the declaration. A port found public that is declared private has Funnel turned off (`tailscale funnel --https=<port> off`, which also removes that port's handlers) and every declared route on the port re-applied privately and re-verified, and an alert is sent; a declared-public port found private is re-applied. A malformed route line is skipped and reported while LifeOS's own route and the valid lines are still applied.
 
 **Add a route.** Add a line to `config/tailscale-routes.local`, then run `./scripts/setup-tailscale.sh` (or wait up to 5 minutes for the watchdog to apply it). Settings are in [Configuration — Host Routes and Dependencies](configuration.md#host-routes-and-dependencies).
+
+## Remote model availability
+
+A remote provider can retire a model id at any time, after which every call configured with it fails. `scripts/check_remote_models.py` sends each configured id one tiny completion on the remote provider (`LIFEOS_REMOTE_LLM_URL`, with `LIFEOS_REMOTE_LLM_API_KEY`). It probes:
+
+- `LIFEOS_REMOTE_LLM_MODEL` and every `LIFEOS_REMOTE_LLM_MODEL_OPTIONS` entry;
+- every `accounts/<account>/models/<name>` id found in the files named by `LIFEOS_MODEL_PROBE_SOURCES` — a local path, or `host:path` read over ssh — so agents outside LifeOS that use the same provider (a Hermes config, another machine's `.env`) are covered without listing their models twice.
+
+The infra watchdog runs it hourly and forwards each problem to Telegram under its own cooldown. A retired model (404) or a rejected key (401/403) alerts on the first run, naming where the id is configured; a timeout or other error, and a source that cannot be read, alert after 3 runs in a row. Run it by hand with `--verbose` to see every id's result:
+
+```bash
+~/.venvs/lifeos/bin/python scripts/check_remote_models.py --verbose
+```
+
+When a model is retired, change every place the alert names to a served id, then rerun the script.
 
 ## Alerting Severities
 

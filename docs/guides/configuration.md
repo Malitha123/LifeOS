@@ -94,6 +94,7 @@ A paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. R
 | `LIFEOS_REMOTE_LLM_INPUT_PRICE_PER_MTOK` | float | — (unset) | USD per million input tokens. Unset (distinct from `0.0`) means the rate isn't known — a turn on this provider records as unpriced rather than a guessed cost. |
 | `LIFEOS_REMOTE_LLM_OUTPUT_PRICE_PER_MTOK` | float | — (unset) | USD per million output tokens. Same unset/`0.0` distinction as the input rate. |
 | `LIFEOS_REMOTE_LLM_MODEL_OPTIONS` | str (comma-separated) | *(empty)* | Additional model ids the provider can serve, beyond `LIFEOS_REMOTE_LLM_MODEL`. Offered as choices on the board's `cloud` assignee's model picker (`GET /api/agents/models`'s `remote` engine list). |
+| `LIFEOS_MODEL_PROBE_SOURCES` | str (comma-separated) | *(empty)* | Extra files the hourly remote-model probe scans for provider model ids (Fireworks `accounts/<account>/models/<name>` form): a local path, or `host:path` read over ssh. `LIFEOS_REMOTE_LLM_MODEL` and `LIFEOS_REMOTE_LLM_MODEL_OPTIONS` are always probed. See [Operations — Remote model availability](operations.md#remote-model-availability). |
 
 All three of URL, model, and API key must be set for the provider to be considered configured; pricing is independent and can be added later without affecting whether turns run.
 

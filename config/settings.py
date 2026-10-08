@@ -1164,6 +1164,16 @@ class Settings(BaseSettings):
                     "codex engine's default: the newest catalog id whose "
                     "family segment (gpt-<version...>-<family>) matches."
     )
+    model_probe_sources: str = Field(
+        default="",
+        alias="LIFEOS_MODEL_PROBE_SOURCES",
+        description="Comma-separated files the remote-model probe "
+                    "(scripts/check_remote_models.py) scans for provider "
+                    "model ids beyond LIFEOS_REMOTE_LLM_MODEL and "
+                    "LIFEOS_REMOTE_LLM_MODEL_OPTIONS: a local path, or "
+                    "host:path read over ssh (e.g. another machine's Hermes "
+                    "config). Every id found is probed on the remote provider."
+    )
     remote_llm_model_options: str = Field(
         default="",
         alias="LIFEOS_REMOTE_LLM_MODEL_OPTIONS",

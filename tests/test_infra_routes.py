@@ -625,3 +625,24 @@ def test_withdrawing_the_opt_in_closes_the_public_mcp_port(box):
     table = box.table()
     assert "funnel|10000" not in table
     assert table["10000|/mcp"] == "http://127.0.0.1:8765/mcp"
+
+
+PROBE_FAKE = '''#!/usr/bin/env bash
+echo "probe $*" >> "$FAKE_ACTIONS"
+printf 'model:accounts/example/models/retired\\tRemote model accounts/example/models/retired is no longer served.\\n'
+'''
+
+
+def test_watchdog_forwards_model_probe_problems_hourly(box, tmp_path):
+    fake = tmp_path / "bin" / "probe-python"
+    fake.write_text(PROBE_FAKE)
+    fake.chmod(0o755)
+    extra = {"LIFEOS_PROBE_PYTHON": str(fake)}
+    box.watch(extra)
+    probes = [a for a in box.log() if a.startswith("probe ")]
+    assert len(probes) == 1 and probes[0].endswith("check_remote_models.py")
+    assert any("no longer served" in t for t in box.telegrams())
+    box.watch(extra)
+    assert len([a for a in box.log() if a.startswith("probe ")]) == 1
+    box.watch({**extra, "LIFEOS_MODEL_PROBE_INTERVAL_MIN": "0"})
+    assert len([a for a in box.log() if a.startswith("probe ")]) == 2
