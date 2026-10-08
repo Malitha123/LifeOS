@@ -123,3 +123,18 @@ def test_ssh_source_reads_over_ssh(probe_mod, monkeypatch):
     assert probe_mod.read_source("other-host:~/.hermes/config.yaml") == f"model: {GONE}\n"
     assert seen["cmd"][0] == "ssh" and "BatchMode=yes" in seen["cmd"]
     assert seen["cmd"][-2:] == ["other-host", "cat ~/.hermes/config.yaml"]
+
+
+def test_a_recovered_model_clears_its_strikes(probe_mod, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(probe_mod.settings, "remote_llm_model_options", FLAKY)
+    for _ in range(2):
+        assert _run(probe_mod, monkeypatch, tmp_path, capsys, []) == []
+    monkeypatch.setattr(probe_mod.settings, "remote_llm_model", FLAKY)
+    monkeypatch.setattr(probe_mod.settings, "remote_llm_model_options", "")
+    real_probe = probe_mod.probe
+    monkeypatch.setattr(probe_mod, "probe", lambda client, base, model: ("ok", ""))
+    assert _run(probe_mod, monkeypatch, tmp_path, capsys, []) == []
+    monkeypatch.setattr(probe_mod, "probe", real_probe)
+    for _ in range(2):
+        assert _run(probe_mod, monkeypatch, tmp_path, capsys, []) == []
+    assert [k for k, _ in _run(probe_mod, monkeypatch, tmp_path, capsys, [])] == [f"model:{FLAKY}"]

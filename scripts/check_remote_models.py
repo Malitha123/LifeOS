@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -38,7 +39,10 @@ from config.settings import settings  # noqa: E402
 
 MODEL_ID_RE = re.compile(r"accounts/[A-Za-z0-9_-]+/models/[A-Za-z0-9._-]+")
 STRIKES = 3
-TIMEOUT_SECONDS = 60
+# Probes and source reads run in parallel under these bounds, so a run
+# finishes well inside the watchdog's own time limit.
+TIMEOUT_SECONDS = 20
+SSH_TIMEOUT_SECONDS = 20
 
 
 def _split(value: str) -> list[str]:
@@ -50,8 +54,8 @@ def read_source(source: str) -> str:
     host, sep, path = source.partition(":")
     if sep and "/" not in host and not Path(source).expanduser().exists():
         result = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"cat {path}"],
-            capture_output=True, text=True, timeout=30,
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, f"cat {path}"],
+            capture_output=True, text=True, timeout=SSH_TIMEOUT_SECONDS,
         )
         if result.returncode != 0:
             raise OSError(f"ssh {host} exited {result.returncode}")
@@ -66,10 +70,12 @@ def collect(sources: list[str]) -> tuple[dict[str, list[str]], dict[str, str]]:
         if model:
             where.setdefault(model, []).append("LifeOS settings")
     errors: dict[str, str] = {}
-    for source in sources:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {source: pool.submit(read_source, source) for source in sources}
+    for source, future in futures.items():
         try:
-            text = read_source(source)
-        except (OSError, subprocess.SubprocessError) as exc:
+            text = future.result()
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
             errors[source] = str(exc) or type(exc).__name__
             continue
         for model in sorted(set(MODEL_ID_RE.findall(text))):
@@ -130,8 +136,10 @@ def main() -> int:
     headers = {"Authorization": f"Bearer {settings.remote_llm_api_key}"}
     results: dict[str, str] = {}
     with httpx.Client(timeout=TIMEOUT_SECONDS, headers=headers) as client:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            outcomes = {model: pool.submit(probe, client, base_url, model) for model in where}
         for model, places in sorted(where.items()):
-            status, detail = probe(client, base_url, model)
+            status, detail = outcomes[model].result()
             results[model] = status
             if args.verbose:
                 print(f"{model}: {status} {detail}".rstrip(), file=sys.stderr)

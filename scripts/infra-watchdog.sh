@@ -28,6 +28,7 @@ PEBBLE_STRIKES="${LIFEOS_INFRA_PEBBLE_STRIKES:-3}"
 OBSIDIAN_LAUNCH_CMD="${LIFEOS_OBSIDIAN_LAUNCH_CMD:-systemd-run --user --collect --unit=obsidian-session-\$(date +%s) snap run obsidian}"
 NODE_SCRIPT="$SCRIPT_DIR/mcp-funnel-node.sh"
 MODEL_PROBE_INTERVAL_MIN="${LIFEOS_MODEL_PROBE_INTERVAL_MIN:-60}"
+MODEL_PROBE_TIMEOUT="${LIFEOS_MODEL_PROBE_TIMEOUT:-60}"
 PROBE_PYTHON="${LIFEOS_PROBE_PYTHON:-$HOME/.venvs/lifeos/bin/python}"
 
 mkdir -p "$STATE_DIR"
@@ -216,7 +217,8 @@ check_mcp_funnel_node() {
 # Remote-provider model ids (LifeOS settings plus LIFEOS_MODEL_PROBE_SOURCES):
 # probed hourly, each problem alerted under its own cooldown key.
 check_remote_models() {
-    local stamp="$STATE_DIR/infra-watchdog-model-probe.stamp" now last key message n=0
+    local stamp="$STATE_DIR/infra-watchdog-model-probe.stamp" out="$STATE_DIR/model-probe.out"
+    local err="$STATE_DIR/model-probe.err" now last key message rc n=0
     now=$(date +%s)
     if [ -f "$stamp" ]; then
         last=$(cat "$stamp")
@@ -225,17 +227,30 @@ check_remote_models() {
         fi
     fi
     echo "$now" > "$stamp"
+    LIFEOS_INFRA_STATE_DIR="$STATE_DIR" timeout "$MODEL_PROBE_TIMEOUT" \
+        "$PROBE_PYTHON" "$SCRIPT_DIR/check_remote_models.py" > "$out" 2> "$err"
+    rc=$?
+    cat "$err" >> "$LOG_FILE"
     while IFS=$'\t' read -r key message; do
         [ -n "$key" ] || continue
         n=$((n + 1))
         alert "model-$(printf '%s' "$key" | tr -c 'A-Za-z0-9._-' '_')" "LifeOS host: $message"
-    done < <(LIFEOS_INFRA_STATE_DIR="$STATE_DIR" "$PROBE_PYTHON" "$SCRIPT_DIR/check_remote_models.py" 2>> "$LOG_FILE")
-    log "model-probe: $n problem(s)"
+    done < "$out"
+    case $rc in
+        0) log "model-probe: $n problem(s)" ;;
+        2) log "model-probe: remote provider not configured; skipped" ;;
+        *)
+            log "model-probe: probe failed (exit $rc)"
+            alert model-probe-failed "LifeOS host: the remote-model probe failed (exit $rc$( [ $rc -eq 124 ] && echo ', timed out')), so retired models may go unnoticed. See logs/infra-watchdog.log."
+            ;;
+    esac
 }
 
+# The model probe runs first: it is bounded by MODEL_PROBE_TIMEOUT, and the
+# unit's own start timeout must leave it room.
+check_remote_models
 check_routes
 check_pebble
 check_obsidian
 check_mcp_funnel_node
-check_remote_models
 exit 0

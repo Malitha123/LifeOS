@@ -126,6 +126,7 @@ def box(tmp_path):
         ("systemd-run", SYSTEMD_RUN_FAKE),
         ("loginctl", LOGINCTL_FAKE),
         ("systemctl", SYSTEMCTL_FAKE),
+        ("unconfigured-probe", "#!/usr/bin/env bash\nexit 2\n"),
     ):
         p = bin_dir / name
         p.write_text(body)
@@ -153,6 +154,7 @@ def box(tmp_path):
             "LIFEOS_INFRA_STATE_DIR": str(state_dir),
             "ENV_FILE": str(env_file),
             "LIFEOS_WATCHDOG_CURL": str(bin_dir / "curl"),
+            "LIFEOS_PROBE_PYTHON": str(bin_dir / "unconfigured-probe"),
             "HOME": str(tmp_path),
         }
         env.update(extra or {})
@@ -646,3 +648,25 @@ def test_watchdog_forwards_model_probe_problems_hourly(box, tmp_path):
     assert len([a for a in box.log() if a.startswith("probe ")]) == 1
     box.watch({**extra, "LIFEOS_MODEL_PROBE_INTERVAL_MIN": "0"})
     assert len([a for a in box.log() if a.startswith("probe ")]) == 2
+
+
+@pytest.mark.parametrize("body,needle", [
+    ("echo boom >&2; exit 1", "exit 1"),
+    ("sleep 5", "timed out"),
+])
+def test_watchdog_alerts_when_the_model_probe_fails(box, tmp_path, body, needle):
+    fake = tmp_path / "bin" / "probe-python"
+    fake.write_text(f"#!/usr/bin/env bash\n{body}\n")
+    fake.chmod(0o755)
+    box.watch({"LIFEOS_PROBE_PYTHON": str(fake), "LIFEOS_MODEL_PROBE_TIMEOUT": "1"})
+    alerts = [t for t in box.telegrams() if "remote-model probe failed" in t]
+    assert len(alerts) == 1
+    assert needle in alerts[0]
+
+
+def test_unconfigured_provider_skips_the_probe_quietly(box, tmp_path):
+    fake = tmp_path / "bin" / "probe-python"
+    fake.write_text("#!/usr/bin/env bash\nexit 2\n")
+    fake.chmod(0o755)
+    box.watch({"LIFEOS_PROBE_PYTHON": str(fake)})
+    assert not any("probe" in t for t in box.telegrams())
