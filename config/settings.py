@@ -599,7 +599,7 @@ class Settings(BaseSettings):
     remote_llm_model: str = Field(
         default="", alias="LIFEOS_REMOTE_LLM_MODEL",
         description="Model id to send in the request body, e.g. "
-                    "accounts/fireworks/models/deepseek-v4-flash-0731."
+                    "accounts/fireworks/models/deepseek-v4p1-flash."
     )
     remote_llm_api_key: str = Field(
         default="", alias="LIFEOS_REMOTE_LLM_API_KEY",
@@ -1163,6 +1163,16 @@ class Settings(BaseSettings):
         description="Model family GET /api/agents/models picks as the "
                     "codex engine's default: the newest catalog id whose "
                     "family segment (gpt-<version...>-<family>) matches."
+    )
+    model_probe_sources: str = Field(
+        default="",
+        alias="LIFEOS_MODEL_PROBE_SOURCES",
+        description="Comma-separated files the remote-model probe "
+                    "(scripts/check_remote_models.py) scans for provider "
+                    "model ids beyond LIFEOS_REMOTE_LLM_MODEL and "
+                    "LIFEOS_REMOTE_LLM_MODEL_OPTIONS: a local path, or "
+                    "host:path read over ssh (e.g. another machine's Hermes "
+                    "config). Every id found is probed on the remote provider."
     )
     remote_llm_model_options: str = Field(
         default="",

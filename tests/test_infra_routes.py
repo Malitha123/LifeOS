@@ -126,6 +126,7 @@ def box(tmp_path):
         ("systemd-run", SYSTEMD_RUN_FAKE),
         ("loginctl", LOGINCTL_FAKE),
         ("systemctl", SYSTEMCTL_FAKE),
+        ("unconfigured-probe", "#!/usr/bin/env bash\nexit 2\n"),
     ):
         p = bin_dir / name
         p.write_text(body)
@@ -153,6 +154,7 @@ def box(tmp_path):
             "LIFEOS_INFRA_STATE_DIR": str(state_dir),
             "ENV_FILE": str(env_file),
             "LIFEOS_WATCHDOG_CURL": str(bin_dir / "curl"),
+            "LIFEOS_PROBE_PYTHON": str(bin_dir / "unconfigured-probe"),
             "HOME": str(tmp_path),
         }
         env.update(extra or {})
@@ -498,8 +500,18 @@ def test_telegram_send_has_connect_and_total_timeouts(box):
     assert "--max-time 15" in call
 
 
-def test_service_unit_has_a_start_timeout():
-    assert "TimeoutStartSec=120" in SERVICE.read_text()
+def test_service_unit_start_timeout_covers_the_worst_case_run():
+    """The unit's start timeout must outlast a run where every bounded check
+    takes its limit: the model probe, the MCP Funnel node's login wait, a
+    Pebble health check, route re-application, and a few Telegram alerts."""
+    import re as re_mod
+    timeout = int(re_mod.search(r"^TimeoutStartSec=(\d+)$", SERVICE.read_text(), re_mod.M).group(1))
+    watchdog = WATCHDOG.read_text()
+    probe = int(re_mod.search(r'LIFEOS_MODEL_PROBE_TIMEOUT:-(\d+)', watchdog).group(1))
+    node = (REPO_ROOT / "scripts" / "mcp-funnel-node.sh").read_text()
+    funnel_wait = int(re_mod.search(r"setting LIFEOS_MCP_FUNNEL_WAIT_SECONDS (\d+)", node).group(1))
+    pebble, routes, telegram, alerts = 10, 60, 15, 4
+    assert timeout >= probe + funnel_wait + 2 + pebble + routes + telegram * alerts
 
 
 def test_linger_enabled_and_verified(box):
@@ -625,3 +637,46 @@ def test_withdrawing_the_opt_in_closes_the_public_mcp_port(box):
     table = box.table()
     assert "funnel|10000" not in table
     assert table["10000|/mcp"] == "http://127.0.0.1:8765/mcp"
+
+
+PROBE_FAKE = '''#!/usr/bin/env bash
+echo "probe $*" >> "$FAKE_ACTIONS"
+printf 'model:accounts/example/models/retired\\tRemote model accounts/example/models/retired is no longer served.\\n'
+'''
+
+
+def test_watchdog_forwards_model_probe_problems_hourly(box, tmp_path):
+    fake = tmp_path / "bin" / "probe-python"
+    fake.write_text(PROBE_FAKE)
+    fake.chmod(0o755)
+    extra = {"LIFEOS_PROBE_PYTHON": str(fake)}
+    box.watch(extra)
+    probes = [a for a in box.log() if a.startswith("probe ")]
+    assert len(probes) == 1 and probes[0].endswith("check_remote_models.py")
+    assert any("no longer served" in t for t in box.telegrams())
+    box.watch(extra)
+    assert len([a for a in box.log() if a.startswith("probe ")]) == 1
+    box.watch({**extra, "LIFEOS_MODEL_PROBE_INTERVAL_MIN": "0"})
+    assert len([a for a in box.log() if a.startswith("probe ")]) == 2
+
+
+@pytest.mark.parametrize("body,needle", [
+    ("echo boom >&2; exit 1", "exit 1"),
+    ("sleep 5", "timed out"),
+])
+def test_watchdog_alerts_when_the_model_probe_fails(box, tmp_path, body, needle):
+    fake = tmp_path / "bin" / "probe-python"
+    fake.write_text(f"#!/usr/bin/env bash\n{body}\n")
+    fake.chmod(0o755)
+    box.watch({"LIFEOS_PROBE_PYTHON": str(fake), "LIFEOS_MODEL_PROBE_TIMEOUT": "1"})
+    alerts = [t for t in box.telegrams() if "remote-model probe failed" in t]
+    assert len(alerts) == 1
+    assert needle in alerts[0]
+
+
+def test_unconfigured_provider_skips_the_probe_quietly(box, tmp_path):
+    fake = tmp_path / "bin" / "probe-python"
+    fake.write_text("#!/usr/bin/env bash\nexit 2\n")
+    fake.chmod(0o755)
+    box.watch({"LIFEOS_PROBE_PYTHON": str(fake)})
+    assert not any("probe" in t for t in box.telegrams())

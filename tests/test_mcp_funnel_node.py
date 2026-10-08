@@ -90,6 +90,7 @@ def env(tmp_path):
         ("tailscale", HOST_TAILSCALE_FAKE),
         ("curl", CURL_FAKE),
         ("pgrep", PGREP_FAKE),
+        ("unconfigured-probe", "#!/usr/bin/env bash\nexit 2\n"),
     ):
         p = bin_dir / name
         p.write_text(body)
@@ -115,6 +116,7 @@ def env(tmp_path):
         "LIFEOS_INFRA_STATE_DIR": str(tmp_path / "state"),
         "ENV_FILE": str(env_file),
         "LIFEOS_WATCHDOG_CURL": str(bin_dir / "curl"),
+        "LIFEOS_PROBE_PYTHON": str(bin_dir / "unconfigured-probe"),
         "HOME": str(tmp_path),
     }
 
