@@ -19,6 +19,7 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
+from api.services.claude_models import resolve_claude_model
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -777,18 +778,20 @@ class AnthropicLLMClient:
         except ImportError:
             raise ImportError("anthropic package required for Anthropic backend: pip install anthropic")
         self._api_key = api_key or getattr(settings, "anthropic_api_key", "")
-        self._model = model or getattr(settings, "anthropic_model", "claude-haiku-4-5")
+        self._model = model or getattr(settings, "anthropic_model", "haiku")
         self._sync_client = anthropic.Anthropic(api_key=self._api_key)
         self._async_client = anthropic.AsyncAnthropic(api_key=self._api_key)
 
     @property
     def model(self) -> str:
-        """The model id this client actually sends on every request
-        -- the resolved default (`settings.anthropic_model`) or the
-        per-turn override passed to `__init__` (escalation, an explicit
-        picker choice). A usage-recording caller needs this, not a
-        construction-time guess, to attribute a turn's real cost."""
-        return self._model
+        """The model id this client sends on every request: the configured
+        model (`settings.anthropic_model`, or the per-turn override passed
+        to `__init__` -- escalation, an explicit picker choice) with a
+        family name resolved to the newest model in that family
+        (`claude_models.resolve_claude_model`). A usage-recording caller
+        needs this, not the configured value, to attribute a turn's real
+        cost."""
+        return resolve_claude_model(self._model)
 
     def _prepare_system(self, system: str | list | None) -> str | list | None:
         """Return the ``system`` value for the Anthropic SDK unchanged.
@@ -812,7 +815,7 @@ class AnthropicLLMClient:
     ) -> LLMResponse:
         """Synchronous chat completion via Anthropic API."""
         kwargs: dict[str, Any] = {
-            "model": self._model,
+            "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
         }
@@ -838,7 +841,7 @@ class AnthropicLLMClient:
     ) -> LLMResponse:
         """Async chat completion via Anthropic API."""
         kwargs: dict[str, Any] = {
-            "model": self._model,
+            "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
         }
@@ -885,7 +888,7 @@ class AnthropicLLMClient:
         same kwarg.
         """
         kwargs: dict[str, Any] = {
-            "model": self._model,
+            "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
         }
@@ -1090,8 +1093,8 @@ def get_anthropic_llm() -> "AnthropicLLMClient | LocalLLMClient":
 
     When ANTHROPIC_API_KEY is set: always the
     Claude API, regardless of LIFEOS_LLM_BACKEND. Sonnet-tier for quality,
-    resolved from LIFEOS_ANTHROPIC_SPECIALIST_MODEL (default
-    claude-sonnet-5), independent of the orchestrator model
+    resolved from LIFEOS_ANTHROPIC_SPECIALIST_MODEL (default `sonnet`, the
+    newest Sonnet), independent of the orchestrator model
     (LIFEOS_ANTHROPIC_MODEL).
 
     When no key is set, falls back in the same priority order the agent

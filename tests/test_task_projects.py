@@ -547,8 +547,8 @@ def test_coordinator_view_streams_only_the_bounded_transcript_tail(
 @pytest.mark.parametrize(
     ("tag", "model"),
     [
-        ("cloud-haiku", "claude-haiku-4-5"),
-        ("cloud-sonnet", "claude-sonnet-5"),
+        ("cloud-haiku", "claude-haiku-5-5"),
+        ("cloud-sonnet", "claude-sonnet-5-5"),
     ],
 )
 def test_plan_and_delegate_supports_managed_cloud_aliases(

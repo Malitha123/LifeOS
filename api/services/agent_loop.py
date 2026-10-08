@@ -20,6 +20,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
+from api.services.claude_models import resolve_claude_model
 from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_STATUS_MESSAGES, execute_tool_parallel, begin_email_send_turn, tools_for_persona
 from api.services.journal_capture import JOURNAL_PERSONA_ID
@@ -237,13 +238,8 @@ def _escalation_ladder(escalation_model: str) -> list[str]:
 
 
 # User-directed escalation. Tier words the operator can name in a chat
-# message map to concrete Anthropic model ids. Update the opus id here if the
-# account is pinned to a different opus release.
-_MODEL_ALIASES = {
-    "haiku": "claude-haiku-4-5",
-    "sonnet": "claude-sonnet-5",
-    "opus": "claude-opus-5",
-}
+# message are Claude family names, each resolved to the newest model in that
+# family (claude_models.resolve_claude_model).
 # A directive verb immediately followed by a tier word: "escalate to opus",
 # "use sonnet", "with claude opus", "switch to haiku", "retry on opus".
 _DIRECTIVE_MODEL_RE = re.compile(
@@ -363,7 +359,7 @@ def _parse_escalation_directive(question: str, escalation_model: str) -> str:
         # A negation before the matched directive cancels it.
         if _NEGATION_BEFORE_RE.search(q[:m.start()]):
             return ""
-        return _MODEL_ALIASES.get(m.group(1).lower(), "")
+        return resolve_claude_model(m.group(1).lower())
     if _DIRECTIVE_SMARTER_RE.search(q):
         return escalation_model
     return ""
@@ -405,10 +401,10 @@ def resolve_orchestrator_model(
 
 
 def resolve_model_alias(name: str) -> str:
-    """Map a short tier word ("haiku"/"sonnet"/"opus") to its Anthropic model id;
-    pass any other string through unchanged. Shared by user-directed escalation
-    and the chat model picker so the alias table stays single-source."""
-    return _MODEL_ALIASES.get((name or "").strip().lower(), name)
+    """Map a short tier word ("haiku"/"sonnet"/"opus") to the newest Anthropic
+    model id in that family; pass any other string through unchanged. Shared
+    by user-directed escalation and the chat model picker."""
+    return resolve_claude_model(name)
 
 
 def _select_client(model: str = "", force_local: bool = False, force_remote: bool = False):
@@ -629,10 +625,11 @@ async def run_agent_loop(
         result.total_cache_read_tokens += usage.cache_read_input_tokens
         result.total_cache_creation_tokens += usage.cache_creation_input_tokens
         # Derive cost from the model that actually served the turn,
-        # recomputed from the running totals each round (mirrors the
-        # accumulation above -- cost_for is cheap and this keeps
-        # total_cost_usd correct if a caller reads it mid-loop via the
-        # turn_state reference). "local" is priced at $0 in PRICING, so a
+        # adding each round's request as it closes (mirrors the
+        # accumulation above, and keeps total_cost_usd correct if a caller
+        # reads it mid-loop via the turn_state reference). Pricing one
+        # request at a time lets a long-prompt tier apply to exactly the
+        # requests that crossed it. "local" is priced at $0 in PRICING, so a
         # genuinely local turn still lands on 0.0 here -- as a result of
         # pricing a free model, not an unconditional assignment. A model
         # with no known rate is left at 0.0 too, but flagged `unpriced`
@@ -662,12 +659,13 @@ async def run_agent_loop(
                 )
                 result.unpriced = False
         elif is_known_model(result.model):
-            result.total_cost_usd = cost_for(
+            result.total_cost_usd += cost_for(
                 result.model,
-                result.total_input_tokens,
-                result.total_output_tokens,
-                result.total_cache_creation_tokens,
-                result.total_cache_read_tokens,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_read_input_tokens,
+                single_request=True,
             )
             result.unpriced = False
         else:

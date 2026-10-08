@@ -7,8 +7,9 @@ anyone being told. Both are **invisibility**, not disagreement — this
 module answers "what's live" by asking the actual running process, or
 observing what actually happened, never by re-reading a config file:
 
-- LifeOS native picker, Anthropic backend: `settings.anthropic_model` IS the
-  live value here — it's read straight out of this process's own in-memory
+- LifeOS native picker, Anthropic backend: `settings.anthropic_model` (a
+  family name resolved to the newest model in that family, exactly as the
+  client resolves it per request) IS the live value here — it's read straight out of this process's own in-memory
   settings (the same object every request already uses), not re-parsed off
   disk. There's no separate Anthropic process on this box that could be
   running a different model out from under that setting.
@@ -65,6 +66,7 @@ from typing import Optional
 
 import httpx
 
+from api.services.claude_models import resolve_claude_model
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -116,7 +118,7 @@ async def get_lifeos_native_model() -> dict:
     if backend == "remote":
         return {"status": "ok", "backend": "remote", "model": settings.remote_llm_model}
     if backend != "local":
-        return {"status": "ok", "backend": "anthropic", "model": settings.anthropic_model}
+        return {"status": "ok", "backend": "anthropic", "model": resolve_claude_model(settings.anthropic_model)}
 
     model = await _probe_live_model(settings.local_llm_url)
     if model is None:

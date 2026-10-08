@@ -18,6 +18,7 @@ from api.services.agent_worker.assignment import (
     local_thinking_for_effort,
     map_effort_for_engine,
 )
+from api.services.claude_models import resolve_claude_model
 
 
 class Executor(str, Enum):
@@ -110,10 +111,12 @@ LEGACY_ROUTE_ALIASES = {
     "#hermes": ("hermes", None), "hermes": ("hermes", None),
     "#cloud": ("remote", None), "cloud": ("remote", None),
     "remote": ("remote", None),
-    "#cloud-haiku": ("claude", "claude-haiku-4-5"),
-    "cloud-haiku": ("claude", "claude-haiku-4-5"),
-    "#cloud-sonnet": ("claude", "claude-sonnet-5"),
-    "cloud-sonnet": ("claude", "claude-sonnet-5"),
+    # Claude family names: parse_legacy_route_alias resolves them to the
+    # newest model in the family.
+    "#cloud-haiku": ("claude", "haiku"),
+    "cloud-haiku": ("claude", "haiku"),
+    "#cloud-sonnet": ("claude", "sonnet"),
+    "cloud-sonnet": ("claude", "sonnet"),
 }
 
 
@@ -514,6 +517,8 @@ def parse_legacy_route_alias(alias: str) -> LegacyAliasResult:
             (Diagnostic("unknown_legacy_alias", "unknown legacy route alias", source="legacy"),),
         )
     executor, model_id = LEGACY_ROUTE_ALIASES[normalized]
+    if model_id is not None:
+        model_id = resolve_claude_model(model_id)
     return LegacyAliasResult(alias, ExecutionRequest(executor=executor, model_id=model_id))
 
 

@@ -221,7 +221,7 @@ class TestSupersede:
         assert contents[1][2] == {"truncated": True, "truncation_reason": "cancelled"}
         assert contents[2] == ("user", "second question", None)
         assert contents[3] == ("assistant", "second full answer", {
-            "sources": [], "reasoning": "agentic (claude-haiku-4-5)", "tool_rounds": 0,
+            "sources": [], "reasoning": "agentic (claude-haiku-5-5)", "tool_rounds": 0,
         })
 
 

@@ -356,7 +356,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | Polling interval | `60` |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | Telegram-clarification wait before abandoning | `72` |
 | `LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES` | How long a reopened `/claude`/`/codex` session may sit unresumed before the stuck-session alert fires | `15` |
-| `LIFEOS_AGENT_MANAGED_MODEL` | Informational; actual model lives in the cloud preset | `claude-sonnet-5` |
+| `LIFEOS_AGENT_MANAGED_MODEL` | Informational; actual model lives in the cloud preset | `sonnet` (newest Sonnet) |
 
 ---
 

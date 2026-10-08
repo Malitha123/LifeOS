@@ -341,7 +341,7 @@ Every `mcp_servers` entry must have a matching `mcp_toolset` in `tools` (and vic
 LIFEOS_AGENT_PRESET_ID=agent_<your_agent_id>
 LIFEOS_AGENT_ENVIRONMENT_ID=env_<your_environment_id>
 LIFEOS_AGENT_VAULT_ID=vlt_<your_vault_id>
-LIFEOS_AGENT_MANAGED_MODEL=claude-sonnet-5   # informational; actual model lives in the preset
+LIFEOS_AGENT_MANAGED_MODEL=sonnet   # informational; actual model lives in the preset
 ANTHROPIC_API_KEY=sk-ant-...                    # already required for the Haiku preflight
 ```
 
@@ -692,7 +692,7 @@ suggestions to keep iteration cheap:
   shape looks right.
 - **Override the model-for-tests setting.** `LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS`
   in `.env` overrides `LIFEOS_AGENT_MANAGED_MODEL` for client-side cost
-  accounting. Set to `claude-haiku-4-5` while iterating so the dollar
+  accounting. Set to `haiku` while iterating so the dollar
   figures the worker logs match what you'd be charged if the preset were
   pointed at Haiku.
 - **Keep tests mocked.** A process-wide pytest guard fails any test that

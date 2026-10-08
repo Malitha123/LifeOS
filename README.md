@@ -264,7 +264,7 @@ Orchestration and synthesis run against the Claude API (default), a local OpenAI
 
 | Hardware / preference | Config | Notes |
 |----------------------|--------|-------|
-| No GPU / prefer cloud (default) | `LIFEOS_LLM_BACKEND=anthropic` + `ANTHROPIC_API_KEY` | Default model `claude-haiku-4-5` (override via `LIFEOS_ANTHROPIC_MODEL`). Query text + retrieved context is sent to Anthropic. |
+| No GPU / prefer cloud (default) | `LIFEOS_LLM_BACKEND=anthropic` + `ANTHROPIC_API_KEY` | Default model `haiku`, the newest Claude Haiku (override via `LIFEOS_ANTHROPIC_MODEL`; a full model id pins a release). Query text + retrieved context is sent to Anthropic. |
 | No GPU, no Anthropic key | `LIFEOS_LLM_BACKEND=remote` + `LIFEOS_REMOTE_LLM_URL`/`_MODEL`/`_API_KEY` | Any OpenAI-compatible endpoint (e.g. Fireworks). Query text + retrieved context is sent to that provider. |
 | 8 GB RAM | `LIFEOS_LLM_BACKEND=local` + a small (~7B) model | Set `LIFEOS_LOCAL_LLM_URL` if not on `localhost:8080`. |
 | 16–32 GB RAM | `LIFEOS_LLM_BACKEND=local` + a medium (~14–32B) model | |
@@ -327,7 +327,7 @@ Full walkthrough (including which external accounts each integration needs): [In
 | Component | Technology |
 |-----------|------------|
 | Backend | FastAPI (port 8000) |
-| LLM (orchestration + synthesis) | Claude via Anthropic API (default; `LIFEOS_ANTHROPIC_MODEL`, defaults to `claude-haiku-4-5`), a local llama.cpp server (`LIFEOS_LLM_BACKEND=local`), or any hosted OpenAI-compatible provider such as Fireworks (`LIFEOS_LLM_BACKEND=remote`) |
+| LLM (orchestration + synthesis) | Claude via Anthropic API (default; `LIFEOS_ANTHROPIC_MODEL`, defaults to `haiku`, the newest Claude Haiku), a local llama.cpp server (`LIFEOS_LLM_BACKEND=local`), or any hosted OpenAI-compatible provider such as Fireworks (`LIFEOS_LLM_BACKEND=remote`) |
 | Embeddings | sentence-transformers (`mxbai-embed-large-v1` by default; `gte-Qwen2-1.5B-instruct` is a supported upgrade) |
 | Vector DB | ChromaDB (port 8001) |
 | Keyword Search | SQLite FTS5 (BM25) |

@@ -467,16 +467,26 @@ class Settings(BaseSettings):
     # resolution logic and its no-key/not-configured error paths.
     llm_backend: str = Field(default="anthropic", alias="LIFEOS_LLM_BACKEND")
 
+    # Claude model settings take a family name (`haiku`, `sonnet`, `opus`),
+    # resolved to the newest model in that family at request time
+    # (api/services/claude_models.py), or a full model id to pin a release.
+    # Pin undated ids (e.g. claude-sonnet-5), never dated snapshots
+    # (claude-*-20YYMMDD): snapshots retire and start returning 404.
+
     # Anthropic model for orchestration
-    anthropic_model: str = Field(default="claude-haiku-4-5", alias="LIFEOS_ANTHROPIC_MODEL")
+    anthropic_model: str = Field(default="haiku", alias="LIFEOS_ANTHROPIC_MODEL")
 
     # Anthropic model for specialist calls (relationship insights, fact
     # extraction, tone analysis) — Sonnet-tier for quality, independent of the
-    # orchestrator model above. Pin ALIASES here (e.g. claude-sonnet-5),
-    # never dated snapshots (claude-*-20YYMMDD): snapshots retire and start
-    # returning 404, silently breaking every specialist feature.
+    # orchestrator model above.
     anthropic_specialist_model: str = Field(
-        default="claude-sonnet-5", alias="LIFEOS_ANTHROPIC_SPECIALIST_MODEL"
+        default="sonnet", alias="LIFEOS_ANTHROPIC_SPECIALIST_MODEL"
+    )
+
+    # How long the Anthropic models list behind family-name resolution is
+    # cached (on disk, shared across processes) before it is re-fetched.
+    anthropic_models_ttl_seconds: int = Field(
+        default=86400, alias="LIFEOS_ANTHROPIC_MODELS_TTL_SECONDS"
     )
 
     # Local LLM (OpenAI-compatible server, e.g. llama-server)
@@ -866,10 +876,12 @@ class Settings(BaseSettings):
                     "also writes here. Path is joined under LIFEOS_VAULT_PATH."
     )
     agent_preflight_model: str = Field(
-        default="claude-haiku-4-5",
+        default="haiku",
         alias="LIFEOS_AGENT_PREFLIGHT_MODEL",
         description="Anthropic model used for the Haiku preflight call that "
-                    "classifies #agent tasks (budget, routing, ambiguity, sanity)."
+                    "classifies #agent tasks (budget, routing, ambiguity, sanity). "
+                    "A family name resolves to that family's newest model; a "
+                    "full model id pins it."
     )
     agent_preflight_engine: str = Field(
         default="auto",
@@ -911,19 +923,21 @@ class Settings(BaseSettings):
                     "is treated as `shadow`."
     )
     agent_managed_model: str = Field(
-        default="claude-sonnet-5",
+        default="sonnet",
         alias="LIFEOS_AGENT_MANAGED_MODEL",
         description="Anthropic model the Managed Agents executor uses for "
                     "Claude-routed #agent tasks. Informational only — the "
                     "actual model is whatever the agent preset says; this "
-                    "value is just used for client-side token-cost accounting."
+                    "value is just used for client-side token-cost accounting. "
+                    "A family name resolves to that family's newest model; a "
+                    "full model id pins it."
     )
     agent_managed_model_for_tests: str = Field(
         default="",
         alias="LIFEOS_AGENT_MANAGED_MODEL_FOR_TESTS",
         description="Optional dev-only override of `agent_managed_model` used "
                     "when iterating on the cloud agent path. Set to e.g. "
-                    "`claude-haiku-4-5` to swap cost accounting to the cheaper "
+                    "`haiku` to swap cost accounting to the cheaper "
                     "model during iteration. Empty (default) means no override. "
                     "This only changes client-side dollar accounting; the "
                     "actual remote model is still the agent preset's setting."
