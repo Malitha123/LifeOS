@@ -599,7 +599,7 @@ class Settings(BaseSettings):
     remote_llm_model: str = Field(
         default="", alias="LIFEOS_REMOTE_LLM_MODEL",
         description="Model id to send in the request body, e.g. "
-                    "accounts/fireworks/models/deepseek-v4-flash-0731."
+                    "accounts/fireworks/models/deepseek-v4p1-flash."
     )
     remote_llm_api_key: str = Field(
         default="", alias="LIFEOS_REMOTE_LLM_API_KEY",
