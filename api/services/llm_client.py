@@ -784,13 +784,14 @@ class AnthropicLLMClient:
 
     @property
     def model(self) -> str:
-        """The model id this client sends on every request: the configured
-        model (`settings.anthropic_model`, or the per-turn override passed
-        to `__init__` -- escalation, an explicit picker choice) with a
-        family name resolved to the newest model in that family
-        (`claude_models.resolve_claude_model`). A usage-recording caller
-        needs this, not the configured value, to attribute a turn's real
-        cost."""
+        """The model id a request made now would send: the configured model
+        (`settings.anthropic_model`, or the per-turn override passed to
+        `__init__` -- escalation, an explicit picker choice) with a family
+        name resolved to the newest model in that family
+        (`claude_models.resolve_claude_model`). Each request resolves this
+        once; usage and cost belong to that request's own model
+        (`LLMResponse.model`, or the ``model`` on `astream`'s ``done``
+        event), since a family can resolve differently between reads."""
         return resolve_claude_model(self._model)
 
     def _prepare_system(self, system: str | list | None) -> str | list | None:
@@ -814,8 +815,9 @@ class AnthropicLLMClient:
         temperature: float | None = None,
     ) -> LLMResponse:
         """Synchronous chat completion via Anthropic API."""
+        model_id = self.model  # resolved once; this request is attributed to it
         kwargs: dict[str, Any] = {
-            "model": self.model,
+            "model": model_id,
             "messages": messages,
             "max_tokens": max_tokens,
         }
@@ -828,7 +830,7 @@ class AnthropicLLMClient:
             kwargs["temperature"] = temperature
 
         resp = self._sync_client.messages.create(**kwargs)
-        return self._parse_anthropic_response(resp)
+        return self._parse_anthropic_response(resp, model_id)
 
     async def acreate(
         self,
@@ -840,8 +842,9 @@ class AnthropicLLMClient:
         temperature: float | None = None,
     ) -> LLMResponse:
         """Async chat completion via Anthropic API."""
+        model_id = self.model  # resolved once; this request is attributed to it
         kwargs: dict[str, Any] = {
-            "model": self.model,
+            "model": model_id,
             "messages": messages,
             "max_tokens": max_tokens,
         }
@@ -854,7 +857,7 @@ class AnthropicLLMClient:
             kwargs["temperature"] = temperature
 
         resp = await self._async_client.messages.create(**kwargs)
-        return self._parse_anthropic_response(resp)
+        return self._parse_anthropic_response(resp, model_id)
 
     async def astream(
         self,
@@ -886,9 +889,14 @@ class AnthropicLLMClient:
         ``timeout`` (seconds) sets a per-request timeout — the agent loop's
         synthesis round passes one, and LocalLLMClient.astream accepts the
         same kwarg.
+
+        The ``done`` event carries ``model``: the id the API reported serving
+        (``message_start``), else the id this request sent -- the model a
+        caller attributes this request's usage and cost to.
         """
+        model_id = self.model  # resolved once; this request is attributed to it
         kwargs: dict[str, Any] = {
-            "model": self.model,
+            "model": model_id,
             "messages": messages,
             "max_tokens": max_tokens,
         }
@@ -914,6 +922,7 @@ class AnthropicLLMClient:
             last_input_tokens = 0
             last_cache_creation = 0
             last_cache_read = 0
+            served_model = model_id
             async for event in stream:
                 if not hasattr(event, "type"):
                     continue
@@ -922,6 +931,7 @@ class AnthropicLLMClient:
                         yield {"type": "text", "content": event.delta.text}
                 elif event.type == "message_start":
                     u = event.message.usage
+                    served_model = getattr(event.message, "model", None) or served_model
                     last_input_tokens = u.input_tokens
                     last_cache_creation = u.cache_creation_input_tokens or 0
                     last_cache_read = u.cache_read_input_tokens or 0
@@ -979,9 +989,10 @@ class AnthropicLLMClient:
                     cache_read_input_tokens=getattr(msg.usage, "cache_read_input_tokens", 0) or 0,
                 ),
                 "finish_reason": msg.stop_reason or "end_turn",
+                "model": served_model,
             }
 
-    def _parse_anthropic_response(self, resp) -> LLMResponse:
+    def _parse_anthropic_response(self, resp, model_id: str = "") -> LLMResponse:
         """Parse Anthropic response into LLMResponse."""
         text = ""
         tool_calls = None
@@ -1011,7 +1022,7 @@ class AnthropicLLMClient:
                 cache_creation_input_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
                 cache_read_input_tokens=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
             ),
-            model=resp.model,
+            model=getattr(resp, "model", None) or model_id,
             finish_reason=resp.stop_reason or "",
             tool_calls=tool_calls,
         )

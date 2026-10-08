@@ -547,7 +547,9 @@ async def run_agent_loop(
     # force_remote built it (LocalLLMClient.model docstring);
     # AnthropicLLMClient.model is the resolved default
     # (settings.anthropic_model) or the per-turn override above (escalation,
-    # an explicit picker choice). `getattr(..., "local")` tolerates a test
+    # an explicit picker choice). This is the turn's model until a round
+    # completes; each round's `done` event then names the model that
+    # request actually used (_track_usage). `getattr(..., "local")` tolerates a test
     # double that predates this property (several unit tests patch
     # _select_client with a bare fake astream() object) by falling back to
     # the same default value.
@@ -619,7 +621,12 @@ async def run_agent_loop(
     yield {"type": "turn_state", "result": result}
     phantom_write_nudged = False  # phantom-write self-correction fires at most once per turn
 
-    def _track_usage(usage: LLMUsage):
+    def _track_usage(usage: LLMUsage, served_model: str | None = None):
+        # The request's own model (the `done` event's `model`, when the
+        # client reports one) -- a family name can resolve to a different
+        # model between `client.model` above and the request itself.
+        if served_model:
+            result.model = served_model
         result.total_input_tokens += usage.input_tokens
         result.total_output_tokens += usage.output_tokens
         result.total_cache_read_tokens += usage.cache_read_input_tokens
@@ -713,6 +720,7 @@ async def run_agent_loop(
             text_this_round = ""
             tool_use_blocks = []
             usage_this_round = LLMUsage()
+            model_this_round = None
             finish_reason = ""
 
             api_error_fatal = False
@@ -741,6 +749,7 @@ async def run_agent_loop(
                                 result.provisional_output_tokens = event["usage"].output_tokens
                             elif event["type"] == "done":
                                 usage_this_round = event["usage"]
+                                model_this_round = event.get("model")
                                 finish_reason = event.get("finish_reason", "")
                         break  # success
                     except Exception as e:
@@ -768,7 +777,7 @@ async def run_agent_loop(
             if api_error_fatal:
                 break
 
-            _track_usage(usage_this_round)
+            _track_usage(usage_this_round, model_this_round)
 
             # Build assistant content for message history (keep narration text
             # for the LLM context even if we strip it from the user-facing response)
@@ -919,7 +928,7 @@ async def run_agent_loop(
                         result.provisional_input_tokens = event["usage"].input_tokens
                         result.provisional_output_tokens = event["usage"].output_tokens
                     elif event["type"] == "done":
-                        _track_usage(event["usage"])
+                        _track_usage(event["usage"], event.get("model"))
                         print(f"[agent] Synthesis round done: finish_reason={event.get('finish_reason', '?')}, events={synthesis_events}")
             except Exception as e:
                 error_msg = str(e) or f"{type(e).__name__} (no message)"

@@ -533,3 +533,92 @@ async def test_agent_loop_prices_unlisted_family_model_not_unpriced():
     result = await _agent_loop_result(_FakeRoundClient("claude-sonnet-6-0", M, 0))
     assert result.unpriced is False
     assert result.total_cost_usd == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Attribution binds to the model each request actually sent
+# ---------------------------------------------------------------------------
+
+class _FakeAnthropicStream:
+    """The SDK's message stream: one message_start (optionally naming the
+    served model), then the final message."""
+
+    def __init__(self, served_model=None, input_tokens=M, output_tokens=0):
+        usage = SimpleNamespace(
+            input_tokens=input_tokens, output_tokens=output_tokens,
+            cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        )
+        message = SimpleNamespace(usage=usage)
+        if served_model:
+            message.model = served_model
+        self._events = [SimpleNamespace(type="message_start", message=message)]
+        self._final = SimpleNamespace(content=[], usage=usage, stop_reason="end_turn")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        self._it = iter(self._events)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def get_final_message(self):
+        return self._final
+
+
+def _client_whose_family_moves(monkeypatch, first, later, served_model=None):
+    """A haiku client whose family resolves to `first` on the first read and
+    `later` afterwards: a background refresh landing between the agent
+    loop's read of `client.model` and the request."""
+    from api.services import llm_client
+
+    reads = []
+
+    def _resolve(value):
+        reads.append(value)
+        return first if len(reads) == 1 else later
+
+    monkeypatch.setattr(llm_client, "resolve_claude_model", _resolve)
+    client = _client("haiku")
+    sent = {}
+
+    def _stream(**kwargs):
+        sent.update(kwargs)
+        return _FakeAnthropicStream(served_model)
+
+    client._async_client = MagicMock()
+    client._async_client.messages.stream = _stream
+    return client, sent
+
+
+async def test_agent_loop_attributes_cost_to_the_model_the_request_sent(monkeypatch):
+    client, sent = _client_whose_family_moves(monkeypatch, "claude-haiku-5-5", "claude-haiku-4-5")
+    result = await _agent_loop_result(client)
+    assert sent["model"] == "claude-haiku-4-5"
+    assert result.model == "claude-haiku-4-5"
+    assert result.total_cost_usd == pytest.approx(1.0)  # Haiku 4.5: $1 per Mtok input
+
+
+async def test_agent_loop_prefers_the_model_the_api_reports(monkeypatch):
+    client, _ = _client_whose_family_moves(
+        monkeypatch, "claude-haiku-5-5", "claude-haiku-4-5",
+        served_model="claude-haiku-4-5-20251001",
+    )
+    result = await _agent_loop_result(client)
+    assert result.model == "claude-haiku-4-5-20251001"
+    assert result.total_cost_usd == pytest.approx(1.0)
+
+
+def test_create_response_falls_back_to_the_sent_model(loaded):
+    client = _client("sonnet")
+    client._sync_client = MagicMock()
+    client._sync_client.messages.create.return_value = _anthropic_response(None)
+    assert client.create([{"role": "user", "content": "hi"}]).model == "claude-sonnet-6-0"
