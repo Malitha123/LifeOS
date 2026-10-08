@@ -273,6 +273,29 @@ def test_parse_session_sums_tokens_and_cost(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_parse_session_prices_each_message_at_its_long_prompt_tier(tmp_path: Path):
+    """Each assistant message is one request: a Haiku 5.5 message over
+    100K input tokens is billed at the long-prompt rate ($0.50/$2.50 per
+    Mtok), and a short one in the same session at the standard rate."""
+    proj = tmp_path / "-home-syn-Code-T"
+    path = proj / "s-tier.jsonl"
+    _write_jsonl(path, [
+        _assistant_event(model="claude-haiku-5-5", usage={
+            "input_tokens": 150_000, "output_tokens": 1_000,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+        _assistant_event(model="claude-haiku-5-5", usage={
+            "input_tokens": 10_000, "output_tokens": 1_000,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+    ])
+    metas = cc.discover_sessions(projects_dir=tmp_path)
+    meta, _ = cc.parse_session(metas[0])
+    long_msg = 150_000 * 0.50e-6 + 1_000 * 2.50e-6    # 0.0775
+    short_msg = 10_000 * 0.10e-6 + 1_000 * 0.50e-6    # 0.0015
+    assert meta.total_dollars == pytest.approx(long_msg + short_msg)
+    assert meta.unpriced is False
+
+
+@pytest.mark.unit
 def test_parse_session_unknown_model_marks_unpriced_not_fallback_rate(tmp_path: Path):
     """This ingest path costs whatever model string Claude Code reports, so
     it's the call site most likely to meet a genuinely new/unrecognized

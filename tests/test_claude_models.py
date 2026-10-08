@@ -2,6 +2,7 @@
 boundary, pricing for the family-resolved models, and the tag / tier maps
 that name families."""
 import json
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -57,22 +58,41 @@ def fetch(monkeypatch):
     return fake
 
 
+def _load():
+    """Resolve once (which starts the background refresh) and wait for the
+    refresh to land, so the next resolution sees the fetched list."""
+    resolve_claude_model("haiku")
+    claude_models.wait_for_refresh()
+
+
+@pytest.fixture
+def loaded(fetch):
+    _load()
+    return fetch
+
+
 # ---------------------------------------------------------------------------
 # Resolver
 # ---------------------------------------------------------------------------
 
-def test_family_resolves_to_newest_in_family(fetch):
+def test_family_resolves_to_newest_in_family(loaded):
     assert resolve_claude_model("opus") == "claude-opus-6-1-20271201"
     assert resolve_claude_model("haiku") == "claude-haiku-6-0-20271001"
 
 
-def test_undated_alias_preferred_over_dated_snapshot_of_same_version(fetch):
+def test_undated_alias_preferred_over_dated_snapshot_of_same_version(loaded):
     assert resolve_claude_model("sonnet") == "claude-sonnet-6-0"
     # Order in the list doesn't matter.
     assert newest_in_family(list(reversed(FAKE_MODELS)), "sonnet") == "claude-sonnet-6-0"
 
 
-def test_fable_and_other_families_never_chosen(fetch):
+def test_versions_compare_numerically_not_lexically():
+    ids = ["claude-sonnet-5-5", "claude-sonnet-5-10", "claude-sonnet-5-9"]
+    assert newest_in_family(ids, "sonnet") == "claude-sonnet-5-10"
+    assert newest_in_family(list(reversed(ids)), "sonnet") == "claude-sonnet-5-10"
+
+
+def test_fable_and_other_families_never_chosen(loaded):
     for family in ("haiku", "sonnet", "opus"):
         assert "fable" not in resolve_claude_model(family)
         assert "mythos" not in resolve_claude_model(family)
@@ -83,21 +103,30 @@ def test_fable_and_other_families_never_chosen(fetch):
 def test_full_id_passes_through_unchanged(fetch):
     for model_id in ("claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-fable-5", "local", ""):
         assert resolve_claude_model(model_id) == model_id
+    claude_models.wait_for_refresh()
     assert fetch.calls == 0
 
 
-def test_case_and_whitespace_ignored_for_family_names(fetch):
+def test_case_and_whitespace_ignored_for_family_names(loaded):
     assert resolve_claude_model("  Sonnet ") == "claude-sonnet-6-0"
     assert resolve_claude_model("OPUS") == "claude-opus-6-1-20271201"
 
 
+def test_first_resolve_serves_latest_known_while_the_list_loads(fetch):
+    assert resolve_claude_model("opus") == LATEST_KNOWN["opus"]
+    claude_models.wait_for_refresh()
+    assert resolve_claude_model("opus") == "claude-opus-6-1-20271201"
+
+
 def test_family_missing_from_list_falls_back_to_latest_known(monkeypatch):
     monkeypatch.setattr(claude_models, "_fetch_model_ids", _FakeFetch(["claude-sonnet-6-0"]))
+    _load()
     assert resolve_claude_model("haiku") == LATEST_KNOWN["haiku"]
 
 
 def test_list_failure_falls_back_to_latest_known_without_raising(monkeypatch):
     monkeypatch.setattr(claude_models, "_fetch_model_ids", _FakeFetch(exc=RuntimeError("synthetic outage")))
+    _load()
     assert resolve_claude_model("haiku") == LATEST_KNOWN["haiku"]
     assert resolve_claude_model("sonnet") == LATEST_KNOWN["sonnet"]
     assert resolve_claude_model("opus") == LATEST_KNOWN["opus"]
@@ -110,6 +139,7 @@ def test_no_api_key_resolves_from_latest_known_without_a_request(monkeypatch):
     monkeypatch.setattr(claude_models, "_fetch_model_ids", _REAL_FETCH)
     monkeypatch.setattr(settings, "anthropic_api_key", "")
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_: pytest.fail("no request without a key"))
+    _load()
     assert resolve_claude_model("opus") == LATEST_KNOWN["opus"]
     assert not claude_models.CACHE_PATH.exists()
 
@@ -130,34 +160,37 @@ def test_real_fetcher_uses_models_list_with_key(monkeypatch):
 
     monkeypatch.setattr(anthropic, "Anthropic", _FakeAnthropic)
     monkeypatch.setattr(claude_models, "_fetch_model_ids", _REAL_FETCH)
+    _load()
     assert resolve_claude_model("sonnet") == "claude-sonnet-6-0"
     assert seen["api_key"] == "sk-synthetic"
     assert seen["timeout"] <= 10.0
 
 
-def test_disk_cache_is_shared_and_respected_within_ttl(fetch):
-    assert resolve_claude_model("opus") == "claude-opus-6-1-20271201"
-    assert fetch.calls == 1
+def test_disk_cache_is_shared_and_respected_within_ttl(loaded):
+    assert loaded.calls == 1
     cached = json.loads(claude_models.CACHE_PATH.read_text())
     assert cached["models"] == FAKE_MODELS
-    # A fresh process (no in-memory memo) reads the disk cache, no fetch.
+    # A fresh process (no in-memory memo) adopts the disk cache: the list is
+    # served on the first resolve and nothing is fetched.
     claude_models.reset_cache()
     assert resolve_claude_model("sonnet") == "claude-sonnet-6-0"
-    assert fetch.calls == 1
+    claude_models.wait_for_refresh()
+    assert loaded.calls == 1
 
 
-def test_cache_refreshed_after_ttl(fetch, monkeypatch):
+def test_cache_refreshed_after_ttl(loaded, monkeypatch):
     from config.settings import settings
 
     monkeypatch.setattr(settings, "anthropic_models_ttl_seconds", 60)
-    resolve_claude_model("opus")
-    assert fetch.calls == 1
     stale = {"checked_at": time.time() - 120, "models": ["claude-opus-4-8"]}
     claude_models.CACHE_PATH.write_text(json.dumps(stale))
     claude_models.reset_cache()
-    fetch.result = FAKE_MODELS + ["claude-opus-7-0"]
+    loaded.result = FAKE_MODELS + ["claude-opus-7-0"]
+    # The stale list serves until the background refresh lands.
+    assert resolve_claude_model("opus") == "claude-opus-4-8"
+    claude_models.wait_for_refresh()
     assert resolve_claude_model("opus") == "claude-opus-7-0"
-    assert fetch.calls == 2
+    assert loaded.calls == 2
 
 
 def test_failed_refresh_keeps_last_good_list_and_waits_a_ttl(fetch, monkeypatch, caplog):
@@ -169,11 +202,84 @@ def test_failed_refresh_keeps_last_good_list_and_waits_a_ttl(fetch, monkeypatch,
     fetch.exc = RuntimeError("synthetic outage")
     with caplog.at_level("WARNING", logger="api.services.claude_models"):
         assert resolve_claude_model("opus") == "claude-opus-6-1"
+        claude_models.wait_for_refresh()
         assert resolve_claude_model("sonnet") == "claude-sonnet-6-0"
         claude_models.reset_cache()  # another process: sees the recorded attempt on disk
         assert resolve_claude_model("opus") == "claude-opus-6-1"
+        claude_models.wait_for_refresh()
     assert fetch.calls == 1
     assert sum("refresh failed" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_slow_fetch_never_delays_resolution(monkeypatch):
+    release = threading.Event()
+
+    def _slow_fetch():
+        release.wait(0.5)
+        return ["claude-opus-9-0"]
+
+    monkeypatch.setattr(claude_models, "_fetch_model_ids", _slow_fetch)
+    started = time.monotonic()
+    first = resolve_claude_model("opus")
+    second = resolve_claude_model("opus")
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.05
+    assert first == second == LATEST_KNOWN["opus"]
+    release.set()
+    claude_models.wait_for_refresh()
+    assert resolve_claude_model("opus") == "claude-opus-9-0"
+
+
+def test_concurrent_resolution_runs_exactly_one_refresh(monkeypatch):
+    """Many threads resolving at once while the list is stale start one
+    refresh thread and one fetch between them. The clock yields inside the
+    check-and-claim of the refresh slot, so an unguarded check-then-set lets
+    several threads in."""
+    release = threading.Event()
+    calls = []
+
+    def _blocking_fetch():
+        calls.append(1)
+        release.wait(5)
+        return ["claude-opus-9-0"]
+
+    real_clock = time.time
+
+    def _yielding_clock():
+        time.sleep(0.001)
+        return real_clock()
+
+    monkeypatch.setattr(claude_models, "_fetch_model_ids", _blocking_fetch)
+    monkeypatch.setattr(claude_models, "_clock", _yielding_clock)
+    real_refresh = claude_models._refresh
+    refreshes = []
+
+    def _counting_refresh(*args):
+        refreshes.append(1)
+        real_refresh(*args)
+
+    monkeypatch.setattr(claude_models, "_refresh", _counting_refresh)
+    barrier = threading.Barrier(16)
+    results = []
+
+    def _worker():
+        barrier.wait()
+        results.append(resolve_claude_model("opus"))
+
+    threads = [threading.Thread(target=_worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert results == [LATEST_KNOWN["opus"]] * 16
+    release.set()
+    claude_models.wait_for_refresh()
+    for t in list(threading.enumerate()):
+        if t.name == "claude-models-refresh":
+            t.join(5)
+    assert len(refreshes) == 1
+    assert len(calls) == 1
+    assert resolve_claude_model("opus") == "claude-opus-9-0"
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +304,7 @@ def _client(model):
     return AnthropicLLMClient(api_key="sk-synthetic", model=model)
 
 
-def test_client_create_sends_resolved_family(fetch):
+def test_client_create_sends_resolved_family(loaded):
     client = _client("sonnet")
     client._sync_client = MagicMock()
     client._sync_client.messages.create.return_value = _anthropic_response("claude-sonnet-6-0")
@@ -207,7 +313,7 @@ def test_client_create_sends_resolved_family(fetch):
     assert client.model == "claude-sonnet-6-0"
 
 
-def test_client_create_sends_pinned_id_unchanged(fetch):
+def test_client_create_sends_pinned_id_unchanged(loaded):
     client = _client("claude-sonnet-4-6")
     client._sync_client = MagicMock()
     client._sync_client.messages.create.return_value = _anthropic_response("claude-sonnet-4-6")
@@ -215,14 +321,14 @@ def test_client_create_sends_pinned_id_unchanged(fetch):
     assert client._sync_client.messages.create.call_args.kwargs["model"] == "claude-sonnet-4-6"
 
 
-def test_client_default_model_is_the_newest_haiku(fetch, monkeypatch):
+def test_client_default_model_is_the_newest_haiku(loaded, monkeypatch):
     from config.settings import settings
 
     monkeypatch.setattr(settings, "anthropic_model", "haiku")
     assert _client(None).model == "claude-haiku-6-0-20271001"
 
 
-async def test_client_acreate_sends_resolved_family(fetch):
+async def test_client_acreate_sends_resolved_family(loaded):
     client = _client("opus")
     client._async_client = MagicMock()
     client._async_client.messages.create = AsyncMock(return_value=_anthropic_response("x"))
@@ -230,7 +336,7 @@ async def test_client_acreate_sends_resolved_family(fetch):
     assert client._async_client.messages.create.call_args.kwargs["model"] == "claude-opus-6-1-20271201"
 
 
-async def test_client_astream_sends_resolved_family(fetch):
+async def test_client_astream_sends_resolved_family(loaded):
     client = _client("haiku")
     seen = {}
 
@@ -261,7 +367,7 @@ async def test_client_astream_sends_resolved_family(fetch):
     assert seen["model"] == "claude-haiku-6-0-20271001"
 
 
-def test_managed_executor_resolves_its_model(fetch):
+def test_managed_executor_resolves_its_model(loaded):
     from api.services.agent_worker.managed_executor import ManagedExecutor
 
     executor = ManagedExecutor(
@@ -295,7 +401,7 @@ def test_settings_defaults_are_family_names():
     ("#cloud-haiku", "claude-haiku-6-0-20271001"),
     ("cloud-sonnet", "claude-sonnet-6-0"),
 ])
-def test_cloud_tags_resolve_to_newest_family_model(fetch, tag, expected):
+def test_cloud_tags_resolve_to_newest_family_model(loaded, tag, expected):
     from api.services.agent_worker.execution import parse_legacy_route_alias
 
     result = parse_legacy_route_alias(tag)
@@ -308,7 +414,7 @@ def test_cloud_tags_resolve_to_newest_family_model(fetch, tag, expected):
     ("sonnet", "claude-sonnet-6-0"),
     ("opus", "claude-opus-6-1-20271201"),
 ])
-def test_escalation_tiers_resolve_to_newest_family_model(fetch, word, expected):
+def test_escalation_tiers_resolve_to_newest_family_model(loaded, word, expected):
     from api.services.agent_loop import resolve_model_alias, resolve_orchestrator_model
 
     assert resolve_model_alias(word) == expected

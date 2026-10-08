@@ -16,12 +16,14 @@ wins over a dated snapshot of the same version.
 
 The list is cached on disk (`data/claude_models.json`, shared by every
 LifeOS process) and in memory for `settings.anthropic_models_ttl_seconds`
-(default 24h). At most one refresh — a short blocking call bounded by
-`_FETCH_TIMEOUT_SECONDS` — runs per TTL; a process lock and a file lock
-serialize it across threads and processes. A failed refresh keeps the last
-good list (with one logged warning) and is not retried until the TTL passes
-again. With no list at all — no API key, or no successful fetch yet —
-families resolve from `LATEST_KNOWN`. Resolution never raises.
+(default 24h). Resolution never waits on the network: it serves the cached
+list and, when that list is stale or absent, starts one background refresh
+thread (single-flight per process; a file lock keeps concurrent processes
+from fetching twice) whose result the next resolution sees. A failed
+refresh keeps the last good list (with one logged warning) and is not
+retried until the TTL passes again. With no list at all — no API key, or
+no fetch finished yet — families resolve from `LATEST_KNOWN`. Resolution
+never raises.
 """
 from __future__ import annotations
 
@@ -54,9 +56,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CACHE_PATH = _REPO_ROOT / "data" / "claude_models.json"
 _FETCH_TIMEOUT_SECONDS = 10.0
 
+# `_lock` guards only in-memory state and is never held across I/O.
 _lock = threading.Lock()
 _memo: Optional[dict] = None
+_refreshing = False
+_refresh_thread: Optional[threading.Thread] = None
 _warned = False
+_clock = time.time
 
 
 def _parse_version(segments: list[str]) -> tuple[int, ...] | None:
@@ -133,9 +139,9 @@ def _fetch_model_ids() -> Optional[list[str]]:
     return [m.id for m in client.models.list(limit=1000)]
 
 
-def _read_cache() -> Optional[dict]:
+def _read_cache(path: Path) -> Optional[dict]:
     try:
-        data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if (
@@ -147,27 +153,31 @@ def _read_cache() -> Optional[dict]:
     return data
 
 
-def _write_cache(entry: dict) -> None:
+def _write_cache(path: Path, entry: dict) -> None:
     try:
-        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = CACHE_PATH.with_name(f"{CACHE_PATH.name}.{os.getpid()}.tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(entry), encoding="utf-8")
-        os.replace(tmp, CACHE_PATH)
+        os.replace(tmp, path)
     except OSError as exc:
-        logger.warning("could not write the Claude models cache %s: %s", CACHE_PATH, exc)
+        logger.warning("could not write the Claude models cache %s: %s", path, exc)
 
 
 class _FileLock:
     """Advisory lock on `<cache>.lock` so concurrent processes don't both
-    refresh. Best effort: where locking isn't possible it does nothing."""
+    refresh. Taken only by the background refresh thread. Best effort:
+    where locking isn't possible it does nothing."""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._fd = None
 
     def __enter__(self):
-        self._fd = None
         try:
             import fcntl
 
-            CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            self._fd = os.open(f"{CACHE_PATH}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._fd = os.open(f"{self._path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
             fcntl.flock(self._fd, fcntl.LOCK_EX)
         except (ImportError, OSError):
             if self._fd is not None:
@@ -185,26 +195,30 @@ def _is_fresh(entry: Optional[dict], now: float, ttl: float) -> bool:
     return entry is not None and (now - entry["checked_at"]) < ttl
 
 
-def _model_ids() -> list[str]:
-    """The cached models list, refreshed when older than the TTL. Empty
-    when no list has ever been fetched."""
-    global _memo, _warned
-    from config.settings import settings
-
-    ttl = float(settings.anthropic_models_ttl_seconds)
+def _set_memo(entry: dict) -> None:
+    global _memo
     with _lock:
-        now = time.time()
-        if _is_fresh(_memo, now, ttl):
-            return _memo["models"]
-        with _FileLock():
-            disk = _read_cache()
+        _memo = entry
+
+
+def _refresh(path: Path, ttl: float) -> None:
+    """Background refresh: re-check the disk cache under the file lock (another
+    process may have just refreshed it), else fetch the list and record it.
+    A failure keeps the last good list and records the attempt, so the next
+    one waits a full TTL."""
+    global _refreshing, _warned
+    try:
+        with _FileLock(path):
+            now = _clock()
+            disk = _read_cache(path)
             if _is_fresh(disk, now, ttl):
-                _memo = disk
-                return disk["models"]
-            last_good = (disk or _memo or {}).get("models") or []
+                _set_memo(disk)
+                return
+            with _lock:
+                last_good = (disk or _memo or {}).get("models") or []
             try:
                 fetched = _fetch_model_ids()
-            except Exception as exc:  # noqa: BLE001 — never fail a request over the list
+            except Exception as exc:  # noqa: BLE001 — never fail resolution over the list
                 if not _warned:
                     logger.warning(
                         "Anthropic models list refresh failed (%s); resolving Claude "
@@ -212,25 +226,62 @@ def _model_ids() -> list[str]:
                         "last good list" if last_good else "built-in table",
                     )
                     _warned = True
-                # Record the attempt so the next one waits a full TTL.
-                _memo = {"checked_at": now, "models": last_good}
-                _write_cache(_memo)
-                return last_good
+                entry = {"checked_at": now, "models": last_good}
+                _write_cache(path, entry)
+                _set_memo(entry)
+                return
             if fetched is None:
                 # No API key: nothing to fetch. Memoized in this process only,
                 # so the disk cache is left for a process that has a key.
-                _memo = {"checked_at": now, "models": last_good}
-                return last_good
-            _memo = {"checked_at": now, "models": fetched}
-            _write_cache(_memo)
+                _set_memo({"checked_at": now, "models": last_good})
+                return
+            entry = {"checked_at": now, "models": fetched}
+            _write_cache(path, entry)
+            _set_memo(entry)
             _warned = False
-            return fetched
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Claude models cache refresh failed: %s", exc)
+    finally:
+        with _lock:
+            _refreshing = False
+
+
+def _model_ids() -> list[str]:
+    """The cached models list, or empty when none has been loaded yet.
+    Never waits on the network or another thread's refresh: when the list is
+    stale (or absent), one background refresh is started and the current list
+    is served meanwhile."""
+    global _memo, _refreshing, _refresh_thread
+    from config.settings import settings
+
+    ttl = float(settings.anthropic_models_ttl_seconds)
+    path = CACHE_PATH
+    if _memo is None:
+        # First use in this process: adopt whatever another process cached.
+        disk = _read_cache(path)
+        if disk is not None:
+            with _lock:
+                if _memo is None:
+                    _memo = disk
+    with _lock:
+        entry = _memo
+        start = not _refreshing and not _is_fresh(entry, _clock(), ttl)
+        if start:
+            _refreshing = True
+    if start:
+        thread = threading.Thread(
+            target=_refresh, args=(path, ttl), name="claude-models-refresh", daemon=True,
+        )
+        _refresh_thread = thread
+        thread.start()
+    return entry["models"] if entry else []
 
 
 def resolve_claude_model(value: str) -> str:
     """The newest model in `value`'s family when `value` is a bare family
     name (`haiku`/`sonnet`/`opus`, any case, surrounding whitespace
-    ignored); any other value unchanged. Never raises."""
+    ignored); any other value unchanged. Never raises or blocks on the
+    network."""
     if not isinstance(value, str):
         return value
     family = value.strip().lower()
@@ -243,9 +294,18 @@ def resolve_claude_model(value: str) -> str:
         return LATEST_KNOWN[family]
 
 
+def wait_for_refresh(timeout: float = 5.0) -> None:
+    """Block until an in-flight background refresh finishes (tests)."""
+    thread = _refresh_thread
+    if thread is not None:
+        thread.join(timeout)
+
+
 def reset_cache() -> None:
-    """Forget the in-process memo and warning state (tests)."""
+    """Wait out any refresh, then forget the in-process memo and warning
+    state (tests)."""
     global _memo, _warned
+    wait_for_refresh()
     with _lock:
         _memo = None
         _warned = False

@@ -421,6 +421,9 @@ def _cost_from_usage(usage: dict[str, Any], model: str) -> tuple[float, bool]:
             out_tok,
             cache_creation_tokens=cache_creation,
             cache_read_tokens=cache_read,
+            # One message's usage is one API request, so a long-prompt
+            # tier applies to exactly the messages that crossed it.
+            single_request=True,
         ),
         False,
     )
