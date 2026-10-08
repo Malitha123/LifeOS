@@ -138,3 +138,13 @@ def test_a_recovered_model_clears_its_strikes(probe_mod, monkeypatch, tmp_path, 
     for _ in range(2):
         assert _run(probe_mod, monkeypatch, tmp_path, capsys, []) == []
     assert [k for k, _ in _run(probe_mod, monkeypatch, tmp_path, capsys, [])] == [f"model:{FLAKY}"]
+
+
+def test_commented_out_model_ids_are_not_probed(probe_mod, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(f"# LIFEOS_REMOTE_LLM_MODEL={GONE}\nLIFEOS_REMOTE_LLM_MODEL={FLAKY}  # was {GONE}\n")
+    hermes = tmp_path / "config.yaml"
+    hermes.write_text(f"model:\n  # default: {GONE}\n  default: {LOCKED}\n")
+    where, _ = probe_mod.collect([str(env), str(hermes)])
+    assert where[FLAKY] == [str(env)] and where[LOCKED] == [str(hermes)]
+    assert where[GONE] == ["LifeOS settings"]

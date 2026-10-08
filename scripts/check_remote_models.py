@@ -38,6 +38,9 @@ os.chdir(PROJECT_DIR)
 from config.settings import settings  # noqa: E402
 
 MODEL_ID_RE = re.compile(r"accounts/[A-Za-z0-9_-]+/models/[A-Za-z0-9._-]+")
+# A `#` at the start of a line or after whitespace starts a comment in both
+# .env and YAML; a commented-out model id is not configured.
+COMMENT_RE = re.compile(r"(^|\s)#.*$", re.MULTILINE)
 STRIKES = 3
 # Probes and source reads run in parallel under these bounds, so a run
 # finishes well inside the watchdog's own time limit.
@@ -78,7 +81,7 @@ def collect(sources: list[str]) -> tuple[dict[str, list[str]], dict[str, str]]:
         except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
             errors[source] = str(exc) or type(exc).__name__
             continue
-        for model in sorted(set(MODEL_ID_RE.findall(text))):
+        for model in sorted(set(MODEL_ID_RE.findall(COMMENT_RE.sub("", text)))):
             where.setdefault(model, []).append(source)
     return where, errors
 
