@@ -77,6 +77,7 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 | `LIFEOS_LOCAL_LLM_TIMEOUT` | int | `90` | Local LLM HTTP request timeout, seconds. |
 | `LIFEOS_LLM_MODEL` | str | — | Optional override for the GGUF model the `lifeos-llm` systemd unit loads. When unset, the unit uses its bundled `-hf` default; when set, the setup script substitutes a `-m`/`--mmproj` form. |
 | `LIFEOS_LOCAL_LLM_AUTOSTART` | bool | `false` | When `true`, the API service brings up `lifeos-llm` on its `Wants=` chain. Default `false` so a missing local model doesn't break the API. |
+| `LIFEOS_LLM_CONTEXT_SIZE` | int | `32768` | llama-server context size in tokens (`-c`), written into `lifeos-llm.service` by `setup-systemd.sh`. Raise it for agents that need a longer window (Hermes asks for at least 65536 for tool use); each doubling grows the KV cache, so check VRAM headroom first. Rerun `sudo ./scripts/setup-systemd.sh` from the repo root, then restart `lifeos-llm`, to apply. |
 
 **When to change `LIFEOS_LLM_BACKEND`:** the default (`anthropic`) is right for operators without a high-VRAM GPU. Switch to `local` if you have a workstation that can run `llama-server` and want zero marginal cost / no data transit to Anthropic.
 

@@ -15,6 +15,7 @@
 #                               the upstream model has been updated — see
 #                               docs/guides/agent-worker-setup.md).
 #   __LLM_RESTART_POLICY__    → "on-failure" or "no" (from LIFEOS_LOCAL_LLM_AUTOSTART)
+#   __LLM_CONTEXT_SIZE__      → llama-server context size in tokens (LIFEOS_LLM_CONTEXT_SIZE)
 
 set -euo pipefail
 
@@ -57,6 +58,11 @@ LLM_MODEL=$(_read_env "LIFEOS_LLM_MODEL" "${LIFEOS_LLM_MODEL:-unsloth/gemma-4-26
 LLM_MODEL_PATH=$(_read_env "LIFEOS_LLM_MODEL_PATH" "")
 LLM_MMPROJ_PATH=$(_read_env "LIFEOS_LLM_MMPROJ_PATH" "")
 LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false")
+LLM_CONTEXT_SIZE=$(_read_env "LIFEOS_LLM_CONTEXT_SIZE" "32768")
+if ! [[ "$LLM_CONTEXT_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: LIFEOS_LLM_CONTEXT_SIZE must be a positive integer (got '$LLM_CONTEXT_SIZE')" >&2
+    exit 1
+fi
 MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
 AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false")
 AUTODEPLOY_ENABLED=$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false")
@@ -114,6 +120,7 @@ echo "  Venv:       $VENV_DIR"
 echo "  llama.cpp:  $LLAMA_DIR"
 echo "  LLM Model:  $LLM_SOURCE_DISPLAY"
 echo "  LLM Auto:   $LLM_AUTOSTART (restart policy: $LLM_RESTART_POLICY)"
+echo "  LLM Ctx:    $LLM_CONTEXT_SIZE tokens"
 if [ -n "$MCP_BEARER_TOKEN" ]; then
     echo "  MCP HTTP:   enabled (token configured)"
 else
@@ -136,6 +143,7 @@ for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         -e "s|__LLM_MODEL__|$LLM_MODEL|g" \
         -e "s|__LLM_SOURCE_ARGS__|$LLM_SOURCE_ARGS|g" \
         -e "s|__LLM_RESTART_POLICY__|$LLM_RESTART_POLICY|g" \
+        -e "s|__LLM_CONTEXT_SIZE__|$LLM_CONTEXT_SIZE|g" \
         "$unit" > "$SYSTEMD_DST/$name"
     echo "  Installed $name"
 done

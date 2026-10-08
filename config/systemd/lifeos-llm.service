@@ -14,7 +14,7 @@ ExecStart=__LLAMA_CPP_DIR__/build/bin/llama-server \
     -fa on \
     --jinja \
     --no-mmap \
-    -c 32768 \
+    -c __LLM_CONTEXT_SIZE__ \
     --host 0.0.0.0 \
     --port 8080
 Restart=__LLM_RESTART_POLICY__
