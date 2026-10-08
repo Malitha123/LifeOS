@@ -148,3 +148,27 @@ def test_commented_out_model_ids_are_not_probed(probe_mod, tmp_path):
     where, _ = probe_mod.collect([str(env), str(hermes)])
     assert where[FLAKY] == [str(env)] and where[LOCKED] == [str(hermes)]
     assert where[GONE] == ["LifeOS settings"]
+
+
+def test_models_and_sources_are_checked_in_parallel(probe_mod, monkeypatch, tmp_path, capsys):
+    import time
+
+    models = [f"accounts/example/models/slow-{i}" for i in range(6)]
+    monkeypatch.setattr(probe_mod.settings, "remote_llm_model_options", ",".join(models))
+    sources = [str(tmp_path / f"src-{i}") for i in range(4)]
+
+    def slow_probe(client, base, model):
+        time.sleep(0.5)
+        return "ok", ""
+
+    def slow_read(source):
+        time.sleep(0.5)
+        return ""
+
+    monkeypatch.setattr(probe_mod, "probe", slow_probe)
+    monkeypatch.setattr(probe_mod, "read_source", slow_read)
+    monkeypatch.setattr(probe_mod.settings, "model_probe_sources", ",".join(sources))
+    started = time.monotonic()
+    _run(probe_mod, monkeypatch, tmp_path, capsys, [])
+    assert time.monotonic() - started < 2.5  # serial would take 5.0+ seconds
+    assert probe_mod.TIMEOUT_SECONDS <= 20 and probe_mod.SSH_TIMEOUT_SECONDS <= 20

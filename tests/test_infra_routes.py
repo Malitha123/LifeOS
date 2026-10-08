@@ -500,8 +500,18 @@ def test_telegram_send_has_connect_and_total_timeouts(box):
     assert "--max-time 15" in call
 
 
-def test_service_unit_has_a_start_timeout():
-    assert "TimeoutStartSec=120" in SERVICE.read_text()
+def test_service_unit_start_timeout_covers_the_worst_case_run():
+    """The unit's start timeout must outlast a run where every bounded check
+    takes its limit: the model probe, the MCP Funnel node's login wait, a
+    Pebble health check, route re-application, and a few Telegram alerts."""
+    import re as re_mod
+    timeout = int(re_mod.search(r"^TimeoutStartSec=(\d+)$", SERVICE.read_text(), re_mod.M).group(1))
+    watchdog = WATCHDOG.read_text()
+    probe = int(re_mod.search(r'LIFEOS_MODEL_PROBE_TIMEOUT:-(\d+)', watchdog).group(1))
+    node = (REPO_ROOT / "scripts" / "mcp-funnel-node.sh").read_text()
+    funnel_wait = int(re_mod.search(r"setting LIFEOS_MCP_FUNNEL_WAIT_SECONDS (\d+)", node).group(1))
+    pebble, routes, telegram, alerts = 10, 60, 15, 4
+    assert timeout >= probe + funnel_wait + 2 + pebble + routes + telegram * alerts
 
 
 def test_linger_enabled_and_verified(box):
