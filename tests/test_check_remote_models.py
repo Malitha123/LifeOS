@@ -49,7 +49,11 @@ def _transport(calls: list):
 
 
 def _run(probe_mod, monkeypatch, tmp_path, capsys, calls):
-    monkeypatch.setattr(probe_mod.httpx, "Client", lambda **kw: REAL_CLIENT(transport=_transport(calls), **kw))
+    def client(**kw):
+        assert kw["timeout"] == probe_mod.TIMEOUT_SECONDS
+        return REAL_CLIENT(transport=_transport(calls), **kw)
+
+    monkeypatch.setattr(probe_mod.httpx, "Client", client)
     monkeypatch.setenv("LIFEOS_INFRA_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr("sys.argv", ["check_remote_models.py"])
     assert probe_mod.main() == 0
@@ -117,6 +121,7 @@ def test_ssh_source_reads_over_ssh(probe_mod, monkeypatch):
 
     def fake_run(cmd, **kw):
         seen["cmd"] = cmd
+        assert kw["timeout"] == probe_mod.SSH_TIMEOUT_SECONDS
         return probe_mod.subprocess.CompletedProcess(cmd, 0, stdout=f"model: {GONE}\n", stderr="")
 
     monkeypatch.setattr(probe_mod.subprocess, "run", fake_run)
@@ -142,11 +147,15 @@ def test_a_recovered_model_clears_its_strikes(probe_mod, monkeypatch, tmp_path, 
 
 def test_commented_out_model_ids_are_not_probed(probe_mod, tmp_path):
     env = tmp_path / ".env"
-    env.write_text(f"# LIFEOS_REMOTE_LLM_MODEL={GONE}\nLIFEOS_REMOTE_LLM_MODEL={FLAKY}  # was {GONE}\n")
+    env.write_text(f"# LIFEOS_REMOTE_LLM_MODEL={GONE}\nLIFEOS_REMOTE_LLM_MODEL={FLAKY}\n")
     hermes = tmp_path / "config.yaml"
-    hermes.write_text(f"model:\n  # default: {GONE}\n  default: {LOCKED}\n")
+    hermes.write_text(
+        f"model:\n  # default: {GONE}\n  default: {LOCKED}\n"
+        f'provider: {{label: "primary # production", model: {LIVE}}}\n'
+    )
     where, _ = probe_mod.collect([str(env), str(hermes)])
     assert where[FLAKY] == [str(env)] and where[LOCKED] == [str(hermes)]
+    assert str(hermes) in where[LIVE]
     assert where[GONE] == ["LifeOS settings"]
 
 

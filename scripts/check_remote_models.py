@@ -38,9 +38,11 @@ os.chdir(PROJECT_DIR)
 from config.settings import settings  # noqa: E402
 
 MODEL_ID_RE = re.compile(r"accounts/[A-Za-z0-9_-]+/models/[A-Za-z0-9._-]+")
-# A `#` at the start of a line or after whitespace starts a comment in both
-# .env and YAML; a commented-out model id is not configured.
-COMMENT_RE = re.compile(r"(^|\s)#.*$", re.MULTILINE)
+# A line whose first non-blank character is `#` is a comment in both .env and
+# YAML; a model id there is not configured. Trailing comments are kept: a `#`
+# inside a quoted value is not a comment, and probing an id too many is safer
+# than missing one.
+COMMENT_RE = re.compile(r"^[ \t]*#.*$", re.MULTILINE)
 STRIKES = 3
 # Probes and source reads run in parallel under these bounds, so a run
 # finishes well inside the watchdog's own time limit.
