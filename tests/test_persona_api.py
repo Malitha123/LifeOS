@@ -1186,6 +1186,33 @@ def test_primary_persona_still_parses_and_resolves():
 
 
 @pytest.mark.unit
+def test_primary_persona_is_personal_chief_of_staff():
+    """Primary is the single user-facing PA rather than a generic knowledge persona."""
+    from config.settings import _parse_persona
+
+    body, _voice, _model = _parse_persona(_PRIMARY_FILE.read_text(), "primary")
+    lowered = body.lower()
+    assert "personal chief of staff" in lowered
+    assert "single conversational front door" in lowered
+    assert "general knowledge" in lowered
+    assert "decision support" in lowered
+    assert "should not need to choose a persona" in lowered
+
+
+@pytest.mark.unit
+def test_primary_persona_keeps_protected_connectors_disabled_until_permission_layer():
+    """Milestone 1 must not make private connectors/action surfaces implicitly available."""
+    from config.settings import _parse_persona
+
+    body, _voice, _model = _parse_persona(_PRIMARY_FILE.read_text(), "primary")
+    lowered = body.lower()
+    assert "permission-safe transition" in lowered
+    assert "do not access protected external services" in lowered
+    for service in ("gmail", "github", "google calendar", "google drive"):
+        assert service in lowered
+
+
+@pytest.mark.unit
 def test_no_primary_hermes_variant_file_created():
     """Shared orchestration-invariant prose stays deferred from extraction
     into a common block until a second orchestrator exists — no
