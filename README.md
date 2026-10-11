@@ -150,6 +150,8 @@ This is an experimental personal and learning project. It is evolving as I test 
 
 The intention is to **reuse strong existing foundations, customize the parts that matter, and avoid rebuilding mature capabilities unnecessarily**.
 
+This project is still evolving, so there may be bugs, rough edges, or incomplete features. If you find any issues, please open an issue or let me know.
+
 ## Original LifeOS documentation
 
 For the original LifeOS description, features, installation instructions, architecture, and upstream documentation, see:
