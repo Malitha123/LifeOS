@@ -16,10 +16,16 @@ import { startPendingQuestionPolling } from './pending-question.js';
 // stops immediately (used for the server-`error` path). `personaId`/`backend`
 // are reserved for follow-ons and omitted from the body when unset, so today's
 // request is byte-identical.
-export async function askStream({ question, conversationId, attachments, personaId, backend, model, on }) {
+export async function askStream({ question, conversationId, attachments, personaId, backend, model, permissionGrants, permissionResume, on }) {
   const body = { question };
   if (conversationId) {
     body.conversation_id = conversationId;
+  }
+  if (permissionGrants && permissionGrants.length > 0) {
+    body.permission_grants = permissionGrants;
+  }
+  if (permissionResume) {
+    body.permission_resume = true;
   }
 
   // Include attachments if any
@@ -99,6 +105,200 @@ export async function stopTurn() {
   }
 }
 
+function permissionCard(request, onResume) {
+  const card = document.createElement('div');
+  card.className = 'permission-request';
+  card.style.marginTop = '10px';
+  card.style.padding = '10px 12px';
+  card.style.border = '1px solid var(--border-color, #d0d0d0)';
+  card.style.borderRadius = '10px';
+  card.style.background = 'var(--bg-secondary, rgba(127,127,127,0.08))';
+
+  const title = document.createElement('div');
+  title.style.fontWeight = '600';
+  title.textContent = `Permission required: ${request.service || 'protected service'}`;
+  card.appendChild(title);
+
+  const detail = document.createElement('div');
+  detail.style.marginTop = '4px';
+  detail.style.fontSize = '0.9em';
+  detail.textContent = `${request.operation || 'access'} · ${request.scope || request.reason || ''}`;
+  card.appendChild(detail);
+
+  const controls = document.createElement('div');
+  controls.style.display = 'flex';
+  controls.style.gap = '8px';
+  controls.style.marginTop = '10px';
+
+  const allow = document.createElement('button');
+  allow.type = 'button';
+  allow.textContent = 'Allow once';
+  const deny = document.createElement('button');
+  deny.type = 'button';
+  deny.textContent = 'Deny';
+  for (const btn of [allow, deny]) {
+    btn.style.padding = '6px 10px';
+    btn.style.borderRadius = '8px';
+    btn.style.border = '1px solid var(--border-color, #c8c8c8)';
+    btn.style.cursor = 'pointer';
+  }
+
+  const setFinished = (text) => {
+    allow.disabled = true;
+    deny.disabled = true;
+    allow.style.cursor = 'default';
+    deny.style.cursor = 'default';
+    const status = document.createElement('span');
+    status.style.alignSelf = 'center';
+    status.style.fontSize = '0.85em';
+    status.textContent = text;
+    controls.appendChild(status);
+  };
+
+  allow.addEventListener('click', async () => {
+    if (allow.disabled) return;
+    allow.disabled = true;
+    deny.disabled = true;
+    try {
+      const response = await fetch(`${endpoints.permissions}/${encodeURIComponent(request.id)}/approve`, {
+        method: 'POST',
+        headers: { 'X-LifeOS-Permission-Approval': request.id },
+      });
+      if (!response.ok) throw new Error('Permission approval failed');
+      setFinished('Approved for this one operation.');
+      await onResume(request.id);
+    } catch (error) {
+      allow.disabled = false;
+      deny.disabled = false;
+      setStatus('error', 'Permission approval failed');
+    }
+  });
+
+  deny.addEventListener('click', async () => {
+    if (deny.disabled) return;
+    allow.disabled = true;
+    deny.disabled = true;
+    try {
+      const response = await fetch(`${endpoints.permissions}/${encodeURIComponent(request.id)}/deny`, {
+        method: 'POST',
+        headers: { 'X-LifeOS-Permission-Approval': request.id },
+      });
+      if (!response.ok) throw new Error('Permission denial failed');
+      setFinished('Denied. No protected access was performed.');
+    } catch (error) {
+      allow.disabled = false;
+      deny.disabled = false;
+      setStatus('error', 'Permission denial failed');
+    }
+  });
+
+  controls.appendChild(allow);
+  controls.appendChild(deny);
+  card.appendChild(controls);
+  return card;
+}
+
+async function resumeWithPermission({ question, attachments, requestId }) {
+  if (!state.currentConversationId) return;
+
+  // A permission event is emitted just before the current turn closes. A fast
+  // click can therefore land while the original SSE cleanup still owns the
+  // composer. Wait briefly for that turn to release instead of approving a
+  // grant and then silently abandoning the resume.
+  for (let i = 0; state.isLoading && i < 100; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  if (state.isLoading) {
+    setStatus('error', 'Could not resume permission request');
+    return;
+  }
+
+  state.isLoading = true;
+  setStatus('loading', 'Continuing…');
+  elements.sendBtn.disabled = true;
+  elements.sendBtn.style.display = 'none';
+  elements.stopBtn.classList.add('visible');
+
+  const msgId = 'msg-' + Date.now();
+  const msg = addMessage('', 'assistant', [], msgId);
+  msg.querySelector('.message-content').innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+
+  let fullContent = '';
+  let sources = [];
+  let routingSources = [];
+  let serverError = false;
+
+  try {
+    await askStream({
+      question,
+      conversationId: state.currentConversationId,
+      attachments,
+      personaId: config.personaId,
+      backend: config.backend,
+      model: config.model,
+      permissionGrants: [requestId],
+      permissionResume: true,
+      on: (data) => {
+        if (data.type === 'routing') {
+          routingSources = data.sources || [];
+        } else if (data.type === 'self_correction') {
+          fullContent = '';
+          updateMessage(msgId, '');
+        } else if (data.type === 'content') {
+          fullContent += data.content;
+          updateMessage(msgId, fullContent);
+        } else if (data.type === 'permission_request') {
+          msg.appendChild(permissionCard(data.request, (nextId) => resumeWithPermission({
+            question, attachments, requestId: nextId,
+          })));
+        } else if (data.type === 'sources') {
+          sources = data.sources;
+        } else if (data.type === 'conversation_id') {
+          state.currentConversationId = data.conversation_id;
+          setStoredConversationId(data.conversation_id);
+        } else if (data.type === 'usage') {
+          const cost = data.cost_usd;
+          if (typeof cost === 'number' && Number.isFinite(cost)) state.sessionCost += cost;
+          else state.sessionCostUnpriced += 1;
+          const prefix = state.sessionCostUnpriced > 0 ? '~' : '';
+          elements.sessionCostEl.textContent = prefix + '$' + state.sessionCost.toFixed(3);
+        } else if (data.type === 'done') {
+          const msgEl = document.getElementById(msgId);
+          if (msgEl) {
+            let metaHtml = '';
+            const sourceIcons = { vault: '📚', calendar: '📅', gmail: '✉️', drive: '📁', attachment: '📎', people: '👤', actions: '✅' };
+            const dataSources = routingSources.filter(src => sourceIcons[src]);
+            if (dataSources.length > 0) {
+              metaHtml += '<div class="routing-sources">';
+              dataSources.forEach(src => { metaHtml += `<span class="routing-source ${src}">${sourceIcons[src]} ${src}</span>`; });
+              metaHtml += '</div>';
+            }
+            metaHtml += buildSourcesHtml(sources);
+            if (metaHtml) msgEl.insertAdjacentHTML('beforeend', `<div class="message-meta">${metaHtml}</div>`);
+          }
+          loadConversations();
+        } else if (data.type === 'error') {
+          serverError = true;
+          updateMessage(msgId, fullContent || 'Sorry, I could not continue after permission approval.');
+          setStatus('error', 'Error');
+          return true;
+        }
+      },
+    });
+    if (!serverError) setStatus('', 'Ready');
+  } catch (error) {
+    console.error('Permission resume failed:', error);
+    updateMessage(msgId, fullContent || 'Sorry, I could not continue after permission approval.');
+    setStatus('error', 'Error');
+  } finally {
+    state.isLoading = false;
+    elements.sendBtn.disabled = false;
+    elements.sendBtn.style.display = '';
+    elements.stopBtn.classList.remove('visible');
+    elements.inputField.focus();
+  }
+}
+
 export async function sendMessage() {
   const question = elements.inputField.value.trim();
   if (!question || state.isLoading) return;
@@ -173,6 +373,10 @@ export async function sendMessage() {
         } else if (data.type === 'content') {
           fullContent += data.content;
           updateMessage(msgId, fullContent);
+        } else if (data.type === 'permission_request') {
+          msg.appendChild(permissionCard(data.request, (requestId) => resumeWithPermission({
+            question, attachments: messageAttachments, requestId,
+          })));
         } else if (data.type === 'sources') {
           sources = data.sources;
         } else if (data.type === 'conversation_id') {
@@ -199,55 +403,57 @@ export async function sendMessage() {
             ? state.sessionCostUnpriced + ' turn(s) this session had no reported cost -- total is a lower bound.'
             : '';
         } else if (data.type === 'claude_intent') {
-          // Engine handoff: the orchestrator delegated to a CLI
-          // worker. Gate it on the selected persona's advertised capabilities
-          // — only personas with the `handoff` capability may trigger
-          // it; for others, ignore the intent (no handoff UI). An explicit
-          // `claude_code` model pick is itself the handoff opt-in, so it
-          // bypasses the persona gate; inferred intents still require a
-          // handoff-capable persona.
+          // Repository-capable worker handoffs are protected by the same
+          // permission-first rule as Gmail/Calendar/etc. The spawn endpoint
+          // itself returns HTTP 428 with a permission request until a one-use
+          // grant is approved, so a client cannot bypass the gate by calling
+          // the handoff route directly.
           if (personaSupportsHandoff() || config.model === 'claude_code' || data.execution) {
             const engine = data.engine || 'claude_code';
             const label = engine === 'codex' ? 'Codex' : 'Claude Code';
-            fullContent = '🤝 Handing off to ' + label + '…';
+            fullContent = 'Preparing ' + label + ' handoff…';
             updateMessage(msgId, fullContent);
-            // Pin the conversation this handoff targets BEFORE the in-flight
-            // POST: the server links the spawned session to exactly this
-            // conversation, so the post-await poll must target it too. Reading
-            // state.currentConversationId again inside the `.then()` would poll
-            // the wrong thread if the user navigated mid-POST.
             const handoffConversationId = state.currentConversationId;
-            fetch(endpoints.handoff, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                engine: engine,
-                task: data.task || '',
-                conversation_id: handoffConversationId,
-                ...(data.execution ? { execution: data.execution } : {}),
-              }),
-            }).then(r => r.json()).then(d => {
-              fullContent = (d && d.message)
-                ? d.message
-                : '⚠️ Handoff to ' + label + ' failed.';
-              updateMessage(msgId, fullContent);
-              // The handoff linked the spawned session to the conversation
-              // it targeted server-side, so poll THAT conversation for the
-              // session's streamed progress + terminal result and render them
-              // into the thread (parity with the orchestrating-persona path
-              // below). The seen-message seed in startPendingQuestionPolling
-              // assumes the handoff ack message is already persisted server-side
-              // (chat_handoff writes it synchronously before returning) when the
-              // first poll fires — if ack persistence ever becomes async, the
-              // seed must be revisited or the ack would render twice. Only on a
-              // successful spawn with a conversation to land results in.
-              if (d && d.ok && handoffConversationId) {
-                startPendingQuestionPolling(handoffConversationId);
+            const payload = {
+              engine: engine,
+              task: data.task || '',
+              conversation_id: handoffConversationId,
+              ...(data.execution ? { execution: data.execution } : {}),
+            };
+
+            const startHandoff = async (permissionGrantId = null) => {
+              try {
+                const response = await fetch(endpoints.handoff, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    ...payload,
+                    ...(permissionGrantId ? { permission_grant_id: permissionGrantId } : {}),
+                  }),
+                });
+                const d = await response.json().catch(() => ({}));
+                if (response.status === 428
+                    && d && d.detail && d.detail.code === 'permission_required'
+                    && d.detail.request) {
+                  fullContent = `I need your permission before ${label} can access the repository for this request.`;
+                  updateMessage(msgId, fullContent);
+                  msg.appendChild(permissionCard(d.detail.request, (requestId) => startHandoff(requestId)));
+                  return;
+                }
+                if (!response.ok) throw new Error((d && d.detail) || 'handoff failed');
+                fullContent = (d && d.message)
+                  ? d.message
+                  : '⚠️ Handoff to ' + label + ' failed.';
+                updateMessage(msgId, fullContent);
+                if (d && d.ok && handoffConversationId) {
+                  startPendingQuestionPolling(handoffConversationId);
+                }
+              } catch (error) {
+                fullContent = '⚠️ Handoff to ' + label + ' failed.';
+                updateMessage(msgId, fullContent);
               }
-            }).catch(() => {
-              fullContent = '⚠️ Handoff to ' + label + ' failed.';
-              updateMessage(msgId, fullContent);
-            });
+            };
+            startHandoff();
           }
         } else if (data.type === 'done') {
           // Add sources and meta to message

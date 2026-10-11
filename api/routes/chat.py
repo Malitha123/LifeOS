@@ -450,6 +450,27 @@ class AskStreamRequest(BaseModel):
     # not required to be a UUID) before sending; the server never generates
     # or returns one. Optional and additive: omitting it changes nothing.
     client_turn_id: Optional[str] = None
+    # One-use permission request ids explicitly approved by the user. These are
+    # never treated as ambient session authorization: the PermissionBroker
+    # verifies conversation + tool + exact normalized arguments and consumes a
+    # matching grant once. `permission_resume` is used by the web UI when the
+    # user clicks Allow so the original user message is not persisted twice.
+    permission_grants: Optional[list[str]] = None
+    permission_resume: bool = False
+
+    @field_validator("permission_grants")
+    @classmethod
+    def validate_permission_grants(cls, v):
+        if v is None:
+            return v
+        if len(v) > 10:
+            raise ValueError("permission_grants may contain at most 10 ids")
+        for grant_id in v:
+            if not isinstance(grant_id, str) or not grant_id or len(grant_id) > 128:
+                raise ValueError("permission grant ids must be non-empty strings <= 128 chars")
+            if not all(c.isalnum() or c in "-_" for c in grant_id):
+                raise ValueError("permission grant ids contain invalid characters")
+        return v
 
     @field_validator("client_turn_id")
     @classmethod
@@ -650,6 +671,11 @@ async def ask_stream(request: AskStreamRequest):
     """
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
+    if request.permission_resume:
+        if not request.conversation_id:
+            raise HTTPException(status_code=400, detail="permission_resume requires conversation_id")
+        if not request.permission_grants:
+            raise HTTPException(status_code=400, detail="permission_resume requires permission_grants")
 
     canonical_spec = None
     if request.execution is not None:
@@ -783,7 +809,10 @@ async def ask_stream(request: AskStreamRequest):
     # surface at once — the Telegram bot and the ingest endpoint both arrive
     # here through `chat_via_api`'s raw-`persona` path, `/chat` and voice
     # through `persona_id`.
-    journal_capture = journal_capture_gate(_effective_pid, request.question)
+    journal_capture = (
+        None if request.permission_resume
+        else journal_capture_gate(_effective_pid, request.question)
+    )
 
     # The turn's lifetime is owned by the server from here on, not by
     # this SSE connection — every modality survives the client leaving
@@ -886,8 +915,11 @@ async def ask_stream(request: AskStreamRequest):
                     }) + "\n\n"
                 )
 
-            # Save user message
-            store.add_message(conversation_id, "user", request.question)
+            # Save the user's message exactly once. Permission approval resumes
+            # the original request invisibly, so persisting the same question a
+            # second time would corrupt conversation history and titles.
+            if not request.permission_resume:
+                store.add_message(conversation_id, "user", request.question)
 
             # `/agent [local|claude] <task>` — spawn an operator agent on demand.
             # Equivalent affordance to Telegram's /agent command, calling
@@ -1266,6 +1298,8 @@ async def ask_stream(request: AskStreamRequest):
                     force_remote=force_remote,
                     persona_id=_effective_pid or "",
                     user_message=request.question,
+                    conversation_id=conversation_id,
+                    permission_grants=request.permission_grants or [],
                 ):
                     if event["type"] == "turn_state":
                         # Live, mutable AgentResult -- see the comment by
@@ -1275,6 +1309,10 @@ async def ask_stream(request: AskStreamRequest):
                         await _content(event['content'])
                     elif event["type"] == "status":
                         await turn.emit(f"data: {json.dumps({'type': 'status', 'message': event['message']})}\n\n")
+                    elif event["type"] == "permission_request":
+                        await turn.emit(
+                            f"data: {json.dumps({'type': 'permission_request', 'request': event['request']})}\n\n"
+                        )
                     elif event["type"] == "self_correction":
                         # What was streamed so far is superseded by the
                         # self-corrected retry that follows — mirrors
@@ -1369,7 +1407,14 @@ async def ask_stream(request: AskStreamRequest):
 
             # Save assistant response
             routing_metadata = {
-                "sources": [tc["tool"] for tc in agent_result.tool_calls_log],
+                "sources": [
+                    tc["tool"] for tc in agent_result.tool_calls_log
+                    if not tc.get("is_error")
+                ],
+                "blocked_permission_tools": [
+                    tc["tool"] for tc in agent_result.tool_calls_log
+                    if tc.get("permission_required")
+                ],
                 "reasoning": f"agentic ({orchestrator_model})",
                 "tool_rounds": len(agent_result.tool_calls_log),
             }
@@ -1571,6 +1616,9 @@ class HandoffRequest(BaseModel):
     effort: Optional[str] = None
     host: Optional[str] = None
     working_dir: Optional[str] = None
+    # One-use approval for repository-capable agent access. The broker binds
+    # it to conversation + engine + task and consumes it at the spawn boundary.
+    permission_grant_id: Optional[str] = None
 
 
 @router.post("/chat/handoff")
@@ -1589,6 +1637,29 @@ async def chat_handoff(request: HandoffRequest):
         raise HTTPException(status_code=400, detail="engine must be 'codex' or 'claude_code'")
     if not task:
         raise HTTPException(status_code=400, detail="task is required")
+
+    # A repository-capable CLI worker can read/write local code and may reach
+    # GitHub through its normal tooling, so spawning it is itself a protected
+    # operation. The user must approve this exact engine + task before any
+    # worker process is created. This check lives at the spawn boundary, not
+    # merely in the chat prompt, so alternate UI paths cannot bypass it.
+    from api.services.permission_broker import get_permission_broker
+    _handoff_decision = get_permission_broker().authorize_or_request(
+        conversation_id=request.conversation_id or "handoff:standalone",
+        tool_name="repository_agent",
+        tool_input={"engine": engine, "task": task},
+        grant_ids=[request.permission_grant_id] if request.permission_grant_id else [],
+    )
+    if not _handoff_decision.allowed:
+        return JSONResponse(
+            status_code=428,
+            content={
+                "detail": {
+                    "code": "permission_required",
+                    "request": _handoff_decision.request.public_dict(),
+                }
+            },
+        )
 
     from dataclasses import replace
     from api.services.agent_worker.execution import parse_execution_request

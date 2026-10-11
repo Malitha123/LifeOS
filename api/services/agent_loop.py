@@ -13,6 +13,7 @@ Event types yielded:
   {"type": "text",   "content": "..."}       -- streamed text chunk
   {"type": "status", "message": "..."}       -- tool execution status
   {"type": "self_correction"}                -- model retrying (consumers should clear buffered text)
+  {"type": "permission_request", "request": {...}} -- protected tool needs user approval
   {"type": "result", "result": AgentResult}  -- final result (last event)
 """
 import asyncio
@@ -23,6 +24,7 @@ from typing import AsyncGenerator
 from api.services.claude_models import resolve_claude_model
 from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_STATUS_MESSAGES, execute_tool_parallel, begin_email_send_turn, tools_for_persona
+from api.services.permission_broker import get_permission_broker, permission_prompt_text
 from api.services.journal_capture import JOURNAL_PERSONA_ID
 from api.services.chat_helpers import role_content
 from api.services.synthesizer import build_message_content
@@ -493,6 +495,8 @@ async def run_agent_loop(
     force_remote: bool = False,
     persona_id: str = "",
     user_message: str = "",
+    conversation_id: str = "",
+    permission_grants: list[str] | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Async generator that runs the agentic chat loop.
@@ -532,6 +536,11 @@ async def run_agent_loop(
             journal-turn `manage_tasks` create can keep only the tags and
             fields the operator actually typed, stripping ones the model
             invented.
+        conversation_id: Conversation that owns this turn. Protected tool
+            approvals are bound to this id and cannot be replayed elsewhere.
+        permission_grants: Explicit one-use permission request ids approved
+            by the user for this resumed turn. The broker verifies the exact
+            conversation, tool and normalized arguments before consuming one.
 
     Yields:
         Dicts with "type" key: "turn_state" (first event -- a live
@@ -836,9 +845,54 @@ async def run_agent_loop(
             # Append the assistant message with tool use blocks
             messages.append({"role": "assistant", "content": assistant_content})
 
-            # Execute tools in parallel
+            # Permission preflight happens before a protected handler is reached.
+            # The broker is the single enforcement point for native PA tool calls:
+            # prompt text can request access, but only an approved one-use grant
+            # can make a protected call executable.
+            broker = get_permission_broker()
+            permission_decisions = {}
+            permission_requests = []
+            for block in tool_use_blocks:
+                decision = broker.authorize_or_request(
+                    conversation_id=conversation_id or "unbound",
+                    tool_name=block.name,
+                    tool_input=block.input,
+                    grant_ids=permission_grants,
+                )
+                permission_decisions[block.id] = decision
+                if not decision.allowed and decision.request is not None:
+                    permission_requests.append(decision.request)
+                    yield {
+                        "type": "permission_request",
+                        "request": decision.request.public_dict(),
+                    }
+
+            # Execute allowed tools in parallel. Protected calls without a grant
+            # are represented as blocked tool results, never passed to a handler.
             async def _exec_one(block):
                 name = block.name
+                decision = permission_decisions[block.id]
+                if not decision.allowed:
+                    req = decision.request
+                    tool_result_str = (
+                        "Error: Permission required before this protected tool can run. "
+                        f"Permission request id: {req.id if req else 'unknown'}."
+                    )
+                    result.tool_calls_log.append({
+                        "tool": name,
+                        "input": block.input,
+                        "result_preview": tool_result_str[:200],
+                        "is_error": True,
+                        "permission_required": True,
+                        "permission_request_id": req.id if req else None,
+                    })
+                    return {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": tool_result_str,
+                        "is_error": True,
+                    }
+
                 logger.info(f"Executing tool: {name} with input: {block.input}")
                 with trace_span(f"tool_{name}") as span_meta:
                     tool_result_str = await execute_tool_parallel(
@@ -867,8 +921,10 @@ async def run_agent_loop(
                     "is_error": is_error,
                 }
 
-            # Emit status for each tool (with sub-action lookup for consolidated tools)
+            # Emit status only for calls that are actually authorized to run.
             for block in tool_use_blocks:
+                if not permission_decisions[block.id].allowed:
+                    continue
                 status_msg = TOOL_STATUS_MESSAGES.get(block.name, f"Running {block.name}...")
                 if block.name in _CONSOLIDATED_TOOLS:
                     action = block.input.get("action", "")
@@ -877,7 +933,19 @@ async def run_agent_loop(
                 yield {"type": "status", "message": status_msg}
 
             tool_results = await asyncio.gather(*[_exec_one(b) for b in tool_use_blocks])
-            print(f"[agent] Round {round_num} tools executed: {[b.name for b in tool_use_blocks]}")
+            print(f"[agent] Round {round_num} tools executed/blocked: {[b.name for b in tool_use_blocks]}")
+
+            # Stop this turn at the permission boundary. We do not let the model
+            # retry the protected call, route around the broker, or claim that it
+            # accessed the service. The browser can approve a request and resume
+            # the original turn with the one-use grant id. Public/local calls that
+            # shared this round may have completed, but no further tools run until
+            # the user decides.
+            if permission_requests:
+                prompt = permission_prompt_text(permission_requests)
+                result.full_text += prompt
+                yield {"type": "text", "content": prompt}
+                break
 
             # LIFEOS_JEV_ORCHESTRATOR=shadow in-loop judgment: fired once this
             # round's tool results are gathered, starting with the second round

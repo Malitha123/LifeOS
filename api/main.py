@@ -63,7 +63,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, agent_assignment, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest, home
+from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, agent_assignment, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest, home, permissions
 from api.services.log_redaction import configure_telegram_log_redaction, install_query_string_redaction_filter
 from api.services.route_timing import RouteTimingMiddleware
 from api.services.runtime_identity import capture_runtime_identity, publish_runtime_identity
@@ -474,6 +474,7 @@ app.include_router(gmail.router)
 app.include_router(drive.router)
 app.include_router(people.router)
 app.include_router(chat.router)
+app.include_router(permissions.router)
 app.include_router(briefings.router)
 app.include_router(admin.router)
 app.include_router(conversations.router)

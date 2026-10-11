@@ -1200,14 +1200,16 @@ def test_primary_persona_is_personal_chief_of_staff():
 
 
 @pytest.mark.unit
-def test_primary_persona_keeps_protected_connectors_disabled_until_permission_layer():
-    """Milestone 1 must not make private connectors/action surfaces implicitly available."""
+def test_primary_persona_requires_permission_for_private_access_and_actions():
+    """Milestone 2 makes the permission-first rule part of primary's operating contract."""
     from config.settings import _parse_persona
 
     body, _voice, _model = _parse_persona(_PRIMARY_FILE.read_text(), "primary")
     lowered = body.lower()
-    assert "permission-safe transition" in lowered
-    assert "do not access protected external services" in lowered
+    assert "permission-first operation" in lowered
+    assert "structural permission broker" in lowered
+    assert "read approval never implies write approval" in lowered
+    assert "one approval applies only" in lowered
     for service in ("gmail", "github", "google calendar", "google drive"):
         assert service in lowered
 
