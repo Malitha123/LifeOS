@@ -1168,6 +1168,30 @@ async def ask_stream(request: AskStreamRequest):
                                 effective_question = expanded
                                 print(f"Expanded query (context): '{request.question}' -> '{effective_question}'")
 
+            # Personal-Assistant routing is advisory context for the primary
+            # Chief of Staff. It never executes tools or grants protected
+            # access; the PermissionBroker remains the only enforcement point.
+            pa_plan = None
+            if (_effective_pid or "primary") == "primary":
+                from api.services.pa_router import route_personal_request
+                from api.services.pa_specialists import build_specialist_context
+
+                pa_plan = route_personal_request(request.question)
+                specialist_context = build_specialist_context(pa_plan)
+                from api.services.personal_state import render_personal_state_context
+                from api.services.pa_orchestrator import consult_specialists
+                structured_context = render_personal_state_context()
+                multi_agent_context = await consult_specialists(pa_plan, request.question)
+                extra_context = "\n\n".join(
+                    block for block in (structured_context, specialist_context, multi_agent_context) if block
+                )
+                if extra_context:
+                    personal_context = (
+                        f"{personal_context.rstrip()}\n\n{extra_context}"
+                        if personal_context and personal_context.strip()
+                        else extra_context
+                    )
+
             # The agent loop uses the orchestrator model configured by
             # LIFEOS_ANTHROPIC_MODEL (or the local backend if LIFEOS_LLM_BACKEND=local),
             # a family name resolved to the newest model in that family.
@@ -1264,10 +1288,19 @@ async def ask_stream(request: AskStreamRequest):
                     for att in request.attachments
                 ]
 
-            _routing_reason = (
-                f'Agentic loop — escalated to {orchestrator_model}'
-                if escalated else f'Agentic loop ({orchestrator_model})'
-            )
+            if pa_plan is not None:
+                _domain_suffix = (
+                    f"; domains={','.join(pa_plan.domains)}" if pa_plan.domains else ""
+                )
+                _routing_reason = (
+                    f"Personal Chief of Staff: {pa_plan.execution_mode}{_domain_suffix}"
+                    + (f"; escalated to {orchestrator_model}" if escalated else "")
+                )
+            else:
+                _routing_reason = (
+                    f'Agentic loop — escalated to {orchestrator_model}'
+                    if escalated else f'Agentic loop ({orchestrator_model})'
+                )
             await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': ['agent'], 'reasoning': _routing_reason, 'latency_ms': 0})}\n\n")
 
             # Consume the async generator from the agent loop

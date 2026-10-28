@@ -172,7 +172,10 @@ SERVER_INSTRUCTIONS = (
     "and finances, indexed and searchable. Prefer these tools over general knowledge "
     "or memory for anything about the user's own life, work, people, plans, or past "
     "conversations. Start with lifeos_ask for a synthesized answer or lifeos_search for "
-    "source passages; use the people tools for anyone the user names."
+    "source passages; use the people tools for anyone the user names. Protected private "
+    "connectors and state-changing tools are permission-first: a first call returns a "
+    "one-use permission request instead of executing; ask the user to approve it, then "
+    "retry the identical operation with the returned _permission_grant_id."
 )
 
 # Curated list of endpoints to expose as tools (path -> tool config)
@@ -620,6 +623,74 @@ _CHATGPT_FETCH_MAX_CHARS = 200_000
 _CHATGPT_FETCHABLE_MAX = 2048
 
 
+# Permission bridge for direct MCP access. Native Personal-Assistant tool calls
+# are already mediated by api.services.permission_broker inside agent_loop.py.
+# MCP is a separate agent surface, so protected/private reads and writes must
+# not bypass that boundary. A protected MCP call returns a one-use permission
+# request id; after the user explicitly approves it through the LifeOS
+# permission endpoint/UI, the caller can retry the identical call with
+# `_permission_grant_id`.
+_MCP_SAFE_POST_READS = frozenset({"lifeos_ask", "lifeos_search"})
+_MCP_PRIVATE_MARKERS = (
+    "calendar", "gmail", "drive", "slack", "imessage", "whatsapp",
+    "monarch", "investment", "photos",
+)
+
+
+def _mcp_tool_config(tool_name: str) -> dict | None:
+    for config in CURATED_ENDPOINTS.values():
+        if config.get("name") == tool_name:
+            return config
+    return None
+
+
+def _mcp_permission_policy(tool_name: str):
+    """Return a PermissionPolicy for protected MCP calls, else None."""
+    config = _mcp_tool_config(tool_name)
+    if config is None:
+        return None
+    method = str(config.get("method") or "GET").upper()
+    lower = tool_name.lower()
+
+    from api.services.permission_broker import (
+        DESTRUCTIVE, PRIVATE_READ, WRITE, PermissionPolicy,
+    )
+
+    service = "LifeOS"
+    if "gmail" in lower:
+        service = "Gmail"
+    elif "calendar" in lower or "meeting_prep" in lower:
+        service = "Google Calendar"
+    elif "drive" in lower:
+        service = "Google Drive"
+    elif "slack" in lower:
+        service = "Slack"
+    elif "imessage" in lower or "whatsapp" in lower:
+        service = "Messages"
+    elif "monarch" in lower or "investment" in lower:
+        service = "Finance"
+    elif "photos" in lower:
+        service = "Photos"
+
+    if any(marker in lower for marker in _MCP_PRIVATE_MARKERS):
+        if method == "GET" or tool_name in {"lifeos_slack_search"}:
+            return PermissionPolicy(
+                PRIVATE_READ, service, "read",
+                f"Access private {service} data through MCP.",
+            )
+
+    if method in {"POST", "PUT", "PATCH", "DELETE"} and tool_name not in _MCP_SAFE_POST_READS:
+        category = DESTRUCTIVE if (
+            method == "DELETE"
+            or any(word in lower for word in ("send", "delete", "cancel", "complete", "pause"))
+        ) else WRITE
+        return PermissionPolicy(
+            category, service, method.lower(),
+            f"Perform a state-changing MCP operation via {tool_name}.",
+        )
+    return None
+
+
 class LifeOSMCPServer:
     """MCP Server that dynamically discovers LifeOS API endpoints."""
 
@@ -777,6 +848,7 @@ class LifeOSMCPServer:
                 self._apply_search_facet_schema(input_schema)
             self._add_turn_header_arg(input_schema, config)
             self._add_request_key_header_arg(input_schema, config)
+            self._add_permission_args(input_schema, config)
             tool = {
                 "name": config["name"],
                 "description": config["description"],
@@ -938,6 +1010,28 @@ class LifeOSMCPServer:
             "type": "string",
             "description": "Optional idempotency key forwarded as X-Request-Key; a retry with "
                            "the same key resolves to the same fire rather than firing twice.",
+        }
+
+    def _add_permission_args(self, schema: dict, config: dict) -> None:
+        """Expose one-use permission fields only on protected MCP tools."""
+        policy = _mcp_permission_policy(config.get("name", ""))
+        if policy is None:
+            return
+        props = schema.setdefault("properties", {})
+        props["_permission_grant_id"] = {
+            "type": "string",
+            "description": (
+                "One-use permission request id after the user explicitly approves "
+                "the matching protected operation. Omit on the first call; LifeOS "
+                "will return a permission request instead of executing."
+            ),
+        }
+        props["_permission_context"] = {
+            "type": "string",
+            "description": (
+                "Stable caller context used to bind the approval, e.g. a conversation/session id. "
+                "Reuse the same value when retrying after approval."
+            ),
         }
 
     def _fallback_schemas(self) -> dict:
@@ -1507,6 +1601,7 @@ class LifeOSMCPServer:
             )
             self._add_turn_header_arg(input_schema, config)
             self._add_request_key_header_arg(input_schema, config)
+            self._add_permission_args(input_schema, config)
             tool = {
                 "name": config["name"],
                 "description": config["description"],
@@ -1811,6 +1906,46 @@ class LifeOSMCPServer:
         caller identity override for `AGENT_SESSION_HEADER` — see
         `_resolve_agent_session_header`.
         """
+        # Work on a copy: permission metadata is MCP-only and must never be
+        # forwarded to the underlying HTTP API.
+        arguments = dict(arguments or {})
+
+        # Inter-agent coordination is an internal worker protocol, not a user
+        # data connector. It keeps its existing transport/session attestation.
+        if tool_name.startswith("lifeos_agent_"):
+            return self._handle_inter_agent(tool_name, dict(arguments))
+
+        # Direct MCP is a separate agent surface from the native chat loop.
+        # Enforce the same permission-first invariant here so Gmail, Calendar,
+        # Drive, finance and state-changing API calls cannot bypass the broker.
+        policy = _mcp_permission_policy(tool_name)
+        if policy is not None:
+            grant_id = str(arguments.pop("_permission_grant_id", "") or "").strip()
+            permission_context = str(
+                arguments.pop("_permission_context", "")
+                or session_id
+                or self._trusted_session_id
+                or "interactive"
+            ).strip()
+            from api.services.permission_broker import get_permission_broker
+            decision = get_permission_broker().authorize_or_request(
+                conversation_id=f"mcp:{permission_context}",
+                tool_name=f"mcp:{tool_name}",
+                tool_input=arguments,
+                grant_ids=[grant_id] if grant_id else [],
+                policy=policy,
+            )
+            if not decision.allowed:
+                req = decision.request
+                return {
+                    "error": (
+                        f"Permission required before {tool_name} can run. "
+                        "Ask the user to approve this exact one-use request, then retry "
+                        "the same arguments with _permission_grant_id."
+                    ),
+                    "permission_request": req.public_dict() if req else None,
+                }
+
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
             return self._handle_sync_trigger(arguments)
@@ -1819,8 +1954,6 @@ class LifeOSMCPServer:
         # (no HTTP round-trip). The caller_session_id arg identifies which
         # session is acting — local executor injects it automatically; remote
         # managed agents pass it explicitly per the system prompt.
-        if tool_name.startswith("lifeos_agent_"):
-            return self._handle_inter_agent(tool_name, dict(arguments))
 
         # lifeos_people_search defaults to a smaller page than the API's own
         # default (20) so the formatter's existing top-10 display stays

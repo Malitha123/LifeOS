@@ -81,6 +81,9 @@ _ALWAYS_ALLOWED: dict[str, PermissionPolicy] = {
     "list_vault": PermissionPolicy(INTERNAL_READ, "Personal Lake", "read", "List already-ingested local notes."),
     "search_memories": PermissionPolicy(INTERNAL_READ, "PA memory", "read", "Search local assistant memory."),
     "person_info": PermissionPolicy(INTERNAL_READ, "Personal Lake", "read", "Read locally indexed person context."),
+    "calculate": PermissionPolicy(PUBLIC_READ, "Calculator", "calculate", "Evaluate arithmetic locally."),
+    "current_time": PermissionPolicy(PUBLIC_READ, "Clock", "read time", "Read the current time."),
+    "get_personal_state": PermissionPolicy(INTERNAL_READ, "PA personal state", "read", "Read local structured personal context."),
 }
 
 # Protected reads. Even though some data may be cached locally, these names
@@ -103,6 +106,7 @@ _WRITES: dict[str, PermissionPolicy] = {
     "update_calendar_event": PermissionPolicy(WRITE, "Google Calendar", "update event", "Change a calendar event and potentially notify attendees."),
     "delete_calendar_event": PermissionPolicy(DESTRUCTIVE, "Google Calendar", "delete event", "Delete a calendar event and potentially send cancellations."),
     "save_memory": PermissionPolicy(WRITE, "PA memory", "save memory", "Persist a new long-term personal memory."),
+    "update_personal_state": PermissionPolicy(WRITE, "PA personal state", "update", "Persist structured profile, preference, goal, or current-state changes."),
     "pause_internet": PermissionPolicy(DESTRUCTIVE, "Home network", "pause internet", "Change household network access."),
     "resume_internet": PermissionPolicy(WRITE, "Home network", "resume internet", "Change household network access."),
     "repository_agent": PermissionPolicy(WRITE, "GitHub / repository", "allow repository-capable agent", "Allow a CLI agent to access the repository for this request."),
@@ -244,6 +248,16 @@ class PermissionBroker:
                 if req.conversation_id == conversation_id and req.status == "pending"
             ]
 
+    def pending(self) -> list[PermissionRequest]:
+        """Return all currently pending requests, oldest first."""
+        with self._lock:
+            now = self._now()
+            self._expire_locked(now)
+            return sorted(
+                (req for req in self._requests.values() if req.status == "pending"),
+                key=lambda req: req.created_at,
+            )
+
     def _matching_pending_locked(
         self, conversation_id: str, tool_name: str, fingerprint: str,
     ) -> PermissionRequest | None:
@@ -325,8 +339,9 @@ class PermissionBroker:
         tool_name: str,
         tool_input: dict[str, Any] | None,
         grant_ids: Iterable[str] | None = None,
+        policy: PermissionPolicy | None = None,
     ) -> PermissionDecision:
-        policy = classify_tool(tool_name, tool_input)
+        policy = policy or classify_tool(tool_name, tool_input)
         if not policy.requires_permission:
             return PermissionDecision(True, policy)
 

@@ -26,6 +26,17 @@ def _require_approval_header(request_id: str, header_value: str | None) -> None:
         raise HTTPException(status_code=403, detail="Missing or invalid permission approval header")
 
 
+@router.get("")
+async def list_pending_permission_requests(conversation_id: str | None = None):
+    broker = get_permission_broker()
+    requests = (
+        broker.pending_for_conversation(conversation_id)
+        if conversation_id
+        else broker.pending()
+    )
+    return {"requests": [_public(req) for req in requests]}
+
+
 @router.get("/{request_id}")
 async def get_permission_request(request_id: str):
     req = get_permission_broker().get(request_id)

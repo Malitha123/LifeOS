@@ -30,6 +30,7 @@ JOURNAL_EXCLUDED_TOOLS = frozenset({
     "create_email_draft",
     "send_email_draft",
     "save_memory",
+    "update_personal_state",
     "manage_workouts",
     "manage_human_queue",
     "manage_reminders",
@@ -1032,11 +1033,82 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "calculate",
+        "description": (
+            "Evaluate a basic arithmetic expression deterministically. Use for calculations instead "
+            "of estimating mentally. Supports +, -, *, /, //, %, ** and parentheses."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "Arithmetic expression to evaluate."},
+            },
+            "required": ["expression"],
+        },
+    },
+    {
+        "name": "current_time",
+        "description": (
+            "Return the current date and time in an IANA timezone. Omit timezone to use the user's configured timezone."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "timezone": {"type": "string", "description": "Optional IANA timezone, e.g. Pacific/Auckland."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_personal_state",
+        "description": (
+            "Read the PA's structured local profile, preferences, goals, or current state. "
+            "This complements free-form memories and is local read-only context."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "enum": ["profile", "preferences", "goals", "state"],
+                    "description": "Optional section. Omit to read all structured personal state.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "update_personal_state",
+        "description": (
+            "Update the PA's structured profile, preferences, goals, or current state. "
+            "This is persistent and always requires explicit permission before execution."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "enum": ["profile", "preferences", "goals", "state"],
+                },
+                "values": {
+                    "type": "object",
+                    "description": "Key/value object to merge or replace. A null value removes a key in merge mode.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["merge", "replace"],
+                    "default": "merge",
+                },
+            },
+            "required": ["section", "values"],
+        },
+    },
+    {
         "name": "manage_workouts",
         "description": (
             "Log and query the user's workout log and fitness metrics (the fitness "
-            "bot's backend). Parse free-form training text and record it — do NOT "
-            "ask the user to confirm before logging. Actions:\n"
+            "bot's backend). Parse free-form training text and record it. Logging is a "
+            "state-changing action, so the PermissionBroker must obtain explicit approval before execution. Actions:\n"
             "- 'log': record a session. Pass `sets` (one entry per distinct "
             "exercise/load); use `count` for repeated identical sets ('3x5 @185' = "
             "count 3, reps 5, weight 185; 'bench 135x8' = count 1, reps 8, weight "
@@ -1212,7 +1284,7 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
 
 # Sync handlers to wrap in to_thread for parallel execution
-_SYNC_HANDLERS = {"search_vault", "read_vault_file", "list_vault", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_human_queue", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "list_vault", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_human_queue", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories", "get_personal_state", "update_personal_state"}
 
 
 _MESSAGE_TAG_RE = re.compile(r"#[\w-]+")
@@ -4395,6 +4467,94 @@ async def _tool_internet_status(inp: dict) -> str:
     return "\n".join(lines)
 
 
+
+def _tool_calculate(inp: dict) -> str:
+    """Evaluate arithmetic without eval(), names, calls, or attribute access."""
+    import ast
+    import math
+    import operator
+
+    expression = str(inp.get("expression") or "").strip()
+    if not expression:
+        return "Error: expression is required."
+    if len(expression) > 300:
+        return "Error: expression is too long."
+
+    binary = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+    }
+    unary = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+    def walk(node):
+        if isinstance(node, ast.Expression):
+            return walk(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in binary:
+            left, right = walk(node.left), walk(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("exponent is too large")
+            value = binary[type(node.op)](left, right)
+            if isinstance(value, (int, float)) and (not math.isfinite(float(value)) or abs(float(value)) > 1e100):
+                raise ValueError("result is outside the supported range")
+            return value
+        if isinstance(node, ast.UnaryOp) and type(node.op) in unary:
+            return unary[type(node.op)](walk(node.operand))
+        raise ValueError("only basic arithmetic is supported")
+
+    try:
+        tree = ast.parse(expression.replace("^", "**"), mode="eval")
+        value = walk(tree)
+    except ZeroDivisionError:
+        return "Error: division by zero."
+    except (SyntaxError, ValueError, OverflowError) as exc:
+        return f"Error: invalid calculation ({exc})."
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return f"{expression} = {value}"
+
+
+def _tool_current_time(inp: dict) -> str:
+    tz_name = str(inp.get("timezone") or settings.timezone).strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return f"Error: unknown IANA timezone {tz_name!r}."
+    now = datetime.now(tz)
+    return f"Current time in {tz_name}: {now.strftime('%A, %Y-%m-%d %H:%M:%S %Z')}"
+
+
+def _tool_get_personal_state(inp: dict) -> str:
+    import json
+    from api.services.personal_state import get_personal_state_store
+    try:
+        data = get_personal_state_store().read(inp.get("section"))
+    except ValueError as exc:
+        return f"Error: {exc}"
+    return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _tool_update_personal_state(inp: dict) -> str:
+    import json
+    from api.services.personal_state import get_personal_state_store
+    try:
+        updated = get_personal_state_store().update(
+            str(inp.get("section") or ""),
+            inp.get("values") or {},
+            mode=str(inp.get("mode") or "merge"),
+        )
+    except ValueError as exc:
+        return f"Error: {exc}"
+    return "Updated structured personal state:\n" + json.dumps(
+        updated, ensure_ascii=False, indent=2, sort_keys=True
+    )
+
 _TOOL_HANDLERS = {
     "search_vault": _tool_search_vault,
     "read_vault_file": _tool_read_vault_file,
@@ -4419,6 +4579,10 @@ _TOOL_HANDLERS = {
     "delete_calendar_event": _tool_delete_calendar_event,
     "save_memory": _tool_save_memory,
     "search_memories": _tool_search_memories,
+    "calculate": _tool_calculate,
+    "current_time": _tool_current_time,
+    "get_personal_state": _tool_get_personal_state,
+    "update_personal_state": _tool_update_personal_state,
     "pause_internet": _tool_pause_internet,
     "resume_internet": _tool_resume_internet,
     "internet_status": _tool_internet_status,
@@ -4479,6 +4643,10 @@ TOOL_STATUS_MESSAGES = {
     "delete_calendar_event": "Deleting calendar event...",
     "save_memory": "Saving memory...",
     "search_memories": "Searching memories...",
+    "calculate": "Calculating...",
+    "current_time": "Checking the time...",
+    "get_personal_state": "Reading personal context...",
+    "update_personal_state": "Updating personal context...",
     "pause_internet": "Pausing internet access...",
     "resume_internet": "Resuming internet access...",
     "internet_status": "Checking internet access status...",

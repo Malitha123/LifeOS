@@ -17,6 +17,9 @@ def test_public_and_internal_reads_do_not_require_permission():
         ("search_vault", {"query": "project notes"}),
         ("search_memories", {"query": "housing"}),
         ("manage_tasks", {"action": "list"}),
+        ("calculate", {"expression": "2+2"}),
+        ("current_time", {}),
+        ("get_personal_state", {"section": "goals"}),
     ):
         policy = classify_tool(tool, payload)
         assert policy.category == INTERNAL_READ or tool == "search_web"
@@ -43,6 +46,7 @@ def test_private_reads_require_permission():
 @pytest.mark.unit
 def test_state_changes_require_permission():
     assert classify_tool("save_memory", {"content": "x"}).category == WRITE
+    assert classify_tool("update_personal_state", {"section": "goals", "values": {"x": 1}}).category == WRITE
     assert classify_tool("manage_tasks", {"action": "create"}).category == WRITE
     assert classify_tool("manage_reminders", {"action": "delete"}).category == DESTRUCTIVE
     assert classify_tool("send_email_draft", {"draft_id": "d1"}).category == DESTRUCTIVE
@@ -129,3 +133,17 @@ def test_denied_request_never_authorizes():
     )
     assert not blocked.allowed
     assert broker.get(request_id).status == "denied"
+
+
+@pytest.mark.unit
+def test_pending_lists_only_pending_requests():
+    broker = PermissionBroker(ttl_seconds=60)
+    first = broker.authorize_or_request(
+        conversation_id="conv-a", tool_name="search_email", tool_input={"keywords": "x"}
+    ).request
+    second = broker.authorize_or_request(
+        conversation_id="conv-b", tool_name="search_calendar", tool_input={"query": "x"}
+    ).request
+    broker.deny(second.id)
+    pending = broker.pending()
+    assert [item.id for item in pending] == [first.id]

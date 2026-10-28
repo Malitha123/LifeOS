@@ -123,26 +123,29 @@ Likewise, actions such as sending an email, changing a calendar event, modifying
 
 Access permission and action permission are separate. For example, permission to read Gmail does not automatically grant permission to send an email.
 
-## Development milestones
+## Current implementation
 
-### Milestone 1: Personal Chief of Staff
+The fork now includes the core Personal Chief of Staff architecture:
 
-Convert the primary LifeOS persona into a single Personal Chief of Staff that acts as the main conversational interface.
+- **Personal Chief of Staff:** the primary persona is the single conversational entry point.
+- **Permission Broker:** private connector reads and state-changing actions require exact, one-use approval. Read permission never implies write permission.
+- **PA Router:** deterministic routing distinguishes general questions, direct/public-tool requests, single-domain requests, and cross-domain decisions.
+- **Specialist layer:** career, home, travel, money, fitness, learning, life admin, networking, research, and planning lenses are injected automatically. Multi-domain decisions can consult multiple lightweight specialists in parallel before the Chief of Staff synthesizes the answer.
+- **Reviewer lens:** higher-impact multi-domain decisions receive an additional internal review for assumptions, missing current facts, calculations, and irreversible consequences.
+- **Structured personal context:** profile, preferences, goals, and current state are stored separately from free-form memories. Structured writes are permission-gated.
+- **Direct utilities:** deterministic calculator and timezone-aware current-time tools are available alongside the existing public web search.
+- **Private services:** Gmail, Calendar, Drive, Slack, messages, finance and repository-capable actions remain behind the Permission Broker.
+- **MCP permission bridge:** direct MCP access to protected private services or state-changing API operations also creates a one-use permission request instead of bypassing the PA's safety boundary.
 
-### Milestone 2: Permission Layer
+The original LifeOS scheduling, RAG/search, memory, task, finance, fitness, Google integrations, agent workers, and other reusable infrastructure remain available underneath this layer.
 
-Add a centralized permission system for private data access and external actions.
+### Still evolving
 
-### Planned next steps
-
-- improve intent and request routing
-- add direct public tools such as weather, web search, maps, time, currency, and calculator
-- formalize personal profile, memory, state, and goals
-- connect private services through the permission layer
-- build specialist agents for career, home, travel, money, fitness, learning, life admin, and networking
-- add multi-agent orchestration and review for complex decisions
-- add proactive workflows and a personal dashboard
-- add evaluation, observability, and security testing
+- richer dedicated public utilities for maps, weather, currency, flights and other verticals
+- deeper domain-specific search/ranking for career, housing and travel
+- proactive Personal Chief of Staff briefings and attention prioritization
+- a dedicated PA dashboard and permission inbox UI
+- broader evaluation, observability, security testing and production hardening
 
 ## Project status
 
